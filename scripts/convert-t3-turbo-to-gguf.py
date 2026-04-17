@@ -29,11 +29,22 @@ LAYER_NORM_EPS = 1e-5
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
 
 
+QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert Chatterbox Turbo T3 weights to GGUF.")
     parser.add_argument("--ckpt-dir", type=Path, help="Local checkpoint dir (downloads from HF if omitted).")
     parser.add_argument("--out", type=Path, default=Path("models/chatterbox-t3-turbo.gguf"), help="Output GGUF path.")
     parser.add_argument("--hf-token", default=None, help="Optional Hugging Face token.")
+    parser.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
+                        help=("Weight dtype for attention + MLP + speech_head projections. "
+                              "f16 (default, ~730 MB), q8_0 (~385 MB), q5_0 (~250 MB), "
+                              "q4_0 (~205 MB). Biases, layer norms, embeddings and "
+                              "positional embeddings always stay at their original dtype. "
+                              "For K-quants (q4_k / q5_k / q6_k), run the resulting f16 "
+                              "GGUF through llama.cpp's llama-quantize instead — the "
+                              "Python gguf package doesn't implement them yet."))
     return parser.parse_args()
 
 
@@ -44,6 +55,53 @@ def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np
     if transpose:
         array = array.T
     return np.ascontiguousarray(array)
+
+
+# Which exported tensor names hold "big" 2-D projection weights that are
+# worth quantizing. These are the ones ggml_mul_mat will consume; their
+# inner (reduction) dimension is always a multiple of 256 for GPT-2 Medium
+# (n_embd = 1024, inner_ffn = 4096), which is the block size requirement
+# for Q4_K / Q5_K.
+def _is_quantizable_weight(gguf_name: str) -> bool:
+    if gguf_name == "chatterbox/speech_head":
+        return True
+    # Per-layer: model/h{i}/attn/c_attn/w, c_proj/w, mlp/c_fc/w, mlp/c_proj/w
+    if gguf_name.startswith("model/h") and (
+        gguf_name.endswith("/attn/c_attn/w") or
+        gguf_name.endswith("/attn/c_proj/w") or
+        gguf_name.endswith("/mlp/c_fc/w") or
+        gguf_name.endswith("/mlp/c_proj/w")
+    ):
+        return True
+    return False
+
+
+# NOTE: the Python gguf 0.18 package only implements the "legacy" block
+# types (Q4_0/1, Q5_0/1, Q8_0). The K-quants (Q4_K, Q5_K, Q6_K) are
+# declared but NotImplementedError at runtime — use llama.cpp's
+# llama-quantize tool on the F16 GGUF if you need those.
+_QUANT_TYPE = {
+    "q8_0": gguf.GGMLQuantizationType.Q8_0,
+    "q5_0": gguf.GGMLQuantizationType.Q5_0,
+    "q4_0": gguf.GGMLQuantizationType.Q4_0,
+}
+
+
+def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray, quant: str):
+    """Pass F32/F16 arrays straight through; quantize the "big" projection
+    weights when --quant is not f16.
+    """
+    if quant == "f16" or not _is_quantizable_weight(name):
+        writer.add_tensor(name, array)
+        return str(array.dtype)
+
+    qtype = _QUANT_TYPE[quant]
+    # Block-quantized kernels consume F32 input.
+    qdata = gguf.quants.quantize(array.astype(np.float32), qtype)
+    # GGUF writer wants the BYTE shape as raw_shape (the qdata.shape);
+    # it converts back to element shape using the quant type's block size.
+    writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=qtype)
+    return qtype.name
 
 
 def load_tokenizer_assets(ckpt_dir: Path):
@@ -180,7 +238,10 @@ def main() -> None:
           f"{sum(1 for t in tok_types if t == int(gguf.TokenType.USER_DEFINED))} added, "
           f"{len(tok_merges)} merges")
 
+    writer.add_string("chatterbox.quantization", args.quant)
+
     exported = 0
+    quantized = 0
     ignored = []
     for name, tensor in state.items():
         mapped = map_tensor_name(name)
@@ -189,9 +250,11 @@ def main() -> None:
             continue
         gguf_name, dtype, transpose = mapped
         array = as_numpy(tensor, dtype=dtype, transpose=transpose)
-        writer.add_tensor(gguf_name, array)
+        written_type = add_maybe_quantized(writer, gguf_name, array, args.quant)
         exported += 1
-        print(f"{gguf_name:32s} {str(tuple(array.shape)):18s} {array.dtype}")
+        if written_type not in ("float32", "float16"):
+            quantized += 1
+        print(f"{gguf_name:32s} {str(tuple(array.shape)):18s} {written_type}")
 
     builtin_speaker = conds["t3"]["speaker_emb"].reshape(1, SPEAKER_EMBED_SIZE)
     builtin_tokens = conds["t3"]["cond_prompt_speech_tokens"].reshape(-1).to(torch.int32)
@@ -206,6 +269,9 @@ def main() -> None:
     writer.close()
 
     print(f"\nWrote {exported + 2} tensors to {args.out}")
+    print(f"  --quant {args.quant}: {quantized}/{exported} weight tensors quantized "
+          f"({'f16/f32' if args.quant == 'f16' else args.quant.upper()} for quantized; "
+          f"embeddings + biases + layer-norms unchanged)")
     if ignored:
         print("\nIgnored tensors:")
         for n in ignored:

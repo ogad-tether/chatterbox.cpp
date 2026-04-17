@@ -468,33 +468,63 @@ Impact: on Apple M-series Metal, RTF should comfortably drop **below 0.1**
 (sub-second generation for most utterances). Desktop discrete GPU: lower
 still. **The single biggest speedup lever left.**
 
-#### A3. Quantize T3 to Q4_K_M / Q5_K
+#### A3. Quantize T3 — ✅ **DONE** (Q8_0 / Q5_0 / Q4_0)
 
-T3 (GPT-2 Medium, ~700 MB in F16) is the one memory-bandwidth-dominated
-component in the pipeline and is a textbook quantization target.
+T3 (GPT-2 Medium, ~700 MB in F16) is the memory-bandwidth-dominated
+component in the pipeline. Implemented via `--quant {f16,q8_0,q5_0,q4_0}`
+flag in `scripts/convert-t3-turbo-to-gguf.py`.
 
-What to do:
-- Gate `mul_mat` weights in `scripts/convert-t3-turbo-to-gguf.py` behind
-  `--quant Q4_K_M` / `--quant Q5_K_M` (pass the dtype straight into
-  `gguf.GGUFWriter.add_tensor`).
-- Leave `wpe`, embeddings, layer norms, `speech_head` in F32/F16
-  (standard llama.cpp quantization policy).
-- C++ needs no changes — `ggml_mul_mat` with Q4_K weights and F32
-  activations is a built-in fast path on both CPU and GPU.
+The Python `gguf` 0.18 package has the K-quants (Q4_K / Q5_K / Q6_K)
+declared but raises `NotImplementedError` in their `quantize_blocks`
+implementations, so only legacy block types (`Q4_0`, `Q5_0`, `Q8_0`) are
+produced here. Running the F16 GGUF through llama.cpp's `llama-quantize`
+tool would work too, producing true K-quants — not done yet.
 
-Scope: **half a day**, mostly converter-side.
+Only the big 2-D `mul_mat` weights get quantized: per-layer
+`attn/c_attn/w`, `attn/c_proj/w`, `mlp/c_fc/w`, `mlp/c_proj/w`, plus
+`chatterbox/speech_head`. Biases, layer norms, embeddings,
+positional encoding, and the tokenizer metadata all stay at their
+original dtype (F32 / F16). No C++ changes — `ggml_mul_mat` with
+quantized weights + F32 activations is already a fast path.
 
-Impact:
-- File size: ~700 MB → ~180 MB (4× smaller — matters for mobile /
-  bundled distribution).
-- T3 wall time: typically 30–50 % faster on CPU.
-- End-to-end: T3 is ~30 % of pipeline time on the EPYC, so **~10–15 %
-  end-to-end speedup**.
-- Quality: negligible at Q4_K_M for GPT-2 Medium-sized backbones
-  (confirmed on comparable LLMs).
+Measured results, same prompt and `--n-predict 200` (201 tokens output):
+
+**10-core EPYC** (remote):
+
+| Variant | GGUF size | T3 wall time | vs F16 |
+|---------|-----------|--------------|--------|
+| F16     | 736 MB    | 3.91 s       | 1.00×  |
+| Q8_0    | 460 MB    | 2.85 s       | **1.37× faster** |
+| Q5_0    | 350 MB    | 2.58 s       | 1.52× faster |
+| Q4_0    | 313 MB    | 2.38 s       | 1.64× faster |
+
+**10-core Mac16,12** (M-series):
+
+| Variant | T3 wall time | vs F16 |
+|---------|--------------|--------|
+| F16     | 14.92 s      | 1.00×  |
+| Q8_0    | 5.41 s       | **2.76× faster** |
+| Q5_0    | 5.27 s       | 2.83× faster |
+| Q4_0    | 4.74 s       | 3.15× faster |
+
+The Mac speedup is disproportionately large because M-series is much
+more memory-bandwidth-bound on F16 than EPYC's DDR5 is.
+
+Quality, comparing output tokens on a long prompt:
+- **Q8_0**: **bit-for-bit identical** to F16. No audible or measurable
+  quality loss. **Recommended default for quantized builds.**
+- **Q5_0**: sampling diverges starting around token 6. Audio output still
+  sounds correct; small perceptible voice-identity shift.
+- **Q4_0**: sampling diverges slightly earlier and more. Audio still
+  intelligible, with more drift from the F16 reference voice.
 
 S3Gen / HiFT weights are conv-dominated (F16 on CFM linears actually
-regressed on CPU — see §3.8 Attempt 7), so keep those F32.
+regressed on CPU — see §3.8 Attempt 7), so those stay F32.
+
+Remaining: Q4_K / Q5_K path. Drop-in win would come from
+`llama-quantize models/chatterbox-t3-turbo.gguf /out.gguf Q4_K_M`
+once that tool's loader is pointed at our non-llama GGUF, or by
+porting one of the K-quant kernels to the Python `gguf` package.
 
 ### Tier B — serious work, impactful for specific use cases
 
