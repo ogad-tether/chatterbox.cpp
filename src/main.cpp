@@ -1,0 +1,722 @@
+#include "gpt2_bpe.h"
+#include "ggml.h"
+#include "ggml-cpu.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "gguf.h"
+
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <map>
+#include <random>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+static constexpr int CHBX_MAX_NODES = 8192;
+
+// --------------------------------------------------------------------------
+// GGUF metadata keys
+// --------------------------------------------------------------------------
+
+static constexpr const char * KEY_TEXT_VOCAB_SIZE   = "chatterbox.text_vocab_size";
+static constexpr const char * KEY_SPEECH_VOCAB_SIZE = "chatterbox.speech_vocab_size";
+static constexpr const char * KEY_START_SPEECH      = "chatterbox.start_speech_token";
+static constexpr const char * KEY_STOP_SPEECH       = "chatterbox.stop_speech_token";
+static constexpr const char * KEY_SPEAKER_EMBED     = "chatterbox.speaker_embed_size";
+static constexpr const char * KEY_LAYER_NORM_EPS    = "chatterbox.layer_norm_eps";
+static constexpr const char * KEY_COND_PROMPT_LEN   = "chatterbox.cond_prompt_length";
+static constexpr const char * KEY_N_CTX             = "chatterbox.n_ctx";
+static constexpr const char * KEY_N_EMBD            = "chatterbox.n_embd";
+static constexpr const char * KEY_N_HEAD            = "chatterbox.n_head";
+static constexpr const char * KEY_N_LAYER           = "chatterbox.n_layer";
+
+// --------------------------------------------------------------------------
+// Model structs
+// --------------------------------------------------------------------------
+
+struct chatterbox_hparams {
+    int32_t n_text_vocab       = 0;
+    int32_t n_speech_vocab     = 0;
+    int32_t start_speech_token = 0;
+    int32_t stop_speech_token  = 0;
+    int32_t n_ctx              = 0;
+    int32_t n_embd             = 0;
+    int32_t n_head             = 0;
+    int32_t n_layer            = 0;
+    int32_t speaker_embed_size = 0;
+    int32_t cond_prompt_len    = 0;
+    float   eps                = 1e-5f;
+};
+
+struct gpt2_layer {
+    ggml_tensor * ln_1_g = nullptr;
+    ggml_tensor * ln_1_b = nullptr;
+    ggml_tensor * ln_2_g = nullptr;
+    ggml_tensor * ln_2_b = nullptr;
+
+    ggml_tensor * c_attn_attn_w = nullptr;
+    ggml_tensor * c_attn_attn_b = nullptr;
+    ggml_tensor * c_attn_proj_w = nullptr;
+    ggml_tensor * c_attn_proj_b = nullptr;
+
+    ggml_tensor * c_mlp_fc_w   = nullptr;
+    ggml_tensor * c_mlp_fc_b   = nullptr;
+    ggml_tensor * c_mlp_proj_w = nullptr;
+    ggml_tensor * c_mlp_proj_b = nullptr;
+};
+
+struct chatterbox_model {
+    chatterbox_hparams hparams;
+
+    ggml_tensor * wpe              = nullptr;
+    ggml_tensor * ln_f_g           = nullptr;
+    ggml_tensor * ln_f_b           = nullptr;
+    ggml_tensor * text_emb         = nullptr;
+    ggml_tensor * speech_emb       = nullptr;
+    ggml_tensor * speech_head      = nullptr;
+    ggml_tensor * speech_head_bias = nullptr;
+    ggml_tensor * cond_spkr_w      = nullptr;
+    ggml_tensor * cond_spkr_b      = nullptr;
+
+    ggml_tensor * builtin_speaker_emb        = nullptr;
+    ggml_tensor * builtin_cond_prompt_tokens = nullptr;
+
+    std::vector<gpt2_layer> layers;
+
+    ggml_tensor * memory_k = nullptr;
+    ggml_tensor * memory_v = nullptr;
+
+    ggml_context * ctx_w  = nullptr;
+    ggml_context * ctx_kv = nullptr;
+
+    ggml_backend_t backend = nullptr;
+
+    ggml_backend_buffer_t buffer_w  = nullptr;
+    ggml_backend_buffer_t buffer_kv = nullptr;
+
+    std::map<std::string, ggml_tensor *> tensors;
+};
+
+// --------------------------------------------------------------------------
+// CLI
+// --------------------------------------------------------------------------
+
+struct cli_params {
+    std::string model;
+    std::string tokens_file;
+    std::string text;
+    std::string tokenizer_dir;
+    std::string output;
+    bool    dump_tokens_only = false;
+    int32_t seed           = 0;
+    int32_t n_threads      = std::min(4, (int32_t) std::thread::hardware_concurrency());
+    int32_t n_predict      = 256;
+    int32_t n_ctx          = 0;
+    int32_t n_gpu_layers   = 0;
+    int32_t top_k          = 1;
+    float   top_p          = 1.0f;
+    float   temp           = 1.0f;
+    float   repeat_penalty = 1.0f;
+};
+
+static void print_usage(const char * argv0) {
+    fprintf(stderr, "usage: %s --model MODEL.gguf [--text TEXT | --tokens-file tokens.txt] [options]\n", argv0);
+    fprintf(stderr, "\noptions:\n");
+    fprintf(stderr, "  --model PATH            GGUF model produced by convert-t3-turbo-to-gguf.py\n");
+    fprintf(stderr, "  --text TEXT             Input text (uses built-in GPT-2 BPE tokenizer)\n");
+    fprintf(stderr, "  --tokenizer-dir PATH    Directory with vocab.json + merges.txt (required with --text)\n");
+    fprintf(stderr, "  --tokens-file PATH      Pre-tokenized text token ids (alternative to --text)\n");
+    fprintf(stderr, "  --output PATH           Output file for generated speech tokens\n");
+    fprintf(stderr, "  --seed N                RNG seed (default: 0)\n");
+    fprintf(stderr, "  --threads N             CPU threads (default: %d)\n", std::min(4, (int32_t) std::thread::hardware_concurrency()));
+    fprintf(stderr, "  --n-predict N           Max speech tokens (default: 256)\n");
+    fprintf(stderr, "  --context N             Override KV context length\n");
+    fprintf(stderr, "  --n-gpu-layers N        GPU backend when N > 0\n");
+    fprintf(stderr, "  --top-k N               (default: 1)\n");
+    fprintf(stderr, "  --top-p P               (default: 1.0)\n");
+    fprintf(stderr, "  --temp T                (default: 1.0)\n");
+    fprintf(stderr, "  --repeat-penalty R      (default: 1.0)\n");
+    fprintf(stderr, "  -h, --help\n");
+}
+
+static bool parse_args(int argc, char ** argv, cli_params & params) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto next = [&](const char * flag) -> const char * {
+            if (i + 1 >= argc) { fprintf(stderr, "error: %s requires an argument\n", flag); return nullptr; }
+            return argv[++i];
+        };
+
+        if      (arg == "--model")          { auto v = next("--model");          if (!v) return false; params.model = v; }
+        else if (arg == "--text")           { auto v = next("--text");           if (!v) return false; params.text = v; }
+        else if (arg == "--tokenizer-dir")  { auto v = next("--tokenizer-dir");  if (!v) return false; params.tokenizer_dir = v; }
+        else if (arg == "--tokens-file")    { auto v = next("--tokens-file");    if (!v) return false; params.tokens_file = v; }
+        else if (arg == "--output")         { auto v = next("--output");         if (!v) return false; params.output = v; }
+        else if (arg == "--seed")           { auto v = next("--seed");           if (!v) return false; params.seed = std::stoi(v); }
+        else if (arg == "--threads")        { auto v = next("--threads");        if (!v) return false; params.n_threads = std::stoi(v); }
+        else if (arg == "--n-predict")      { auto v = next("--n-predict");      if (!v) return false; params.n_predict = std::stoi(v); }
+        else if (arg == "--context")        { auto v = next("--context");        if (!v) return false; params.n_ctx = std::stoi(v); }
+        else if (arg == "--n-gpu-layers")   { auto v = next("--n-gpu-layers");   if (!v) return false; params.n_gpu_layers = std::stoi(v); }
+        else if (arg == "--top-k")          { auto v = next("--top-k");          if (!v) return false; params.top_k = std::stoi(v); }
+        else if (arg == "--top-p")          { auto v = next("--top-p");          if (!v) return false; params.top_p = std::stof(v); }
+        else if (arg == "--temp")           { auto v = next("--temp");           if (!v) return false; params.temp = std::stof(v); }
+        else if (arg == "--repeat-penalty") { auto v = next("--repeat-penalty"); if (!v) return false; params.repeat_penalty = std::stof(v); }
+        else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
+        else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); std::exit(0); }
+        else { fprintf(stderr, "error: unknown argument: %s\n", arg.c_str()); return false; }
+    }
+    if (params.dump_tokens_only) {
+        if (params.text.empty() || params.tokenizer_dir.empty()) {
+            fprintf(stderr, "error: --dump-tokens-only requires --text and --tokenizer-dir\n");
+            return false;
+        }
+        return true;
+    }
+    if (params.model.empty()) { fprintf(stderr, "error: --model is required\n"); return false; }
+    if (params.text.empty() && params.tokens_file.empty()) {
+        fprintf(stderr, "error: either --text or --tokens-file is required\n"); return false;
+    }
+    if (!params.text.empty() && params.tokenizer_dir.empty()) {
+        fprintf(stderr, "error: --tokenizer-dir is required when using --text\n"); return false;
+    }
+    return true;
+}
+
+// --------------------------------------------------------------------------
+// I/O helpers
+// --------------------------------------------------------------------------
+
+static std::vector<int32_t> read_token_file(const std::string & path) {
+    std::ifstream fin(path);
+    if (!fin) throw std::runtime_error("failed to open token file: " + path);
+    std::string raw((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+    for (char & ch : raw) if (ch == ',') ch = ' ';
+    std::vector<int32_t> tokens;
+    std::stringstream ss(raw);
+    int32_t tok;
+    while (ss >> tok) tokens.push_back(tok);
+    return tokens;
+}
+
+static void write_token_file(const std::string & path, const std::vector<int32_t> & tokens) {
+    std::ofstream fout(path);
+    if (!fout) throw std::runtime_error("failed to open output file: " + path);
+    for (size_t i = 0; i < tokens.size(); ++i) { if (i) fout << ','; fout << tokens[i]; }
+    fout << '\n';
+}
+
+// --------------------------------------------------------------------------
+// GGUF helpers
+// --------------------------------------------------------------------------
+
+static int64_t require_key(const gguf_context * ctx, const char * key) {
+    int64_t id = gguf_find_key(ctx, key);
+    if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + key);
+    return id;
+}
+
+static ggml_tensor * require_tensor(const chatterbox_model & m, const char * name) {
+    auto it = m.tensors.find(name);
+    if (it == m.tensors.end() || !it->second) throw std::runtime_error(std::string("missing tensor: ") + name);
+    return it->second;
+}
+
+// --------------------------------------------------------------------------
+// Backend init
+// --------------------------------------------------------------------------
+
+static ggml_backend_t init_backend(int n_gpu_layers) {
+#ifdef GGML_USE_CUDA
+    if (n_gpu_layers > 0) {
+        auto * b = ggml_backend_cuda_init(0);
+        if (b) { fprintf(stderr, "%s: using CUDA backend\n", __func__); return b; }
+    }
+#endif
+#ifdef GGML_USE_METAL
+    if (n_gpu_layers > 0) {
+        auto * b = ggml_backend_metal_init();
+        if (b) { fprintf(stderr, "%s: using Metal backend\n", __func__); return b; }
+    }
+#endif
+    auto * b = ggml_backend_cpu_init();
+    if (!b) throw std::runtime_error("ggml_backend_cpu_init() failed");
+    fprintf(stderr, "%s: using CPU backend\n", __func__);
+    return b;
+}
+
+// --------------------------------------------------------------------------
+// Model loading
+// --------------------------------------------------------------------------
+
+static bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
+    ggml_context * tmp_ctx = nullptr;
+    gguf_init_params gguf_params = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
+    if (!gguf_ctx) { fprintf(stderr, "%s: failed to open '%s'\n", __func__, path.c_str()); return false; }
+
+    try {
+        auto & hp = model.hparams;
+        hp.n_text_vocab       = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_VOCAB_SIZE));
+        hp.n_speech_vocab     = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_SPEECH_VOCAB_SIZE));
+        hp.start_speech_token = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_START_SPEECH));
+        hp.stop_speech_token  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_STOP_SPEECH));
+        hp.speaker_embed_size = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_SPEAKER_EMBED));
+        hp.cond_prompt_len    = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_COND_PROMPT_LEN));
+        hp.eps                = gguf_get_val_f32(gguf_ctx, require_key(gguf_ctx, KEY_LAYER_NORM_EPS));
+        hp.n_ctx   = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_CTX));
+        hp.n_embd  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_EMBD));
+        hp.n_head  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_HEAD));
+        hp.n_layer = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_LAYER));
+        if (requested_ctx > 0) hp.n_ctx = std::min(hp.n_ctx, requested_ctx);
+
+        model.backend = init_backend(n_gpu_layers);
+
+        const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);
+        ggml_init_params params = { ggml_tensor_overhead() * (size_t) num_tensors, nullptr, true };
+        model.ctx_w = ggml_init(params);
+        if (!model.ctx_w) throw std::runtime_error("ggml_init() failed");
+
+        for (int64_t i = 0; i < num_tensors; ++i) {
+            const char * name = gguf_get_tensor_name(gguf_ctx, i);
+            ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
+            ggml_tensor * dst = ggml_dup_tensor(model.ctx_w, src);
+            ggml_set_name(dst, name);
+            model.tensors[name] = dst;
+        }
+        model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
+        for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
+            ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
+            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        }
+
+        model.wpe              = require_tensor(model, "model/wpe");
+        model.ln_f_g           = require_tensor(model, "model/ln_f/g");
+        model.ln_f_b           = require_tensor(model, "model/ln_f/b");
+        model.text_emb         = require_tensor(model, "chatterbox/text_emb");
+        model.speech_emb       = require_tensor(model, "chatterbox/speech_emb");
+        model.speech_head      = require_tensor(model, "chatterbox/speech_head");
+        model.speech_head_bias = require_tensor(model, "chatterbox/speech_head_bias");
+        model.cond_spkr_w      = require_tensor(model, "chatterbox/cond_spkr/w");
+        model.cond_spkr_b      = require_tensor(model, "chatterbox/cond_spkr/b");
+        model.builtin_speaker_emb        = require_tensor(model, "chatterbox/builtin/speaker_emb");
+        model.builtin_cond_prompt_tokens = require_tensor(model, "chatterbox/builtin/cond_prompt_speech_tokens");
+
+        model.layers.resize(hp.n_layer);
+        for (int i = 0; i < hp.n_layer; ++i) {
+            auto & l = model.layers[i];
+            std::string p = "model/h" + std::to_string(i);
+            l.ln_1_g        = require_tensor(model, (p + "/ln_1/g").c_str());
+            l.ln_1_b        = require_tensor(model, (p + "/ln_1/b").c_str());
+            l.ln_2_g        = require_tensor(model, (p + "/ln_2/g").c_str());
+            l.ln_2_b        = require_tensor(model, (p + "/ln_2/b").c_str());
+            l.c_attn_attn_w = require_tensor(model, (p + "/attn/c_attn/w").c_str());
+            l.c_attn_attn_b = require_tensor(model, (p + "/attn/c_attn/b").c_str());
+            l.c_attn_proj_w = require_tensor(model, (p + "/attn/c_proj/w").c_str());
+            l.c_attn_proj_b = require_tensor(model, (p + "/attn/c_proj/b").c_str());
+            l.c_mlp_fc_w    = require_tensor(model, (p + "/mlp/c_fc/w").c_str());
+            l.c_mlp_fc_b    = require_tensor(model, (p + "/mlp/c_fc/b").c_str());
+            l.c_mlp_proj_w  = require_tensor(model, (p + "/mlp/c_proj/w").c_str());
+            l.c_mlp_proj_b  = require_tensor(model, (p + "/mlp/c_proj/b").c_str());
+        }
+
+        ggml_init_params kv_params = { ggml_tensor_overhead() * 2, nullptr, true };
+        model.ctx_kv = ggml_init(kv_params);
+        int64_t n_elements = (int64_t) hp.n_embd * hp.n_layer * hp.n_ctx;
+        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
+        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
+        model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
+
+        fprintf(stderr, "%s: ctx=%d embd=%d layers=%d heads=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
+                __func__, hp.n_ctx, hp.n_embd, hp.n_layer, hp.n_head,
+                hp.n_text_vocab, hp.n_speech_vocab, hp.cond_prompt_len);
+        fprintf(stderr, "%s: weights=%.2f MB  KV=%.2f MB\n", __func__,
+                ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
+                ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0));
+    } catch (const std::exception & e) {
+        fprintf(stderr, "%s: %s\n", __func__, e.what());
+        gguf_free(gguf_ctx); if (tmp_ctx) ggml_free(tmp_ctx);
+        return false;
+    }
+    gguf_free(gguf_ctx);
+    ggml_free(tmp_ctx);
+    return true;
+}
+
+// --------------------------------------------------------------------------
+// GPT-2 transformer core (shared by prompt and step graphs)
+// --------------------------------------------------------------------------
+
+static ggml_tensor * build_transformer_core(
+    ggml_context * ctx, ggml_cgraph * gf,
+    const chatterbox_model & model,
+    ggml_tensor * inpL, int n_past, int N) {
+
+    const auto & hp = model.hparams;
+    const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = hp.n_ctx;
+
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * cur;
+        cur = ggml_norm(ctx, inpL, hp.eps);
+        cur = ggml_add(ctx, ggml_mul(ctx, cur, model.layers[il].ln_1_g), model.layers[il].ln_1_b);
+        cur = ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_attn_attn_w, cur), model.layers[il].c_attn_attn_b);
+
+        ggml_tensor * Qcur = ggml_view_2d(ctx, cur, n_embd, N, cur->nb[1], 0*sizeof(float)*n_embd);
+        ggml_tensor * Kcur = ggml_view_2d(ctx, cur, n_embd, N, cur->nb[1], 1*sizeof(float)*n_embd);
+        ggml_tensor * Vcur = ggml_view_2d(ctx, cur, n_embd, N, cur->nb[1], 2*sizeof(float)*n_embd);
+
+        {
+            ggml_tensor * k = ggml_view_1d(ctx, model.memory_k, (int64_t)N*n_embd,
+                (size_t)ggml_element_size(model.memory_k)*n_embd*((size_t)il*n_ctx+n_past));
+            ggml_tensor * v = ggml_view_1d(ctx, model.memory_v, (int64_t)N*n_embd,
+                (size_t)ggml_element_size(model.memory_v)*n_embd*((size_t)il*n_ctx+n_past));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur, k));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur, v));
+        }
+
+        ggml_tensor * Q = ggml_permute(ctx, ggml_cont_3d(ctx, Qcur, n_embd/n_head, n_head, N), 0,2,1,3);
+        ggml_tensor * K = ggml_permute(ctx,
+            ggml_reshape_3d(ctx,
+                ggml_view_1d(ctx, model.memory_k, (int64_t)(n_past+N)*n_embd,
+                    (size_t)il*n_ctx*ggml_element_size(model.memory_k)*n_embd),
+                n_embd/n_head, n_head, n_past+N),
+            0,2,1,3);
+
+        ggml_tensor * KQ = ggml_soft_max(ctx,
+            ggml_diag_mask_inf(ctx,
+                ggml_scale(ctx, ggml_mul_mat(ctx, K, Q), 1.0f/std::sqrt((float)n_embd/n_head)),
+                n_past));
+
+        ggml_tensor * V_trans = ggml_cont_3d(ctx,
+            ggml_permute(ctx,
+                ggml_reshape_3d(ctx,
+                    ggml_view_1d(ctx, model.memory_v, (int64_t)(n_past+N)*n_embd,
+                        (size_t)il*n_ctx*ggml_element_size(model.memory_v)*n_embd),
+                    n_embd/n_head, n_head, n_past+N),
+                1,2,0,3),
+            n_past+N, n_embd/n_head, n_head);
+
+        cur = ggml_cont_2d(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, V_trans, KQ), 0,2,1,3), n_embd, N);
+        cur = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_attn_proj_w, cur), model.layers[il].c_attn_proj_b), inpL);
+
+        ggml_tensor * inpFF = cur;
+        cur = ggml_norm(ctx, inpFF, hp.eps);
+        cur = ggml_add(ctx, ggml_mul(ctx, cur, model.layers[il].ln_2_g), model.layers[il].ln_2_b);
+        cur = ggml_gelu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_mlp_fc_w, cur), model.layers[il].c_mlp_fc_b));
+        cur = ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_mlp_proj_w, cur), model.layers[il].c_mlp_proj_b);
+
+        inpL = ggml_add(ctx, cur, inpFF);
+    }
+
+    inpL = ggml_norm(ctx, inpL, hp.eps);
+    inpL = ggml_add(ctx, ggml_mul(ctx, inpL, model.ln_f_g), model.ln_f_b);
+
+    ggml_tensor * logits = ggml_add(ctx, ggml_mul_mat(ctx, model.speech_head, inpL), model.speech_head_bias);
+    ggml_set_name(logits, "logits");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+    return logits;
+}
+
+// --------------------------------------------------------------------------
+// Graph builders
+// --------------------------------------------------------------------------
+
+static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_text_tokens) {
+    const int N = 1 + model.hparams.cond_prompt_len + n_text_tokens + 1;
+    static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
+    static std::vector<uint8_t> buf(buf_size);
+    ggml_init_params p = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
+
+    ggml_tensor * text_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_text_tokens);
+    ggml_set_name(text_tokens, "text_tokens"); ggml_set_input(text_tokens);
+    ggml_tensor * start_token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(start_token, "speech_token"); ggml_set_input(start_token);
+    ggml_tensor * position = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+    ggml_set_name(position, "position"); ggml_set_input(position);
+
+    ggml_tensor * spkr = ggml_add(ctx, ggml_mul_mat(ctx, model.cond_spkr_w, model.builtin_speaker_emb), model.cond_spkr_b);
+    ggml_tensor * cond = ggml_get_rows(ctx, model.speech_emb, model.builtin_cond_prompt_tokens);
+    ggml_tensor * temb = ggml_get_rows(ctx, model.text_emb, text_tokens);
+    ggml_tensor * semb = ggml_get_rows(ctx, model.speech_emb, start_token);
+
+    ggml_tensor * inp = ggml_concat(ctx, spkr, cond, 1);
+    inp = ggml_concat(ctx, inp, temb, 1);
+    inp = ggml_concat(ctx, inp, semb, 1);
+    inp = ggml_add(ctx, inp, ggml_get_rows(ctx, model.wpe, position));
+
+    build_transformer_core(ctx, gf, model, inp, 0, N);
+    ggml_free(ctx);
+    return gf;
+}
+
+static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past) {
+    static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
+    static std::vector<uint8_t> buf(buf_size);
+    ggml_init_params p = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
+
+    ggml_tensor * speech_token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(speech_token, "speech_token"); ggml_set_input(speech_token);
+    ggml_tensor * position = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(position, "position"); ggml_set_input(position);
+
+    ggml_tensor * inp = ggml_add(ctx,
+        ggml_get_rows(ctx, model.speech_emb, speech_token),
+        ggml_get_rows(ctx, model.wpe, position));
+
+    build_transformer_core(ctx, gf, model, inp, n_past, 1);
+    ggml_free(ctx);
+    return gf;
+}
+
+// --------------------------------------------------------------------------
+// Evaluation
+// --------------------------------------------------------------------------
+
+static bool eval_prompt(
+    const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
+    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
+
+    prompt_len = 1 + model.hparams.cond_prompt_len + (int)text_tokens.size() + 1;
+    if (prompt_len > model.hparams.n_ctx) {
+        fprintf(stderr, "%s: prompt %d exceeds context %d\n", __func__, prompt_len, model.hparams.n_ctx);
+        return false;
+    }
+    ggml_cgraph * gf = build_prompt_graph(model, (int)text_tokens.size());
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "text_tokens"), text_tokens.data(), 0, text_tokens.size()*sizeof(int32_t));
+    int32_t st = model.hparams.start_speech_token;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &st, 0, sizeof(st));
+    std::vector<int32_t> pos(prompt_len);
+    for (int i = 0; i < prompt_len; ++i) pos[i] = i;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), pos.data(), 0, pos.size()*sizeof(int32_t));
+
+    if (ggml_backend_is_cpu(model.backend)) ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+    ggml_backend_graph_compute(model.backend, gf);
+
+    ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
+    logits_out.resize(model.hparams.n_speech_vocab);
+    ggml_backend_tensor_get(logits, logits_out.data(),
+        (size_t)model.hparams.n_speech_vocab*(prompt_len-1)*sizeof(float),
+        (size_t)model.hparams.n_speech_vocab*sizeof(float));
+    return true;
+}
+
+static bool eval_step(
+    const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
+    int n_past, int32_t token, std::vector<float> & logits_out) {
+
+    ggml_cgraph * gf = build_step_graph(model, n_past);
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
+    int32_t position = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
+
+    if (ggml_backend_is_cpu(model.backend)) ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+    ggml_backend_graph_compute(model.backend, gf);
+
+    ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
+    logits_out.resize(model.hparams.n_speech_vocab);
+    ggml_backend_tensor_get(logits, logits_out.data(), 0, (size_t)model.hparams.n_speech_vocab*sizeof(float));
+    return true;
+}
+
+// --------------------------------------------------------------------------
+// Sampling
+// --------------------------------------------------------------------------
+
+// Matches HuggingFace LogitsProcessorList order used in inference_turbo:
+//   1. TemperatureLogitsWarper   (if temp > 0 and temp != 1)
+//   2. TopKLogitsWarper          (if top_k > 0)
+//   3. TopPLogitsWarper          (if top_p < 1)
+//   4. RepetitionPenaltyLogitsProcessor (if penalty != 1)
+// Then softmax + multinomial.
+static int32_t sample_next_token(
+    const std::vector<float> & logits,
+    const std::vector<int32_t> & generated,
+    const cli_params & params,
+    std::mt19937 & rng) {
+
+    const int n = (int)logits.size();
+    std::vector<float> scores(logits.begin(), logits.end());
+
+    // 1. Temperature
+    if (params.temp > 0.0f && params.temp != 1.0f) {
+        float inv_t = 1.0f / params.temp;
+        for (float & s : scores) s *= inv_t;
+    }
+
+    // 2. TopK  — set everything outside the top-k to -inf
+    if (params.top_k > 0 && params.top_k < n) {
+        std::vector<float> tmp(scores);
+        std::nth_element(tmp.begin(), tmp.begin() + params.top_k, tmp.end(), std::greater<float>());
+        float threshold = tmp[params.top_k];
+        int kept = 0;
+        for (float s : scores) if (s > threshold) ++kept;
+        if (kept < params.top_k) threshold -= 1e-10f;
+        for (float & s : scores) if (s <= threshold) s = -INFINITY;
+    }
+
+    // 3. TopP — set tokens below the cumulative probability cutoff to -inf
+    if (params.top_p < 1.0f) {
+        struct IS { int idx; float s; };
+        std::vector<IS> sorted;
+        sorted.reserve(n);
+        for (int i = 0; i < n; ++i) if (scores[i] != -INFINITY) sorted.push_back({i, scores[i]});
+        std::sort(sorted.begin(), sorted.end(), [](const IS& a, const IS& b){ return a.s > b.s; });
+
+        float mx = sorted.empty() ? 0.0f : sorted[0].s;
+        std::vector<float> probs(sorted.size());
+        float psum = 0;
+        for (size_t i = 0; i < sorted.size(); ++i) { probs[i] = std::exp(sorted[i].s - mx); psum += probs[i]; }
+        for (float & p : probs) p /= psum;
+
+        float cum = 0;
+        std::set<int> keep_set;
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            cum += probs[i];
+            keep_set.insert(sorted[i].idx);
+            if (cum >= params.top_p) break;
+        }
+        if (keep_set.empty() && !sorted.empty()) keep_set.insert(sorted[0].idx);
+        for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
+    }
+
+    // 4. Repetition penalty (HF convention: divide positive, multiply negative)
+    if (params.repeat_penalty != 1.0f && !generated.empty()) {
+        std::set<int32_t> seen(generated.begin(), generated.end());
+        for (int32_t t : seen) {
+            if (t < 0 || t >= n) continue;
+            if (scores[t] == -INFINITY) continue;
+            scores[t] = scores[t] > 0 ? scores[t] / params.repeat_penalty : scores[t] * params.repeat_penalty;
+        }
+    }
+
+    // Softmax + sample (or argmax for greedy)
+    float mx = -INFINITY;
+    for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
+
+    std::vector<float> probs(n);
+    float psum = 0;
+    for (int i = 0; i < n; ++i) {
+        probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
+        psum += probs[i];
+    }
+    if (psum == 0.0f) return 0;
+    for (float & p : probs) p /= psum;
+
+    if (params.temp <= 0.0f) {
+        return (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
+    }
+
+    std::discrete_distribution<int> dist(probs.begin(), probs.end());
+    return dist(rng);
+}
+
+// --------------------------------------------------------------------------
+// Main
+// --------------------------------------------------------------------------
+
+int main(int argc, char ** argv) {
+    ggml_time_init();
+    cli_params params;
+    if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }
+
+    try {
+        std::vector<int32_t> text_tokens;
+        if (!params.text.empty()) {
+            gpt2_bpe bpe;
+            std::string dir = params.tokenizer_dir;
+            if (dir.back() != '/') dir += '/';
+            if (!bpe.load_vocab_json(dir + "vocab.json")) return 1;
+            if (!bpe.load_merges_txt(dir + "merges.txt")) return 1;
+            bpe.load_added_tokens_json(dir + "added_tokens.json");
+
+            std::string normalized = gpt2_bpe::punc_norm(params.text);
+            text_tokens = bpe.tokenize(normalized);
+
+            if (params.dump_tokens_only) {
+                for (size_t i = 0; i < text_tokens.size(); ++i) {
+                    if (i) printf(",");
+                    printf("%d", text_tokens[i]);
+                }
+                printf("\n");
+                return 0;
+            }
+
+            fprintf(stderr, "%s: text: \"%s\"\n", __func__, normalized.c_str());
+            fprintf(stderr, "%s: %zu text tokens\n", __func__, text_tokens.size());
+        } else {
+            text_tokens = read_token_file(params.tokens_file);
+        }
+        if (text_tokens.empty()) throw std::runtime_error("empty token input");
+
+        chatterbox_model model;
+        if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        std::mt19937 rng(params.seed);
+        std::vector<float> logits;
+        int prompt_len = 0;
+        if (!eval_prompt(model, allocr, params.n_threads, text_tokens, logits, prompt_len))
+            throw std::runtime_error("prompt eval failed");
+
+        int n_past = prompt_len;
+        std::vector<int32_t> generated;
+        generated.reserve(params.n_predict + 1);
+
+        int32_t current = sample_next_token(logits, generated, params, rng);
+        generated.push_back(current);
+
+        for (int i = 0; i < params.n_predict; ++i) {
+            if (current == model.hparams.stop_speech_token) break;
+            if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
+            if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
+                throw std::runtime_error("step eval failed");
+            ++n_past;
+            current = sample_next_token(logits, generated, params, rng);
+            generated.push_back(current);
+        }
+
+        if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
+            generated.pop_back();
+
+        if (!params.output.empty()) write_token_file(params.output, generated);
+        for (size_t i = 0; i < generated.size(); ++i) { if (i) printf(","); printf("%d", generated[i]); }
+        printf("\n");
+
+        ggml_gallocr_free(allocr);
+        ggml_backend_buffer_free(model.buffer_w);
+        ggml_backend_buffer_free(model.buffer_kv);
+        ggml_backend_free(model.backend);
+        ggml_free(model.ctx_w);
+        ggml_free(model.ctx_kv);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,299 @@
+# Chatterbox → ggml Port: Development Journal
+
+This document tracks the port of **Chatterbox Turbo** (Resemble AI, MIT license) to
+`ggml` — what was built, what was verified, what's left, and a log of the non-obvious
+issues hit along the way.
+
+- **Model**: `ResembleAI/chatterbox-turbo` (text-to-speech, ~450 M params without
+  the tokenizer / speaker-encoder).
+- **Goal**: end-to-end text → waveform in C++/ggml with **bit-exact (or
+  float-precision) parity** against the official PyTorch reference.
+- **Verification target**: every intermediate tensor within 1e-6 relative error
+  of the PyTorch implementation, on CPU.
+
+---
+
+## 1. Current status
+
+### ✅ Done and verified on the remote Linux x86-64 machine (CPU)
+
+| Stage | Component | Max relative error vs PyTorch |
+|-------|-----------|-------------------------------|
+| — | GPT-2 BPE tokenizer (self-contained C++) | **10 / 10** exact-match test cases |
+| — | T3 speech-token generation (greedy + sampling) | **bit-exact** on 4 deterministic prompts |
+| A | S3Gen speaker_emb projection (F.normalize + Linear) | 1.2e-7 |
+| B | S3Gen input embedding (nn.Embedding lookup) | 0 (exact) |
+| C | Encoder embed (Linear + LayerNorm + sqrt(D) scale + ESPnet rel PE) | 4.4e-7 |
+| D | PreLookaheadLayer (asymmetric-padded Conv1d stack) | 2.5e-7 |
+| E | One Conformer encoder block (rel-pos MHA + rel_shift + Swish FFN) | 1.3e-7 |
+| **F** | **Full encoder** (6 blocks + Upsample1D + 4 blocks + after_norm + encoder_proj) | **5.6e-7** |
+| G1 | CFM time embedding (sin → MLP → mixer) | 7.0e-7 |
+| G2 | CFM `CausalResnetBlock1D` (causal-conv + LN + Mish + time MLP + res_conv) | 2.9e-7 |
+| G3 | `BasicTransformerBlock` (self-attn + FFN with GELU-erf) | 1.7e-7 |
+| **G4** | **Full CFM decoder one step** (1 down + 12 mid + 1 up + final + final_proj) | **1.3e-6** |
+
+Runnable from CPU today: `text → tokens → speech tokens` (via `chatterbox`
+binary). `mel → waveform` (HiFT) is the last missing piece.
+
+### ⏳ Not yet done
+
+- **HiFTGenerator** (vocoder, mel → waveform):
+  - `ConvRNNF0Predictor`
+  - `SineGen` / `SourceModuleHnNSF` (harmonic excitation from F0)
+  - Transposed-conv upsampling stack `[8, 5, 3]`
+  - Multi-ResBlock with Snake activation
+  - STFT/ISTFT output head (24 kHz, hop = 480)
+  - 246 tensors, ~20 MB; `weight_norm` already resolved at conversion time.
+- **End-to-end binary** that glues T3 + S3Gen + HiFT and writes a `.wav`.
+
+---
+
+## 2. Repository layout
+
+```
+qvac-chatterbox.cpp/
+  ggml/                           ← pristine ggml checkout (vendored, unmodified)
+  src/
+    main.cpp                      T3 runtime  (chatterbox binary)
+    gpt2_bpe.{h,cpp}              self-contained GPT-2 byte-level BPE tokenizer
+    test_s3gen.cpp                staged verification harness (stages A..G4)
+    npy.h                         minimal .npy loader + compare helpers
+  scripts/
+    convert-t3-turbo-to-gguf.py   converts Turbo T3 weights + conds to GGUF
+    convert-s3gen-to-gguf.py      converts flow (encoder + CFM) + HiFT to GGUF
+    dump-s3gen-reference.py       runs PyTorch, dumps every intermediate tensor
+    reference-t3-turbo.py         runs PyTorch T3, compares against C++
+    compare-tokenizer.py          10-case tokenizer comparison against HF
+  models/
+    chatterbox-t3-turbo.gguf      T3 + tokenizer conditionals
+    chatterbox-s3gen.gguf         flow + mel2wav weights + built-in voice
+  CMakeLists.txt                  top-level: add_subdirectory(ggml) + two targets
+  README.md                       quick-start
+  PROGRESS.md                     this file
+```
+
+A separate machine holds PyTorch + the original Chatterbox repo for reference
+runs. On-device (Apple Silicon / Linux x86) the C++ binary has **no runtime
+dependency on Python** — the tokenizer reads `vocab.json` + `merges.txt`
+directly.
+
+---
+
+## 3. High-level timeline / what was done
+
+1. **Scoping** — surveyed open-source TTS landscape
+   (`F5-TTS`, `Kokoro`, `XTTS v2`, `Chatterbox`, `Supertonic`, …) and chose
+   `Chatterbox Turbo`: MIT-licensed, zero-shot cloning, Turbo variant runs with
+   just 2 flow-matching steps (fast).
+
+2. **Repo bootstrap** — cloned latest `ggml` + reference
+   `resemble-ai/chatterbox` side-by-side; built a standalone
+   `qvac-chatterbox.cpp/` with `ggml/` as a vendored subdirectory (no
+   modifications inside `ggml/`).
+
+3. **T3 port** (GPT-2 Medium size, 24 layers) — reused the pattern from
+   ggml's `examples/gpt-2`:
+   - Wrote `scripts/convert-t3-turbo-to-gguf.py` to emit GGUF with built-in
+     voice conditionals (`speaker_emb`, `cond_prompt_speech_tokens`) embedded.
+   - C++ graph uses separate "prompt" and "step" graphs with a persistent KV
+     cache.
+   - Verified against PyTorch: **bit-for-bit** identical speech tokens on 4
+     deterministic sampling configs (greedy / temperature / top-k /
+     repetition-penalty / no-penalty × short + long prompts).
+
+4. **C++ tokenizer** — studied llama.cpp's BPE (too entangled with GGUF vocab
+   loading) and wrote a self-contained GPT-2 BPE in `src/gpt2_bpe.cpp`:
+   byte-level encoding table, regex pre-tokenization, BPE merge loop, plus
+   `punc_norm` matching Python's implementation. 10/10 test cases match HF
+   tokenizer byte-for-byte, including the 19 paralinguistic added tokens
+   (`[laugh]`, `[chuckle]`, …).
+
+5. **Full-pipeline glue for T3** — `chatterbox` binary takes `--text` +
+   `--tokenizer-dir` and produces speech tokens end-to-end in C++.
+
+6. **S3Gen encoder** (Upsample Conformer, 10 blocks total, ~60 M params):
+   - Python reference dumper captures every intermediate via `forward_hook`.
+   - Staged C++ implementation (stages A–F above) with per-stage comparison.
+   - Tricky parts: ESPnet relative positional encoding, `rel_shift` attention
+     score alignment, nearest-neighbor ×2 upsample via `concat` trick.
+
+7. **CFM decoder** (U-Net with transformer blocks, ~45 M params):
+   - 1 down block → 12 mid blocks → 1 up block (skip concat) → final_block →
+     final_proj. Each block carries 4 `BasicTransformerBlock`s.
+   - Time embedding: sinusoidal(320) → MLP(320→1024) → mixer(2048→1024) on
+     `concat(t_emb, r_emb)` for meanflow mode.
+   - Verified as a single forward step against `cfm_step0_dxdt.npy` at
+     **rel=1.3e-6**.
+
+---
+
+## 4. Issues found and how they were fixed
+
+Grouping by theme so the story is easy to pattern-match the next time a similar
+bug appears.
+
+### 4.1 Repo / tooling issues
+
+| # | Issue | Cause | Fix |
+|---|-------|-------|-----|
+| 1 | `rsync` not on macOS by default | — | Switched to `tar … \| ssh … tar -x`. |
+| 2 | Remote repo polluted with `._*` AppleDouble files | macOS `tar` writes extended attributes | `COPYFILE_DISABLE=1 tar …` before SSH pipe. |
+| 3 | Partial sync left `src/CMakeLists.txt` stray file | Earlier `scp` blasted a nested CMake file | Removed, and unified sync to always push the whole tree. |
+| 4 | Remote binary `0 bytes` after SSH disconnect | Link step got killed mid-write | `rm build/<target>` + rebuild. |
+| 5 | SSH session dropped for several minutes mid-task | Remote transient | Retried with `ConnectTimeout=10` loops. |
+
+### 4.2 ggml layout & tensor-shape traps
+
+| # | Issue | Cause | Fix |
+|---|-------|-------|-----|
+| 6 | `ggml_can_mul_mat` assertion in `T3` | PyTorch weight `[out, in]` needs transpose for GGUF export of `Conv1D` (`GPT2`'s `c_attn`, `c_proj`, `c_fc`, `mlp.c_proj`) while `nn.Linear`, embeddings, `wpe` already match | Converter transposes only the `Conv1D`-style weights; embeddings and `wpe` pass-through. |
+| 7 | `speaker_embed` broadcasting failed in `cond_spkr` matmul | Reshape produced `ne=[256]` instead of `ne=[1, 256]` | Explicit `reshape_2d(bias, 1, 256)` whenever a `ne=[C]` bias is added to a `ne=[T, C]` conv1d output. |
+| 8 | Nearest-neighbor ×2 upsample gave "interleaved by channel" instead of "repeated per t" | First attempt reshaped to `ne=[T, 1, D]` and concat'd along `ne[1]` → memory order was `t0_copy0, t1_copy0, …, t0_copy1, …` | Correct trick: reshape to `ne=[1, T, D]` → `concat` along `ne[0]` → `ne=[2, T, D]` → reshape to `ne=[2T, D]`, giving `t0_copy0, t0_copy1, t1_copy0, …`. |
+| 9 | `rel_shift` attention produced garbage (~100 % rel error) | `view_3d(bd_viewed, T, 2T-1, H, nb1, **T*(2T-1)*elem**, offset)` used the *sliced* ne[1] size for `nb2` | `nb2` must match the *source's* element stride: use `bd_viewed->nb[2]` directly. |
+| 10 | `ggml_backend_tensor_get(input_tensor)` returned garbage | `ggml_gallocr` reused the input buffer for intermediates because we only marked it `set_input` | Also call `ggml_set_output` on tensors we want to read back; or just read them before `graph_compute`. |
+| 11 | `layer_norm` applied over time axis instead of channel | For `ne=[T, C]` layout, `ggml_norm` reduces `ne[0]=T`, which is wrong | Added a `layer_norm_on_channel` helper that permutes to `ne=[C, T]`, norms, applies affine, permutes back. |
+
+### 4.3 Weight dtype / op compatibility
+
+| # | Issue | Cause | Fix |
+|---|-------|-------|-----|
+| 12 | `ggml_conv_1d` aborted with `src0->type == GGML_TYPE_F16` | Core `ggml_im2col` path requires the kernel to be F16 | Wrote `conv1d_f32` helper that calls `ggml_im2col(…, GGML_TYPE_F32)` + `mul_mat` directly, keeping kernels in F32 for precision. |
+| 13 | Accidentally left `up_layer/conv/w` as F16 while the rest of the convs moved to F32 | Mixed converter state across partial edits | Single converter policy now: **all convs stay F32** (with `conv1d_f32`). Quantization can be added later in one place. |
+| 14 | Ignored `weight_norm` convolutions in `mel2wav` | Torch 2.6 stores them under `parametrizations.weight.original{0,1}` | `expand_weight_norm()` in the converter fuses `g * v / ‖v‖₂` back into a normal `weight` tensor before export. |
+| 15 | GELU mismatch in `BasicTransformerBlock` (rel=3e-4) | `ggml_gelu` is the tanh approximation; `diffusers.models.activations.GELU` uses the exact `erf` formulation | Switched to `ggml_gelu_erf`. Error dropped to 1.7e-7. |
+| 16 | Mish activation missing from ggml unary ops | No `GGML_UNARY_OP_MISH` | Built from primitives: `x * tanh(softplus(x))` via `GGML_UNARY_OP_SOFTPLUS` + `GGML_UNARY_OP_TANH`. |
+
+### 4.4 NumPy / reference-dump gotchas
+
+| # | Issue | Cause | Fix |
+|---|-------|-------|-----|
+| 17 | C++ comparisons showed **100 %** error on `h_ln` even though values in Python looked right | Torch's `.transpose()` yields a non-contiguous view; `np.save` stores it as **Fortran-ordered** (`fortran_order: True` in the .npy header) | Dumper now calls `t.detach().cpu().contiguous().numpy()` followed by `np.ascontiguousarray(...)`. C++ loader also throws a clear error if it sees `fortran_order=True`. |
+| 18 | Python hook overwrote the same tensor across multiple CFM steps | Meanflow calls `time_embeddings` once for `t` and again for `r`; also the full decoder runs twice per sample (`t_span = [0, 0.5, 1]`) | `make_hook(multi_call=True)` counts invocations and saves `*_call0.npy`, `*_call1.npy`, …. |
+| 19 | Confusion between Python `(B, C, T)` vs Python `(B, T, C)` layouts | CFM alternates: resnets are `(B, C, T)`, transformer blocks are `(B, T, C)`, switched via `rearrange` calls | In ggml we mirror this: resnet uses `ne=[T, C]` (= numpy `(C, T)`), transformer uses `ne=[C, T]`. Both helpers clearly label the convention in their doc comments; we `cont(permute)` at the boundary. |
+
+### 4.5 Sampling / numerics parity
+
+| # | Issue | Cause | Fix |
+|---|-------|-------|-----|
+| 20 | Repetition-penalty path diverged from HF at token 22 onwards | Python's `RepetitionPenaltyLogitsProcessor` divides **positive** logits by the penalty and multiplies **negative** logits (shrinks toward 0). My first C++ version did the opposite. | Flipped the sign condition. |
+| 21 | Sampler order mismatched HF's `LogitsProcessorList` | Initial C++ applied rep-penalty first; HF applies Temperature → TopK → TopP → RepetitionPenalty, in that order | Rewrote `sample_next_token` to mirror HF's order exactly. After the fix, greedy+penalty tests pass bit-exactly. |
+
+### 4.6 Dumper / hooking logistics
+
+| # | Issue | Cause | Fix |
+|---|-------|-------|-----|
+| 22 | `UnboundLocalError: cfm` in dumper | Hook registration referred to `cfm = flow.decoder` before that line | Used `flow.decoder.estimator` directly; removed the dependency on a later local binding. |
+| 23 | My `flow_inference(finalize=False)` triggered an internal shape-mismatch assert inside PyTorch | That code path trims `pre_lookahead_len * token_mel_ratio = 6` frames — not the inference path | Pass `finalize=True` (matches what the public `inference()` entry point does). |
+| 24 | Estimator `forward_hook` never fired for per-step tensors | `basic_euler` calls `self.estimator.forward(x, …)` directly, bypassing `__call__` | Monkey-patched `estimator.forward` to record `x_in` / `mu` / `t` / `r` / `spks` / `cond` / `mask` / `dxdt` for every step. |
+
+---
+
+## 5. Verification approach
+
+We treat verification as a staged pipeline:
+
+1. **Python reference dumper** (`scripts/dump-s3gen-reference.py`) runs the
+   full PyTorch pipeline with `forward_hook`s on every module we plan to
+   reimplement. Each intermediate is saved as `.npy` in `artifacts/s3gen-ref/`
+   with a predictable name. Multi-call hooks save a `_call{N}` suffix so each
+   flow-matching step gets its own tensor.
+
+2. **C++ staged harness** (`src/test_s3gen.cpp`) loads a single GGUF, then for
+   each stage:
+   - Loads only the reference tensors needed as inputs.
+   - Builds a tiny ggml graph covering exactly that stage.
+   - Runs the graph and reads back the outputs.
+   - Calls `compare_f32(got, expected, n)` to print
+     `max_abs / mean_abs / rms / max|ref| / rel`.
+
+3. Each stage is gated on rel-error thresholds. Precision regresses
+   immediately visible, so a change that drops precision to ~1e-4 shows up
+   before it silently corrupts later stages.
+
+4. For T3 we additionally have **bit-exact** testing — under greedy decoding
+   with deterministic preprocessing, ggml speech tokens equal PyTorch speech
+   tokens token-for-token.
+
+---
+
+## 6. How to re-run everything
+
+Assume the remote machine has the Python venv already built:
+
+```bash
+ssh gianni@qvac-dev-linux-x64
+cd ~/qvac-chatterbox.cpp
+
+# One-time: build the binaries
+cmake -S . -B build
+cmake --build build -j8 --target chatterbox test-s3gen
+
+# One-time: convert weights + built-in conditionals
+. ~/chatterbox-ref/.venv/bin/activate
+python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
+python scripts/convert-s3gen-to-gguf.py   --out models/chatterbox-s3gen.gguf
+
+# One-time: dump the Python reference tensors
+python scripts/dump-s3gen-reference.py \
+  --text 'Hello from ggml.' --out artifacts/s3gen-ref \
+  --seed 42 --n-predict 64 --device cpu
+
+# Validate every stage in C++
+./build/test-s3gen models/chatterbox-s3gen.gguf artifacts/s3gen-ref ALL
+```
+
+Expected output:
+
+```
+Stage A speaker_emb_affine   rel ≈ 1e-7
+Stage B input_embedded       rel = 0
+Stage C encoder_embed        rel ≈ 4e-7
+Stage D pre_lookahead        rel ≈ 3e-7
+Stage E enc_block0_out       rel ≈ 1e-7
+Stage F encoder_out / mu     rel ≈ 5e-7
+Stage G1 time_mixer          rel ≈ 7e-7
+Stage G2 cfm_resnet_out      rel ≈ 3e-7
+Stage G3 tfm_out             rel ≈ 2e-7
+Stage G4 cfm_step0_dxdt      rel ≈ 1e-6
+```
+
+End-to-end T3 text → speech tokens (currently the deepest working path on-device):
+
+```bash
+./build/chatterbox \
+  --model models/chatterbox-t3-turbo.gguf \
+  --text 'Hello from ggml.' \
+  --tokenizer-dir ~/.cache/huggingface/hub/models--ResembleAI--chatterbox-turbo/snapshots/*/ \
+  --output speech_tokens.txt
+```
+
+---
+
+## 7. Next steps
+
+1. **HiFTGenerator** — port `ConvRNNF0Predictor`, `SineGen`, the transposed
+   conv upsample stack, multi-ResBlock with Snake activation, and the
+   STFT/ISTFT output head. Validate against `waveform.npy` (already dumped by
+   the reference pipeline) at **rel < 1e-4** (vocoder precision is typically
+   looser than pure transformer ops because of `stft`/`istft` and `cumsum`
+   phase).
+
+2. **End-to-end binary** — wire T3 → S3Gen → HiFT in a single `chatterbox`
+   invocation that takes `--text` and emits a `.wav`. Expected speed on CPU:
+   ~ real-time factor 1.0–1.5× on a modern desktop (T3 is the long pole, ~30
+   steps/s for 24-layer GPT-2 Medium in ggml).
+
+3. **GPU backends** — once the CPU path is stable, re-enable `GGML_CUDA` /
+   `GGML_METAL` paths. The code is already using `ggml_backend_t` abstractions
+   so in principle only conv1d needs custom wiring (im2col path is already
+   backend-agnostic).
+
+4. **Quantization** — T3 alone is ~700 MB in F16; a Q4_0 / Q4_K_M path should
+   land us around 200 MB with negligible quality loss (proven on GPT-2 Medium
+   sized backbones elsewhere). Convs in S3Gen / HiFT stay F32 for now.
+
+5. **Voice cloning** — currently uses the built-in `conds.pt` voice. To
+   support custom audio we'd need to port `VoiceEncoder` (3-layer LSTM) and
+   either `S3Tokenizer` or accept pre-computed speaker embeddings from
+   Python-side preprocessing. LSTM inference in ggml is known-good via
+   whisper.cpp / llama.cpp patterns.
