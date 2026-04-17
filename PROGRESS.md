@@ -417,21 +417,174 @@ python scripts/dump-s3gen-reference.py \
 
 ## Still on the table
 
-1. **Quantize the T3 GPT-2 Medium backbone** to Q4_K_M / Q5_K — only affects
-   the separate `chatterbox` (T3) binary. ~700 MB F16 → ~200 MB Q4_K_M with
-   negligible quality loss (proven on GPT-2 Medium sized backbones
-   elsewhere).
-2. **GPU backends** (CUDA / Metal) — already wired through `ggml_backend_t`;
-   untested for this workload. With the graph-reuse in place these should
-   be straightforward.
-3. **Pre-compiled / cached graphs across utterances** — for server mode,
-   extend the `cfm_estimator_cache` pattern to the encoder and HiFT graphs
-   so the per-utterance graph-build + `gallocr_reserve` cost amortizes.
-4. **Voice cloning** — currently uses the built-in `conds.pt` voice. To
-   support custom audio, port `VoiceEncoder` (3-layer LSTM) and either
-   `S3Tokenizer` or accept pre-computed speaker embeddings from a Python
-   preprocessing step. LSTM inference in ggml is known-good via
-   `whisper.cpp` / `llama.cpp` patterns.
-5. **Custom Conformer flash-attn op** — implement a ggml op that folds
-   ESPnet's in-softmax relative positional bias into a flash-attention
-   kernel, so the S3Gen encoder can also benefit (Attempt 8 above).
+Ranked by impact-per-effort ratio, from biggest wins to niche polish.
+
+### Tier A — biggest wins, should be tackled next
+
+#### A1. Voice cloning (VoiceEncoder + S3Tokenizer + mel extraction)
+
+Right now the only voice is the built-in one baked into `conds.pt`; users
+cannot clone their own. Adds a `--reference-audio file.wav` flag to
+`chatterbox-tts` that computes the three conditioning tensors in C++
+instead of requiring the Python-side dump.
+
+What to port:
+- **`VoiceEncoder`** — 3-layer bi-LSTM, `wav (16 kHz) → speaker embedding
+  (192-d)`. LSTM in ggml is known-good from `whisper.cpp` / `llama.cpp`
+  / `bark.cpp`.
+- **`S3Tokenizer`** — small wav2vec-style encoder producing the
+  6561-vocab speech tokens used as `prompt_token`.
+- **Mel spectrogram extraction** for `prompt_feat` — 80-channel log-mel
+  via STFT + filterbank. The STFT code from the HiFT port is reusable;
+  mel filterbank is ~50 lines.
+
+Scope: ~2–3 days. Biggest unknown is the `S3Tokenizer` architecture.
+
+Impact: **transforms the project from a fixed-voice demo into a real
+zero-shot TTS** — the flagship Chatterbox feature.
+
+#### A2. GPU backend (Metal first, then CUDA)
+
+The code already uses `ggml_backend_t` abstractions everywhere and the
+CMake flags `GGML_METAL` / `GGML_CUDA` exist; only the CPU path has been
+tested so far. `chatterbox` has a `--n-gpu-layers N` flag — need to wire
+the same through to `chatterbox-tts` and then actually run it.
+
+Work items:
+- Wire `--n-gpu-layers` on `chatterbox-tts`.
+- Verify each custom op has a GPU kernel. Known fine on GPU:
+  `flash_attn_ext`, `mul_mat`, `conv_1d` via im2col (standard),
+  `soft_max`, `norm`. Probably fine: `ggml_sin` / `ggml_exp` /
+  `ggml_leaky_relu` / `ggml_gelu_erf`. Need verification:
+  `ggml_conv_1d` with **F32** `im2col` path (we pass `GGML_TYPE_F32` to
+  keep conv kernels F32), `ggml_conv_transpose_1d`.
+- Validate numerical parity — GPU `flash_attn_ext` often runs F16
+  internally; confirm rel error vs PyTorch stays <1e-4.
+
+Scope: 1–2 days if everything "just works", up to ~a week if two or three
+ops need custom wiring or fallbacks.
+
+Impact: on Apple M-series Metal, RTF should comfortably drop **below 0.1**
+(sub-second generation for most utterances). Desktop discrete GPU: lower
+still. **The single biggest speedup lever left.**
+
+#### A3. Quantize T3 to Q4_K_M / Q5_K
+
+T3 (GPT-2 Medium, ~700 MB in F16) is the one memory-bandwidth-dominated
+component in the pipeline and is a textbook quantization target.
+
+What to do:
+- Gate `mul_mat` weights in `scripts/convert-t3-turbo-to-gguf.py` behind
+  `--quant Q4_K_M` / `--quant Q5_K_M` (pass the dtype straight into
+  `gguf.GGUFWriter.add_tensor`).
+- Leave `wpe`, embeddings, layer norms, `speech_head` in F32/F16
+  (standard llama.cpp quantization policy).
+- C++ needs no changes — `ggml_mul_mat` with Q4_K weights and F32
+  activations is a built-in fast path on both CPU and GPU.
+
+Scope: **half a day**, mostly converter-side.
+
+Impact:
+- File size: ~700 MB → ~180 MB (4× smaller — matters for mobile /
+  bundled distribution).
+- T3 wall time: typically 30–50 % faster on CPU.
+- End-to-end: T3 is ~30 % of pipeline time on the EPYC, so **~10–15 %
+  end-to-end speedup**.
+- Quality: negligible at Q4_K_M for GPT-2 Medium-sized backbones
+  (confirmed on comparable LLMs).
+
+S3Gen / HiFT weights are conv-dominated (F16 on CFM linears actually
+regressed on CPU — see §3.8 Attempt 7), so keep those F32.
+
+### Tier B — serious work, impactful for specific use cases
+
+#### B1. Streaming / chunked generation for first-token latency
+
+The current pipeline is "wait 2.4 s then hear all 8.6 s at once". For
+interactive apps, **first-audio-out latency** matters more than
+total RTF.
+
+What to port:
+- Chatterbox's `S3GenStreamer` path in Python: interleaves T3
+  token-generation with chunked S3Gen / HiFT runs, overlap-adds their
+  waveforms at the seams.
+- Adds `flow_cache`, `cache_source`, `mel_cache` parameters we've been
+  setting to empty, plus the overlap-add math for the HiFT vocoder.
+- Emit audio to stdout (or a callback) as each chunk comes out.
+
+Scope: ~**1 week**, mostly because the overlap-add math has to match
+Python byte-for-byte or seams click.
+
+Impact: **first audio chunk out in ~200–400 ms** instead of 2+ s. Turns
+the binary from "batch" into "live".
+
+#### B2. Server mode with persistent graphs
+
+Every invocation currently pays ~200–400 ms fixed cost for graph
+construction + `gallocr_reserve` + model load. Amortizing these over a
+long-running process is free wall-time for a deployed service.
+
+What to do:
+- Daemonize with a simple stdio JSON-RPC or HTTP interface.
+- Extend the `cfm_estimator_cache` pattern (from §3.8 Attempt 4) to the
+  encoder and HiFT graphs — keep them pre-reserved across requests.
+- Tensor shapes depend on input length → either: (a) LRU of per-length
+  graphs, (b) pad to a fixed max length + attention mask, or (c) rebuild
+  on shape change but pool the buffers.
+
+Scope: **2–3 days**.
+
+Impact: for repeated short utterances on the same server, another **20–30 %**
+off wall time on top of the current RTF 0.28.
+
+### Tier C — nice polish, niche
+
+#### C1. Custom fused Conformer attention op (with rel-pos bias)
+
+The S3Gen encoder's 10 Conformer blocks couldn't use `flash_attn_ext`
+because they add ESPnet relative positional bias *inside* the softmax
+(see §3.8 Attempt 8). A custom op that does
+`softmax(QKᵀ/√d + B) · V` with B pre-computed `[L, T, H]` would fuse
+those too.
+
+Scope: **3–5 days** — CPU AVX-512 kernel first, Metal/CUDA once (A2) is
+online.
+
+Impact: maybe 50–100 ms off encoder (~10 % of encoder, which is already
+only 12 % of the pipeline). Small in absolute terms; does get you the
+same fusion level throughout.
+
+#### C2. Batch generation
+
+Multiple utterances in one pass. Python supports it; our C++ pipeline
+assumes batch=1 throughout. Only matters at scale (multiple concurrent
+users).
+
+#### C3. Repository / packaging polish
+
+- **GitHub Actions CI** running `compare-tokenizer.py` + `test-s3gen ALL`
+  on every push. All the validation infrastructure is already in place;
+  wiring it takes a few hours.
+- **Prebuilt GGUFs on Hugging Face** so end users don't need the
+  Python toolchain at all. Upload the two `.gguf` files with a model
+  card explaining the build.
+- **Library API** (not just binaries). Expose
+  `chatterbox_synthesize(text, opts) -> wav` as a C / C++ API so
+  Swift / Node.js / Python bindings can layer on top. ~Half a day.
+
+### Recommended next-up order
+
+For maximum usefulness per day of effort:
+
+1. **A3 — Quantize T3** (~4 h) → instant size/speed win, essentially
+   risk-free.
+2. **A1 — Voice cloning** (2–3 days) → unlocks the flagship
+   Chatterbox feature; without it this is only a demo.
+3. **A2 — Metal backend** (1–2 days if smooth) → biggest speedup left;
+   Mac users feel it immediately.
+4. **B1 — Streaming** (~1 week) → what gets this into interactive apps.
+5. **C3 — CI + prebuilt GGUFs** — pick up before announcing publicly.
+
+B2 (server mode) and C1 (custom Conformer attn op) are worth doing once a
+concrete deployment is pressuring for them; right now the CPU numbers are
+already well past real-time for CLI use.
