@@ -1104,50 +1104,39 @@ static std::vector<int32_t> read_tokens_file(const std::string & path) {
 }
 
 // ============================================================================
-// Main
+// Public entry point — takes pre-generated T3 speech tokens + a voice source
+// (either a --ref-dir with .npy files or the built-in voice baked into the
+// s3gen GGUF) and writes a 24 kHz wav.
 // ============================================================================
 
-int main(int argc, char ** argv) {
-    std::string gguf_path, ref_dir, tokens_file, tokens_csv, out_path;
-    int seed = 42;
-    int sr = 24000;
-    int pre_lookahead_len = 3;  // Chatterbox default
-    int token_mel_ratio = 1;    // for T3 output
-    bool debug_mode = false;
-    int n_threads = 0;  // 0 -> auto (hw_concurrency)
-    (void)token_mel_ratio;
+#include "s3gen_pipeline.h"
 
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if (a == "--s3gen-gguf" && i + 1 < argc) gguf_path = argv[++i];
-        else if (a == "--ref-dir" && i + 1 < argc) ref_dir = argv[++i];
-        else if (a == "--tokens-file" && i + 1 < argc) tokens_file = argv[++i];
-        else if (a == "--tokens" && i + 1 < argc) tokens_csv = argv[++i];
-        else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
-        else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
-        else if (a == "--threads" && i + 1 < argc) n_threads = std::atoi(argv[++i]);
-        else if (a == "--debug") debug_mode = true;
-        else {
-            fprintf(stderr,
-                "usage: %s --s3gen-gguf MODEL.gguf [--ref-dir DIR]\n"
-                "           (--tokens-file FILE | --tokens CSV)\n"
-                "           --out OUT.wav [--seed N] [--threads N] [--debug]\n"
-                "\n"
-                "With no --ref-dir the built-in voice embedded in MODEL.gguf is used.\n"
-                "--ref-dir is required for --debug mode (needs Python-dumped tensors).\n",
-                argv[0]);
-            return 1;
-        }
-    }
+int s3gen_synthesize_to_wav(
+    const std::vector<int32_t> & speech_tokens,
+    const s3gen_synthesize_opts & opts)
+{
+    const std::string & gguf_path = opts.s3gen_gguf_path;
+    const std::string & ref_dir   = opts.ref_dir;
+    const std::string & out_path  = opts.out_wav_path;
+    const int  seed       = opts.seed;
+    const int  sr         = opts.sr;
+    const bool debug_mode = opts.debug;
+    const int  pre_lookahead_len = 3;  // Chatterbox default
+
+    int n_threads = opts.n_threads;
     if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
     g_n_threads = n_threads;
     fprintf(stderr, "Using %d threads\n", g_n_threads);
     if (gguf_path.empty() || out_path.empty()) {
-        fprintf(stderr, "missing required arguments (--s3gen-gguf and --out)\n");
+        fprintf(stderr, "s3gen_synthesize_to_wav: s3gen_gguf_path and out_wav_path are required\n");
         return 1;
     }
     if (debug_mode && ref_dir.empty()) {
         fprintf(stderr, "--debug requires --ref-dir (Python-dumped intermediate tensors)\n");
+        return 1;
+    }
+    if (speech_tokens.empty()) {
+        fprintf(stderr, "s3gen_synthesize_to_wav: speech_tokens is empty\n");
         return 1;
     }
 
@@ -1175,22 +1164,6 @@ int main(int argc, char ** argv) {
         pf_rows = (int)pf_npy.shape[0];
     }
 
-    // Speech tokens
-    std::vector<int32_t> speech_tokens;
-    if (!tokens_file.empty()) {
-        speech_tokens = read_tokens_file(tokens_file);
-    } else if (!tokens_csv.empty()) {
-        std::stringstream ss(tokens_csv);
-        std::string t;
-        while (std::getline(ss, t, ',')) speech_tokens.push_back(std::stoi(t));
-    } else if (!ref_dir.empty()) {
-        npy_array st = npy_load(ref_dir + "/speech_tokens.npy");
-        const int32_t * pi = (const int32_t *)st.data.data();
-        for (size_t i = 0; i < st.n_elements(); ++i) speech_tokens.push_back(pi[i]);
-    } else {
-        fprintf(stderr, "error: no speech tokens provided (use --tokens-file or --tokens)\n");
-        return 1;
-    }
     fprintf(stderr, "Speech tokens: %zu\n", speech_tokens.size());
 
     // Trim tokens >= vocab_size and append 3 silence tokens (S3GEN_SIL=4299)

@@ -28,6 +28,8 @@
 #include <thread>
 #include <vector>
 
+#include "s3gen_pipeline.h"
+
 static constexpr int CHBX_MAX_NODES = 8192;
 
 // --------------------------------------------------------------------------
@@ -122,10 +124,15 @@ struct chatterbox_model {
 // --------------------------------------------------------------------------
 
 struct cli_params {
-    std::string model;
-    std::string tokens_file;
-    std::string text;
-    std::string output;
+    std::string model;           // T3 GGUF (required unless --tokens-file + --s3gen-gguf)
+    std::string tokens_file;     // optional pre-tokenized speech tokens (skips T3)
+    std::string text;            // input text for T3
+    std::string output;          // legacy: speech-tokens output file (if set, write tokens)
+    // S3Gen + HiFT vocoder:
+    std::string s3gen_gguf;      // enables full text → wav pipeline
+    std::string out_wav;         // wav output path (requires --s3gen-gguf)
+    std::string ref_dir;         // override built-in voice with .npy reference dump
+    bool    debug          = false;  // --debug: load Python-dumped intermediates for validation
     bool    dump_tokens_only = false;
     int32_t seed           = 0;
     int32_t n_threads      = std::min(4, (int32_t) std::thread::hardware_concurrency());
@@ -145,8 +152,17 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          (must embed tokenizer.ggml.* metadata; produced by the\n");
     fprintf(stderr, "                          current converter)\n");
     fprintf(stderr, "  --text TEXT             Input text (uses the GPT-2 BPE tokenizer embedded in GGUF)\n");
-    fprintf(stderr, "  --tokens-file PATH      Pre-tokenized text token ids (alternative to --text)\n");
-    fprintf(stderr, "  --output PATH           Output file for generated speech tokens\n");
+    fprintf(stderr, "  --tokens-file PATH      Pre-tokenized text token ids (alternative to --text).\n");
+    fprintf(stderr, "                          With --s3gen-gguf this is interpreted as *speech* tokens\n");
+    fprintf(stderr, "                          and the T3 step is skipped.\n");
+    fprintf(stderr, "  --output PATH           Write generated speech tokens to PATH (text mode).\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  --s3gen-gguf PATH       Enables the full text -> wav pipeline (S3Gen + HiFT).\n");
+    fprintf(stderr, "  --out PATH              Output wav file when --s3gen-gguf is set.\n");
+    fprintf(stderr, "  --ref-dir DIR           Override built-in voice with embedding.npy /\n");
+    fprintf(stderr, "                          prompt_token.npy / prompt_feat.npy from DIR.\n");
+    fprintf(stderr, "  --debug                 Load reference intermediates from --ref-dir for\n");
+    fprintf(stderr, "                          bit-exact numerical validation (requires --ref-dir).\n");
     fprintf(stderr, "  --seed N                RNG seed (default: 0)\n");
     fprintf(stderr, "  --threads N             CPU threads (default: %d)\n", std::min(4, (int32_t) std::thread::hardware_concurrency()));
     fprintf(stderr, "  --n-predict N           Max speech tokens (default: 256)\n");
@@ -171,6 +187,10 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--text")           { auto v = next("--text");           if (!v) return false; params.text = v; }
         else if (arg == "--tokens-file")    { auto v = next("--tokens-file");    if (!v) return false; params.tokens_file = v; }
         else if (arg == "--output")         { auto v = next("--output");         if (!v) return false; params.output = v; }
+        else if (arg == "--s3gen-gguf")     { auto v = next("--s3gen-gguf");     if (!v) return false; params.s3gen_gguf = v; }
+        else if (arg == "--out")            { auto v = next("--out");            if (!v) return false; params.out_wav = v; }
+        else if (arg == "--ref-dir")        { auto v = next("--ref-dir");        if (!v) return false; params.ref_dir = v; }
+        else if (arg == "--debug")          { params.debug = true; }
         else if (arg == "--seed")           { auto v = next("--seed");           if (!v) return false; params.seed = std::stoi(v); }
         else if (arg == "--threads")        { auto v = next("--threads");        if (!v) return false; params.n_threads = std::stoi(v); }
         else if (arg == "--n-predict")      { auto v = next("--n-predict");      if (!v) return false; params.n_predict = std::stoi(v); }
@@ -191,9 +211,21 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         }
         return true;
     }
-    if (params.model.empty()) { fprintf(stderr, "error: --model is required\n"); return false; }
+    // If we're only doing the S3Gen+HiFT back half (user already has speech tokens),
+    // --model (T3) is optional; otherwise it's required.
+    const bool skip_t3 = !params.s3gen_gguf.empty() && !params.tokens_file.empty() && params.text.empty();
+    if (!skip_t3 && params.model.empty()) {
+        fprintf(stderr, "error: --model is required (pass --s3gen-gguf + --tokens-file to skip T3)\n");
+        return false;
+    }
     if (params.text.empty() && params.tokens_file.empty()) {
         fprintf(stderr, "error: either --text or --tokens-file is required\n"); return false;
+    }
+    if (!params.s3gen_gguf.empty() && params.out_wav.empty()) {
+        fprintf(stderr, "error: --s3gen-gguf requires --out PATH.wav\n"); return false;
+    }
+    if (params.debug && params.ref_dir.empty()) {
+        fprintf(stderr, "error: --debug requires --ref-dir\n"); return false;
     }
     return true;
 }
@@ -669,6 +701,20 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }
 
     try {
+        // Short-circuit: user gave us speech tokens directly + --s3gen-gguf. Skip T3 entirely.
+        if (params.model.empty() && !params.s3gen_gguf.empty() && !params.tokens_file.empty()) {
+            std::vector<int32_t> speech_tokens = read_token_file(params.tokens_file);
+            if (speech_tokens.empty()) throw std::runtime_error("empty speech tokens file");
+            s3gen_synthesize_opts opts;
+            opts.s3gen_gguf_path = params.s3gen_gguf;
+            opts.out_wav_path    = params.out_wav;
+            opts.ref_dir         = params.ref_dir;
+            opts.seed            = params.seed;
+            opts.n_threads       = params.n_threads;
+            opts.debug           = params.debug;
+            return s3gen_synthesize_to_wav(speech_tokens, opts);
+        }
+
         // Load model first so we can use the GGUF-embedded tokenizer (if any).
         chatterbox_model model;
         if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
@@ -732,8 +778,23 @@ int main(int argc, char ** argv) {
             generated.pop_back();
 
         if (!params.output.empty()) write_token_file(params.output, generated);
-        for (size_t i = 0; i < generated.size(); ++i) { if (i) printf(","); printf("%d", generated[i]); }
-        printf("\n");
+
+        // If --s3gen-gguf is set, chain into the S3Gen + HiFT vocoder to write a wav.
+        if (!params.s3gen_gguf.empty()) {
+            s3gen_synthesize_opts opts;
+            opts.s3gen_gguf_path = params.s3gen_gguf;
+            opts.out_wav_path    = params.out_wav;
+            opts.ref_dir         = params.ref_dir;
+            opts.seed            = params.seed;
+            opts.n_threads       = params.n_threads;
+            opts.debug           = params.debug;
+            int rc = s3gen_synthesize_to_wav(generated, opts);
+            if (rc != 0) return rc;
+        } else {
+            // Legacy: print the tokens to stdout too (handy for piping).
+            for (size_t i = 0; i < generated.size(); ++i) { if (i) printf(","); printf("%d", generated[i]); }
+            printf("\n");
+        }
 
         ggml_gallocr_free(allocr);
         ggml_backend_buffer_free(model.buffer_w);

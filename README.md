@@ -13,22 +13,24 @@ optimization pass that got us to **3.6× faster than real-time on CPU**.
 ## Pipeline at a glance
 
 ```
-      text                                                  24 kHz wav
-       │                                                         ▲
-       ▼                                                         │
-  ┌────────────┐     speech tokens      ┌──────────────────────────────┐
-  │ chatterbox │ ─────────────────────► │ chatterbox-tts               │
-  │  (T3)      │      (int32, 6561      │  S3Gen encoder               │
-  │            │       vocab)           │  + CFM 2-step meanflow       │
-  └────────────┘                        │  + HiFT vocoder (mel → wav)  │
-       ▲                                 └──────────────────────────────┘
-       │                                               ▲
-   BPE tokenizer                                reference voice
-   (embedded in T3 GGUF metadata)               (embedded in S3Gen GGUF)
+      text                                                 24 kHz wav
+       │                                                        ▲
+       ▼                                                        │
+  ┌────────────────────────────────────────────────────────────────┐
+  │                       chatterbox                               │
+  │                                                                │
+  │   T3 (GPT-2 Medium)  ──►  S3Gen encoder  ──►  CFM (meanflow)   │
+  │   text → speech toks      speech toks → h      h → mel         │
+  │                                                                │
+  │                          HiFT vocoder  ──►  24 kHz wav         │
+  └────────────────────────────────────────────────────────────────┘
+       ▲                                              ▲
+   BPE tokenizer                               reference voice
+   (embedded in T3 GGUF metadata)              (embedded in S3Gen GGUF)
 ```
 
-`scripts/synthesize.sh` chains the two binaries into a single `text → wav`
-command.
+One binary, one invocation, end to end — `scripts/synthesize.sh` is a
+thin convenience wrapper that fills in the two GGUF paths.
 
 ## Prerequisites
 
@@ -58,7 +60,7 @@ cd chatterbox.cpp
 # ggml is vendored as a sibling subdirectory
 git clone https://github.com/ggml-org/ggml.git ggml
 
-# Build all 4 binaries: chatterbox, chatterbox-tts, mel2wav, test-s3gen
+# Build all 3 binaries: chatterbox, mel2wav, test-s3gen
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
@@ -67,8 +69,7 @@ This produces:
 
 | Binary | What it does |
 |--------|--------------|
-| `build/chatterbox` | T3: text → speech tokens |
-| `build/chatterbox-tts` | S3Gen + HiFT: speech tokens → 24 kHz wav |
+| `build/chatterbox` | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT) |
 | `build/mel2wav` | HiFT only: mel.npy → wav (demo) |
 | `build/test-s3gen` | Staged numerical validation vs Python dumps |
 
@@ -116,20 +117,14 @@ The easiest way:
 ./scripts/synthesize.sh "Hello from native C plus plus." /tmp/out.wav
 ```
 
-That wraps the two-binary pipeline:
+That's equivalent to running the binary directly:
 
 ```bash
-# What synthesize.sh actually runs under the hood:
-
 ./build/chatterbox \
-  --model models/chatterbox-t3-turbo.gguf \
-  --text "Hello from native C plus plus." \
-  --output /tmp/tokens.txt
-
-./build/chatterbox-tts \
-  --s3gen-gguf models/chatterbox-s3gen.gguf \
-  --tokens-file /tmp/tokens.txt \
-  --out /tmp/out.wav
+  --model       models/chatterbox-t3-turbo.gguf \
+  --s3gen-gguf  models/chatterbox-s3gen.gguf \
+  --text        "Hello from native C plus plus." \
+  --out         /tmp/out.wav
 ```
 
 Everything is self-contained in the two `.gguf` files:
@@ -140,9 +135,15 @@ Everything is self-contained in the two `.gguf` files:
 - `chatterbox-s3gen.gguf` embeds the built-in reference voice (embedding,
   prompt token, prompt mel) under `s3gen/builtin/*`.
 
-`chatterbox-tts` also accepts `--ref-dir DIR` to override the built-in
-voice with `embedding.npy` / `prompt_token.npy` / `prompt_feat.npy`
-(used by validation and custom-voice workflows).
+Advanced modes:
+
+- **T3 only** — drop `--s3gen-gguf` + `--out`; write tokens with
+  `--output tokens.txt`. Useful for piping into other tools.
+- **S3Gen + HiFT only** — pass `--s3gen-gguf` + `--tokens-file FILE` with
+  already-generated speech tokens and no `--model`.
+- **Custom voice** — `--ref-dir DIR` overrides the built-in voice with
+  `embedding.npy` / `prompt_token.npy` / `prompt_feat.npy` from a
+  directory produced by `scripts/dump-s3gen-reference.py`.
 
 Play the result:
 
@@ -156,10 +157,11 @@ ffplay /tmp/out.wav         # any OS with ffmpeg
 
 - `--seed N` — change the RNG seed for the CFM initial noise and the SineGen
   excitation (same text, different voice "take").
-- `--threads N` — override the default `std::thread::hardware_concurrency()`
-  on `chatterbox-tts`. The sweet spot on a 10-core CPU is 10.
-- `--debug` — on `chatterbox-tts`, substitute Python-dumped reference values
-  for the random bits so every stage can be bit-exactly compared to PyTorch.
+- `--threads N` — override the default `std::thread::hardware_concurrency()`.
+  The sweet spot on a 10-core CPU is 10.
+- `--debug` (requires `--ref-dir`) — substitute Python-dumped reference
+  values for the random bits so every stage can be bit-exactly compared to
+  PyTorch.
 
 Typical timings on a 10-core EPYC CPU:
 
@@ -218,10 +220,11 @@ python scripts/reference-t3-turbo.py \
 chatterbox.cpp/
   ggml/                          pristine ggml clone (not tracked)
   src/
-    main.cpp                     T3 runtime          (chatterbox)
-    chatterbox_tts.cpp           S3Gen + HiFT runtime (chatterbox-tts)
-    mel2wav.cpp                  HiFT-only demo       (mel2wav)
-    test_s3gen.cpp               staged validation    (test-s3gen)
+    main.cpp                     CLI + T3 runtime      (chatterbox)
+    chatterbox_tts.cpp           S3Gen + HiFT pipeline (linked into chatterbox)
+    s3gen_pipeline.h             public API for the S3Gen+HiFT back half
+    mel2wav.cpp                  HiFT-only demo        (mel2wav)
+    test_s3gen.cpp               staged validation     (test-s3gen)
     gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer
     npy.h                        minimal .npy loader + compare helpers
   scripts/
@@ -233,7 +236,7 @@ chatterbox.cpp/
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
   models/                        generated GGUFs (not tracked)
   artifacts/s3gen-ref/           generated .npy reference tensors (not tracked)
-  CMakeLists.txt                 top-level build: add_subdirectory(ggml) + 4 targets
+  CMakeLists.txt                 top-level build: add_subdirectory(ggml) + 3 targets
   README.md                      this file
   PROGRESS.md                    chronological development journal
 ```
@@ -260,5 +263,5 @@ magnitude are from the stochastic SineGen excitation (non-bit-exact RNG
 between `std::mt19937` and `torch.rand`).
 
 **Slower than real-time** — make sure you built `-DCMAKE_BUILD_TYPE=Release`
-and that `--threads` picks up all your cores. `synthesize.sh` inherits
-defaults from `std::thread::hardware_concurrency()` via `chatterbox-tts`.
+and that `--threads` picks up all your cores. The binary defaults to
+`std::thread::hardware_concurrency()`.
