@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #define DR_WAV_IMPLEMENTATION
@@ -254,4 +255,107 @@ std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
         /*n_fft=*/400, /*hop=*/160, /*win=*/400, /*n_mels=*/40,
         /*center=*/1, /*power_exp=*/2.0f, /*log_floor=*/-1.0f,
         /*transpose=*/true);
+}
+
+// ---------------------------------------------------------------------------
+// Kaldi-style 80-channel fbank @ 16 kHz (torchaudio.compliance.kaldi.fbank).
+// ---------------------------------------------------------------------------
+std::vector<float> fbank_kaldi_80(const std::vector<float> & wav_16k,
+                                  const std::vector<float> & mel_filterbank)
+{
+    const int n_fft      = 512;           // next_pow2(frame_length)
+    const int frame_len  = 400;           // 25 ms @ 16 kHz
+    const int hop        = 160;           // 10 ms @ 16 kHz
+    const int n_mels     = 80;
+    const int F          = n_fft / 2 + 1; // 257
+    const float preemph  = 0.97f;
+    // NB: torchaudio.compliance.kaldi.fbank, unlike Kaldi itself, does NOT
+    // apply the int16 (×32768) scaling to the input.  It consumes float32
+    // audio in the original [-1, 1] range directly.
+
+    if (mel_filterbank.size() != (size_t)(n_mels * F)) {
+        fprintf(stderr,
+            "fbank_kaldi_80: filterbank has %zu elements, expected %d (n_mels * F)\n",
+            mel_filterbank.size(), n_mels * F);
+        return {};
+    }
+
+    const int L = (int)wav_16k.size();
+    if (L < frame_len) return {};
+    const int T = (L - frame_len) / hop + 1;  // snip_edges=True, no padding
+
+    // Povey window: (0.5 - 0.5*cos(2*pi*i/(N-1)))**0.85  over N=frame_len.
+    std::vector<float> povey(frame_len);
+    for (int n = 0; n < frame_len; ++n) {
+        double a = 0.5 - 0.5 * std::cos(2.0 * M_PI * (double)n / (double)(frame_len - 1));
+        povey[n] = (float)std::pow(a, 0.85);
+    }
+
+    // DFT twiddle tables (512-point, 257 bins).
+    std::vector<float> cos_tbl((size_t)F * n_fft);
+    std::vector<float> sin_tbl((size_t)F * n_fft);
+    for (int k = 0; k < F; ++k) {
+        for (int n = 0; n < n_fft; ++n) {
+            double th = 2.0 * M_PI * (double)k * (double)n / (double)n_fft;
+            cos_tbl[(size_t)k * n_fft + n] = (float)std::cos(th);
+            sin_tbl[(size_t)k * n_fft + n] = (float)std::sin(th);
+        }
+    }
+
+    // Per-frame processing, stored directly in the output (T, 80) tensor.
+    std::vector<float> out((size_t)T * n_mels);
+
+    std::vector<float> frame(n_fft, 0.0f);
+    std::vector<float> power(F);
+    for (int t = 0; t < T; ++t) {
+        // 1. Copy frame_len samples into frame; the rest stay zero (zero-pad
+        //    to n_fft for the FFT).
+        const float * src = wav_16k.data() + t * hop;
+        for (int n = 0; n < frame_len; ++n) frame[n] = src[n];
+        for (int n = frame_len; n < n_fft; ++n) frame[n] = 0.0f;
+
+        // 2. Remove DC offset.
+        double acc = 0.0;
+        for (int n = 0; n < frame_len; ++n) acc += frame[n];
+        float dc = (float)(acc / frame_len);
+        for (int n = 0; n < frame_len; ++n) frame[n] -= dc;
+
+        // 3. Preemphasis.
+        //   out[i] = frame[i] - 0.97 * frame[i-1]  for i>=1
+        //   out[0] = frame[0] - 0.97 * frame[0] = frame[0] * (1 - 0.97)
+        // Apply in reverse so we don't need an extra buffer.
+        for (int n = frame_len - 1; n >= 1; --n) {
+            frame[n] = frame[n] - preemph * frame[n - 1];
+        }
+        frame[0] = frame[0] * (1.0f - preemph);
+
+        // 4. Povey window.
+        for (int n = 0; n < frame_len; ++n) frame[n] *= povey[n];
+
+        // 5. FFT -> magnitude².
+        for (int k = 0; k < F; ++k) {
+            const float * cs = cos_tbl.data() + (size_t)k * n_fft;
+            const float * sn = sin_tbl.data() + (size_t)k * n_fft;
+            float re = 0.0f, im = 0.0f;
+            for (int n = 0; n < n_fft; ++n) {
+                re += frame[n] * cs[n];
+                im -= frame[n] * sn[n];
+            }
+            power[k] = re * re + im * im;
+        }
+
+        // 6. Mel filterbank matmul → (80,) for this frame.
+        //    out[t, m] = sum_k fb[m, k] * power[k], then log(clip(., eps)).
+        for (int m = 0; m < n_mels; ++m) {
+            const float * fb_row = mel_filterbank.data() + (size_t)m * F;
+            float mel_e = 0.0f;
+            for (int k = 0; k < F; ++k) mel_e += fb_row[k] * power[k];
+            // Kaldi uses epsilon = FLT_EPSILON for log floor.
+            if (mel_e < std::numeric_limits<float>::epsilon())
+                mel_e = std::numeric_limits<float>::epsilon();
+            out[(size_t)t * n_mels + m] = std::log(mel_e);
+        }
+    }
+
+    return out;
 }

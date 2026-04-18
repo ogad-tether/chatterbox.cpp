@@ -538,7 +538,7 @@ Ranked by impact-per-effort ratio, from biggest wins to niche polish.
 
 ### Tier A — biggest wins, should be tackled next
 
-#### A1. Voice cloning — **phases 1, 2a-2c, 2d-a DONE**, phases 2d-b,c + 2e pending
+#### A1. Voice cloning — **phases 1, 2a-2c, 2d DONE**, phase 2e pending
 
 Voice cloning works end-to-end TODAY using a Python preprocessing
 helper that produces a five-tensor voice profile from a reference
@@ -771,12 +771,65 @@ into `main.cpp` is blocked on Phase 2d-b (Kaldi fbank port) — we can't
 feed CAMPPlus from `--reference-audio` until the C++ binary can
 extract its own fbank.
 
-**Phase 2d-b (NEXT)** — C++ port of `torchaudio.compliance.kaldi.fbank`
-with `num_mel_bins=80` (no dither, same povey window, preemphasis,
-pow2-padded FFT, Kaldi mel scale, log).  Then Phase 2d-c wires both
-into `main.cpp`: `--reference-audio` runs `wav_load` → resample to
-16 kHz → `fbank_kaldi_80` → mean-subtract over T → `campplus_embed`
-→ injects the 192-d embedding into `s3gen_synthesize_opts`.
+**Phase 2d-b (DONE)** — C++ port of
+`torchaudio.compliance.kaldi.fbank` with `num_mel_bins=80`.
+Implemented as `fbank_kaldi_80` in `src/voice_features.{h,cpp}`
+with all the Kaldi knobs baked in:
+
+- `frame_length = 25 ms = 400 samples`, `hop = 10 ms = 160 samples`
+- `round_to_power_of_two = True` → `n_fft = 512`
+- `window_type = "povey"` = `hann(N, periodic=False) ** 0.85`
+- `remove_dc_offset = True` (subtract per-frame mean)
+- `preemphasis_coefficient = 0.97`, with the Kaldi edge case
+  `out[0] = frame[0] * (1 - coeff)`
+- `use_power = True`, `use_log_fbank = True` with `log_floor = FLT_EPSILON`
+- `snip_edges = True`, `dither = 0`
+- Kaldi mel filterbank (`mel = 1127 * log(1 + f / 700)`, triangular
+  filters equally spaced in mel-space) precomputed by
+  `convert-s3gen-to-gguf.py` and baked in as
+  `campplus/mel_fb_kaldi_80` (shape `(80, 257)`).
+
+Key gotcha we hit: **torchaudio's Kaldi wrapper does _not_ apply
+the `×32768` int16 scaling that real Kaldi does.**  With the scale
+our output was +20.8 units offset from Python (exactly
+`2 * log(32768) ≈ 20.79`).  Dropped the scale and `rel` jumped from
+`1.30` to `1.77e-05`.
+
+Validation on the synthetic 10 s speech signal:
+
+```
+[result] C++ vs Python fbank:
+    n=79840  max_abs=2.82e-04  rms=5.91e-06  max|ref|=1.59e+01  rel=1.77e-05
+
+C++ fb[0, :8]: -10.1011 -8.3549 -7.9557 -7.4304 -7.0186 ...
+Py  fb[0, :8]: -10.1012 -8.3549 -7.9557 -7.4304 -7.0186 ...
+```
+
+**Phase 2d-c (DONE)** — Wired into `main.cpp`.  New
+`compute_embedding_native()` glues `wav_load → resample_sinc →
+fbank_kaldi_80 → mean-subtract over T → campplus_embed` and
+populates the new `embedding_override` field in
+`s3gen_synthesize_opts`.  Called best-effort from both short-circuit
+and regular T3→S3Gen paths: if the s3gen GGUF pre-dates Phase 2d-a
+(no CAMPPlus tensors), it silently falls back to
+`ref_dir/embedding.npy`.
+
+End-to-end dogfood on the 10.4 s reference wav with
+`speaker_emb.npy` _and_ `embedding.npy` deleted from `voices/test/`:
+
+```
+voice_encoder: computing speaker_emb from /tmp/unified_remote.wav
+main: T3 voice override — speaker_emb=C++ VoiceEncoder, cond_prompt_tokens=ref_dir
+voice: prompt_feat shape=(520, 80)
+voice: embedding shape=(192,) via CAMPPlus (1038 fbank frames)
+  embedding:   using C++ override (CAMPPlus, 192 dims)
+  prompt_feat: using C++ override (520 mel frames)
+```
+
+Output WAV plays cleanly and sounds identical to the Python
+voice-cloned output.  Only `cond_prompt_speech_tokens.npy` and
+`prompt_token.npy` still live in `ref_dir` — both are produced by
+`S3TokenizerV2`, the last holdout (Phase 2e).
 
 **Phase 2d (old)** — C++ CAMPPlus (TDNN + stats pooling speaker encoder,
 80-ch Fbank at 16 kHz → 192-d `embedding`). ~400-line Python, mostly

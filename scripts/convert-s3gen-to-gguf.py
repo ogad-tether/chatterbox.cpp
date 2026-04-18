@@ -326,7 +326,38 @@ def main():
         writer.add_uint32("campplus.kernel_size",      3)
         writer.add_uint32("campplus.seg_pool_len",     100)
         writer.add_uint32("campplus.sample_rate",      16000)
-        print(f"Embedded CAMPPlus: {n_conv} conv/linear tensors + {n_bn} fused BNs")
+
+        # Kaldi-style mel filterbank (80 bins, 16 kHz, n_fft=512, low=20 Hz,
+        # high=8000 Hz).  Used by the C++ fbank_kaldi_80 implementation in
+        # src/voice_features.cpp to replace torchaudio.compliance.kaldi.fbank
+        # at runtime.  Formula: triangular filters equally spaced in mel-space
+        # (Kaldi mel: 1127 * log(1 + f/700)), evaluated at each FFT bin's
+        # linear frequency.
+        SR = 16000
+        NFFT = 512
+        N_MELS = 80
+        LOW = 20.0
+        HIGH = 8000.0
+        mel_low  = 1127.0 * np.log(1.0 + LOW  / 700.0)
+        mel_high = 1127.0 * np.log(1.0 + HIGH / 700.0)
+        mel_delta = (mel_high - mel_low) / (N_MELS + 1)
+        bin_freq  = np.arange(NFFT // 2 + 1, dtype=np.float64) * SR / NFFT
+        bin_mel   = 1127.0 * np.log(1.0 + bin_freq / 700.0)
+        kaldi_fb  = np.zeros((N_MELS, NFFT // 2 + 1), dtype=np.float32)
+        for m in range(N_MELS):
+            mel_center = mel_low + (m + 1) * mel_delta
+            mel_lo = mel_center - mel_delta
+            mel_hi = mel_center + mel_delta
+            for k, mb in enumerate(bin_mel):
+                if mb < mel_lo or mb > mel_hi:
+                    continue
+                if mb <= mel_center:
+                    kaldi_fb[m, k] = (mb - mel_lo) / (mel_center - mel_lo)
+                else:
+                    kaldi_fb[m, k] = (mel_hi - mb) / (mel_hi - mel_center)
+        writer.add_tensor("campplus/mel_fb_kaldi_80", np.ascontiguousarray(kaldi_fb))
+        print(f"Embedded CAMPPlus: {n_conv} conv/linear tensors + {n_bn} fused BNs "
+              f"+ kaldi mel filterbank {kaldi_fb.shape}")
 
     n_flow = sum(1 for k in state if k.startswith("flow.")) - sum(1 for k in state if k.startswith("flow.decoder.estimator."))
     n_cfm  = len(decoder_keys)

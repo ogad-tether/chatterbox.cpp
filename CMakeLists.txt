@@ -15,9 +15,14 @@ add_executable(chatterbox
     src/gpt2_bpe.cpp
     src/chatterbox_tts.cpp
     src/voice_features.cpp
-    src/voice_encoder.cpp)
+    src/voice_encoder.cpp
+    src/campplus.cpp)
 target_link_libraries(chatterbox PRIVATE ggml)
 target_include_directories(chatterbox PRIVATE ggml/include src)
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(chatterbox PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # Staged numerical validation harness (optional).
 add_executable(test-s3gen src/test_s3gen.cpp)
@@ -58,6 +63,24 @@ target_include_directories(test-campplus PRIVATE ggml/include src)
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
     target_link_libraries(test-campplus PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# Kaldi-style fbank validation harness.
+add_executable(test-fbank
+    src/test_fbank.cpp
+    src/voice_features.cpp)
+target_link_libraries(test-fbank PRIVATE ggml)
+target_include_directories(test-fbank PRIVATE ggml/include src)
+
+# End-to-end wav → 192-d speaker embedding validation (CAMPPlus + fbank).
+add_executable(test-voice-embedding
+    src/test_voice_embedding.cpp
+    src/campplus.cpp
+    src/voice_features.cpp)
+target_link_libraries(test-voice-embedding PRIVATE ggml)
+target_include_directories(test-voice-embedding PRIVATE ggml/include src)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test-voice-embedding PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 if (GGML_CUDA)

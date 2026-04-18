@@ -33,7 +33,6 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
 
     from chatterbox.tts_turbo import ChatterboxTurboTTS
-    from chatterbox.models.s3gen.xvector import extract_feature
 
     tts = ChatterboxTurboTTS.from_pretrained("cpu")
     speaker_encoder = tts.s3gen.speaker_encoder
@@ -44,19 +43,30 @@ def main() -> None:
     if sr != 16000:
         wav = torchaudio.functional.resample(wav, sr, 16000)
 
-    # This is exactly what speaker_encoder.inference does.
-    feats, lens, times = extract_feature([wav])
-    # feats: (1, T, 80) after per-utterance mean subtraction.
-    fbank = feats[0].numpy().astype(np.float32)
+    # Deterministic Kaldi fbank (no dither).  The Python extract_feature helper
+    # uses dither=1.0 by default, which would give non-reproducible features
+    # and make C++ vs. Python numerical comparison impossible.
+    import torchaudio.compliance.kaldi as Kaldi
+    fbank_raw = Kaldi.fbank(wav.unsqueeze(0), num_mel_bins=80, dither=0.0)  # (T, 80)
+    # Also save the raw (un-mean-subtracted) fbank; C++ mean-subtract is
+    # trivial.
+    fbank_centered = fbank_raw - fbank_raw.mean(dim=0, keepdim=True)
+
+    np.save(args.out / "fbank_raw.npy",      np.ascontiguousarray(fbank_raw.numpy().astype(np.float32)))
+    np.save(args.out / "fbank.npy",          np.ascontiguousarray(fbank_centered.numpy().astype(np.float32)))
 
     with torch.no_grad():
-        emb = speaker_encoder.forward(feats.to(torch.float32))
+        emb = speaker_encoder.forward(fbank_centered.unsqueeze(0).to(torch.float32))
     emb = emb[0].cpu().numpy().astype(np.float32)
-
-    np.save(args.out / "fbank.npy", np.ascontiguousarray(fbank))
     np.save(args.out / "embedding.npy", np.ascontiguousarray(emb))
-    print(f"fbank.npy      shape={fbank.shape}  dtype={fbank.dtype}")
-    print(f"embedding.npy  shape={emb.shape}  dtype={emb.dtype}  norm={np.linalg.norm(emb):.4f}")
+
+    # The wav itself (post-resample) is also useful for C++ fbank parity tests.
+    np.save(args.out / "wav_16k.npy", np.ascontiguousarray(wav.numpy().astype(np.float32)))
+
+    print(f"fbank_raw.npy  shape={fbank_raw.shape}")
+    print(f"fbank.npy      shape={fbank_centered.shape}")
+    print(f"embedding.npy  shape={emb.shape}  norm={np.linalg.norm(emb):.4f}")
+    print(f"wav_16k.npy    shape={wav.shape}")
 
 
 if __name__ == "__main__":

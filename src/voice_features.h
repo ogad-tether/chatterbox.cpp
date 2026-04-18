@@ -75,3 +75,24 @@ std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
 // Returns a row-major (T_mel, 40) tensor, where T_mel = 1 + L_wav / hop.
 std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
                                       const std::vector<float> & mel_filterbank);
+
+// Kaldi-style 80-channel log-power mel filterbank at 16 kHz (matches
+// torchaudio.compliance.kaldi.fbank with its default arguments + dither=0).
+// Parameters baked in:
+//
+//   frame_length = 25 ms (400 samples)    frame_shift = 10 ms (160 samples)
+//   num_mel_bins = 80                     low_freq    = 20 Hz
+//   high_freq    = 8000 Hz (nyquist)      preemphasis = 0.97
+//   window_type  = "povey" (0.85-exponent Hann)
+//   round_to_power_of_two = True → n_fft = 512
+//   remove_dc_offset = True, snip_edges = True
+//   use_power = True, use_log_fbank = True, dither = 0
+//   signed_16bit_max = 32768 (Kaldi int16 scaling)
+//
+// `mel_filterbank` must be the (80, 257)-element Kaldi filterbank baked into
+// the s3gen GGUF as `campplus/mel_fb_kaldi_80`.
+//
+// Returns a row-major (T, 80) log-mel tensor,
+// T = (L_wav - 400) / 160 + 1.
+std::vector<float> fbank_kaldi_80(const std::vector<float> & wav_16k,
+                                  const std::vector<float> & mel_filterbank);
