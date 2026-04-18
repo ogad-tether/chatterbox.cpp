@@ -43,6 +43,36 @@ static bool file_exists(const std::string & path) {
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+// Sanity-check a --reference-audio file before we kick off the full voice-
+// cloning pipeline.  The Python reference asserts `len(ref) / sr > 5.0` and
+// fails hard otherwise; we silently accept any length, but produce undersized
+// conditioning tensors (prompt_token=125 instead of 250, etc.) which falls
+// back on whatever is in the built-in voice slots.  That's misleading — give
+// a clear error instead.  Recommended length is 10–15 seconds.
+static bool validate_reference_audio(const std::string & path) {
+    std::vector<float> wav;
+    int sr = 0;
+    if (!wav_load(path, wav, sr)) {
+        fprintf(stderr, "error: failed to load --reference-audio: %s\n", path.c_str());
+        return false;
+    }
+    const double secs = (double)wav.size() / (double)sr;
+    if (secs <= 5.0) {
+        fprintf(stderr,
+            "error: --reference-audio is only %.2f s; Chatterbox requires strictly more "
+            "than 5 s of clean mono speech.  Shorter references produce undersized "
+            "conditioning tensors and the model falls back on the built-in voice.\n"
+            "  Recommended length: 10–15 s.\n", secs);
+        return false;
+    }
+    if (secs < 10.0) {
+        fprintf(stderr,
+            "warning: --reference-audio is %.2f s; 10–15 s is recommended for best "
+            "voice similarity.\n", secs);
+    }
+    return true;
+}
+
 // Load REF.wav, resample to 24 kHz if needed, pull the 80-ch mel filterbank out
 // of the s3gen GGUF, and compute prompt_feat (log-mel) in C++.  out_rows is the
 // number of mel frames (= T_mel in the row-major (T_mel, 80) layout).
@@ -867,6 +897,14 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }
 
     try {
+        // Early preflight: if the user supplied --reference-audio, make sure
+        // it's long enough for real voice cloning.  Bail out now with a clear
+        // message instead of silently falling back on the built-in voice when
+        // the conditioning tensors come out undersized.
+        if (!params.reference_audio.empty()) {
+            if (!validate_reference_audio(params.reference_audio)) return 1;
+        }
+
         // Short-circuit: user gave us speech tokens directly + --s3gen-gguf. Skip T3 entirely.
         if (params.model.empty() && !params.s3gen_gguf.empty() && !params.tokens_file.empty()) {
             std::vector<int32_t> speech_tokens = read_token_file(params.tokens_file);
