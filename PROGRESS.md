@@ -819,6 +819,73 @@ pre-FA         1274 ms   2.36 s   0.176
 pre-optimization baseline on the same M3 Ultra — all via Metal
 kernel + graph-shape changes, no model changes.
 
+### 3.16  Metal: extend mat-vec fusion to `MUL_MAT + ADD + ADD`; Vulkan/CPU already optimal
+
+While investigating whether the §3.15 fusion could also apply to
+Vulkan and CPU, two findings:
+
+- **Vulkan already has it.** `ggml_vk_can_fuse` in upstream recognises
+  `MUL_MAT + ADD` *and* `MUL_MAT + ADD + ADD`, and the mat-vec shaders
+  (`vulkan-shaders/mul_mat_vec_iface.glsl`) have dedicated `Fuse0` /
+  `Fuse1` buffer bindings for the two optional adds.  Running
+  `GGML_VK_DISABLE_FUSION=1` on the 5090 pushes T3 Q4_0 from 346 →
+  413 ms (3-run avg), a real 16 % speedup that was silently helping us
+  before.  Nothing to add on Vulkan.
+- **CPU has no op-level fusion framework.**  But it also has ~zero
+  per-op dispatch overhead (ggml-cpu just calls the next op's compute
+  function directly), and the matmul output stays in L1 cache
+  (`n_embd=1024` × 4 B = 4 KB) so the intermediate round-trip is
+  essentially free.  Estimated gain from fusion: < 1 %.  Not worth the
+  plumbing work.
+
+That left Metal, where §3.15 covered `MUL_MAT + ADD(bias)` but not the
+3-op form `MUL_MAT + ADD(bias) + ADD(residual)` used by T3's attn-proj
+and MLP-proj linears.  Extended the Metal patch to match Vulkan's
+fusion surface:
+
+- New function constant `FC_mul_mv_has_residual` at `FC_MUL_MV + 3`.
+- Each Q-variant top-level kernel gains a second buffer binding
+  (`device const char * residual` at slot 5).  `helper_mv_add_bias`
+  now applies both the bias broadcast and the per-element residual
+  add; both branches are gated on their respective function constants
+  so non-fused call sites specialise them away.
+- `ggml_metal_op_mul_mat` tries `{MUL_MAT, ADD, ADD}` first (requires
+  bias-shaped src1 on ADD1 and full-shape F32-contiguous on ADD2),
+  falls back to `{MUL_MAT, ADD}` from §3.15.  Returns `n_fuse=3` /
+  `n_fuse=2` accordingly.
+- Pipeline names now carry `_bias=?_res=?` so fused/non-fused variants
+  are cached independently by the library.
+
+**Correctness bug caught while writing the 3-op variant.**  §3.15's
+helper had `if (tiisg != 0 || sgitg != 0) return;`, so only simdgroup
+0 added bias.  That's correct for Q8_0 (all simdgroups cooperate on
+the same `r0`) but **wrong for Q4/Q5** where each simdgroup writes
+its own `r0 = (tgpig.x*NSG + sgitg)*NR0`, silently dropping bias from
+the rows computed by simdgroups ≥ 1.  Output was "close enough" to
+sound right but not numerically correct.  Fixed by moving the
+`sgitg` gate to the callers: Q-n kernels call the helper from every
+simdgroup with their own `r0`; Q8_0 wraps the call in
+`if (sgitg == 0)`.  Token counts snapped back to the pre-fusion
+trajectory once this was right.
+
+Measured on M3 Ultra, 10 s sentence, seed 42, 3-run warm average:
+
+| Variant  | T3 before §3.16 | T3 after §3.16 | Δ     | Wall before | Wall after |
+|----------|----------------:|---------------:|------:|------------:|-----------:|
+| F16      |          915 ms |         913 ms | flat  |   2.26 s    |  2.27 s    | (fusion N/A)
+| **Q8_0** |      **819 ms** |     **794 ms** | **−3 %** | **2.02 s** | **1.94 s** |
+| Q5_0     |          840 ms |         873 ms | +4 %  |   1.96 s    |  2.01 s    | (tokens +15)
+| Q4_0     |          766 ms |         770 ms | flat  |   1.87 s    |  1.88 s    | (tokens +6)
+
+Smaller than the headline "save 48 dispatches × 9 µs" estimate
+suggested, because Metal's scheduler overlaps consecutive small
+dispatches — the `bin_fuse` the fused kernel replaces was already
+running concurrently with later work.  Q8_0 still sees a clean 3 %
+win; Q4/Q5 are noise after accounting for token-count drift.  Still
+worth committing: matches Vulkan's fusion surface, fixes the latent
+§3.15 bias correctness bug, and closes the last dispatch-per-linear
+gap vs Vulkan.
+
 ### Cross-backend summary
 
 Same 10 s sentence, seed 42, `gen_RTF` is inference-only (excludes
