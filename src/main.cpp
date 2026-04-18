@@ -767,29 +767,32 @@ static ggml_tensor * build_transformer_core(
         cur = ggml_add(ctx, ggml_mul(ctx, cur, model.layers[il].ln_1_g), model.layers[il].ln_1_b);
         cur = ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_attn_attn_w, cur), model.layers[il].c_attn_attn_b);
 
-        ggml_tensor * Qcur = ggml_view_2d(ctx, cur, n_embd, N, cur->nb[1], 0*sizeof(float)*n_embd);
+        // View Q / K / V directly inside the fused QKV projection output as
+        // [HD, N, n_head] with explicit strides.  FA consumes this non-contig
+        // view directly: nb0=4 (fast HD axis), nb1=3*n_embd*4 (stride between
+        // columns of the original cur), nb2=HD*4 (stride between heads within
+        // a column).  No cont_3d + permute + cont sequence per layer.
+        const size_t qkv_col_stride  = cur->nb[1];                // 3 * n_embd * sizeof(float)
+        const size_t qkv_head_stride = (size_t) HD * sizeof(float);
 
-        // KV cache append: write [n_embd, N] into cache as [HD, N, n_head]
-        // rows sitting at positions [n_past, n_past+N).  Source is viewed as
-        // [HD, n_head, N] and permuted to [HD, N, n_head] so ggml_cpy writes
-        // into the strided destination one kernel launch per tensor.
+        ggml_tensor * Q = ggml_view_3d(ctx, cur, HD, N, n_head,
+            qkv_col_stride,
+            qkv_head_stride,
+            0);  // Qcur slot
+        ggml_tensor * Kcur_QNH = ggml_view_3d(ctx, cur, HD, N, n_head,
+            qkv_col_stride,
+            qkv_head_stride,
+            (size_t) n_embd * sizeof(float));  // Kcur slot
+        ggml_tensor * Vcur_QNH = ggml_view_3d(ctx, cur, HD, N, n_head,
+            qkv_col_stride,
+            qkv_head_stride,
+            (size_t) 2 * n_embd * sizeof(float));  // Vcur slot
+
+        // KV cache append: write the [HD, N, n_head] source into a strided
+        // [HD, N, n_head] view of the cache starting at position n_past.
+        // One kernel launch per tensor.
+        const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
         {
-            const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
-
-            ggml_tensor * Kcur_3d = ggml_view_3d(ctx, cur,
-                HD, n_head, N,
-                (size_t) HD * sizeof(float),  // nb1: stride between head rows within one column
-                cur->nb[1],                   // nb2: stride between N columns (original cur stride)
-                (size_t) n_embd * sizeof(float));  // skip Qcur
-            ggml_tensor * Vcur_3d = ggml_view_3d(ctx, cur,
-                HD, n_head, N,
-                (size_t) HD * sizeof(float),
-                cur->nb[1],
-                (size_t) 2 * n_embd * sizeof(float));
-
-            ggml_tensor * Kcur_KNH = ggml_permute(ctx, Kcur_3d, 0, 2, 1, 3);
-            ggml_tensor * Vcur_KNH = ggml_permute(ctx, Vcur_3d, 0, 2, 1, 3);
-
             ggml_tensor * k_dst = ggml_view_3d(ctx, model.memory_k,
                 HD, N, n_head,
                 kv_pos_stride,
@@ -801,17 +804,10 @@ static ggml_tensor * build_transformer_core(
                 kv_head_stride,
                 layer_off + (size_t) n_past * kv_pos_stride);
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_KNH, k_dst));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_KNH, v_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_QNH, k_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_QNH, v_dst));
         }
 
-        // Q: the one tensor that still needs a cont (it's a strided view of
-        // the fused QKV output).  K and V are strided views of the cache and
-        // flash_attn_ext consumes them directly without a per-step copy.
-        ggml_tensor * Q = ggml_cont(ctx,
-            ggml_permute(ctx, ggml_cont_3d(ctx, Qcur, HD, n_head, N), 0, 2, 1, 3));
-
-        const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
         ggml_tensor * K = ggml_view_3d(ctx, model.memory_k,
             HD, L, n_head,
             kv_pos_stride,
