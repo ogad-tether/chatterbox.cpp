@@ -76,13 +76,15 @@ qvac-chatterbox.cpp/
     mel2wav.cpp                   mel → wav demo binary (HiFT only)
     npy.h                         minimal .npy loader + compare helpers
   scripts/
-    convert-t3-turbo-to-gguf.py   T3 weights + conds → GGUF
-    convert-s3gen-to-gguf.py      flow (encoder + CFM) + HiFT → GGUF
-    dump-s3gen-reference.py       runs PyTorch, dumps every intermediate .npy
-    reference-t3-turbo.py         PyTorch T3 + compare against C++
-    compare-tokenizer.py          10-case tokenizer comparison against HF
-    prepare-voice.py              reference .wav → voice profile (.npy files)
-    synthesize.sh                 text → wav wrapper (chatterbox binary)
+    convert-t3-turbo-to-gguf.py       T3 weights + tokenizer + VE + builtin voice → GGUF
+    convert-s3gen-to-gguf.py          S3Gen encoder + CFM + HiFT + CAMPPlus
+                                      + S3TokenizerV2 + mel filterbanks → GGUF
+    dump-s3gen-reference.py           PyTorch → .npy intermediates for test-s3gen
+    dump-campplus-reference.py        PyTorch → .npy intermediates for test-campplus
+    dump-s3tokenizer-reference.py     PyTorch → .npy intermediates for test-s3tokenizer
+    reference-t3-turbo.py             PyTorch T3 + compare against C++
+    compare-tokenizer.py              10-case tokenizer comparison against HF
+    synthesize.sh                     text → wav wrapper (chatterbox binary)
   models/
     chatterbox-t3-turbo.gguf      T3 + tokenizer conditionals
     chatterbox-s3gen.gguf         flow + mel2wav weights + built-in voice

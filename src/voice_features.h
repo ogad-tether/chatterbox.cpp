@@ -1,17 +1,19 @@
 #pragma once
 
-// Voice-cloning preprocessing primitives: WAV I/O, resampling, and mel
-// extraction. These replace the Python side of prepare-voice.py one piece at
-// a time.
+// Voice-cloning preprocessing primitives: WAV I/O, resampling, loudness
+// normalisation, mel extraction.  Together with the VoiceEncoder / CAMPPlus
+// / S3TokenizerV2 ports in voice_encoder.{h,cpp}, campplus.{h,cpp}, and
+// s3tokenizer.{h,cpp}, these cover every tensor Chatterbox needs for voice
+// cloning — no Python runtime dependency.
 //
-// Phase 1 status:
-//   - wav_load                        done
-//   - resample_sinc (Kaiser window)   done
-//   - mel_extract_24k_80              done — produces prompt_feat (S3Gen side)
-//
-// The other four voice-cloning tensors (speaker_emb, cond_prompt_speech_tokens,
-// embedding, prompt_token) still need VoiceEncoder / CAMPPlus / S3TokenizerV2
-// ports and are covered by Phases 2-4 in PROGRESS.md.
+// Exposes:
+//   wav_load            — dr_wav-based multi-format WAV reader → mono f32
+//   resample_sinc       — Kaiser-windowed sinc resampler
+//   measure_lufs        — ITU-R BS.1770-4 loudness metering
+//   normalise_lufs      — in-place gain to a target LUFS
+//   mel_extract_24k_80  — 80-ch log-mel @ 24 kHz (S3Gen prompt_feat)
+//   mel_extract_16k_40  — 40-ch power mel @ 16 kHz (VoiceEncoder input)
+//   fbank_kaldi_80      — Kaldi-style fbank @ 16 kHz (CAMPPlus input)
 
 #include <cstdint>
 #include <string>

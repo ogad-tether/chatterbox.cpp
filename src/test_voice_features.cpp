@@ -1,7 +1,8 @@
 // Validation harness for the C++ voice-cloning preprocessing primitives:
 //   wav_load + resample_sinc + mel_extract_24k_80
 // Compares the C++ 80-channel log-mel at 24 kHz against a Python-dumped
-// prompt_feat.npy produced by scripts/prepare-voice.py.
+// prompt_feat.npy (produced by scripts/dump-s3gen-reference.py or any
+// other path that calls chatterbox.models.s3gen.utils.mel.mel_spectrogram).
 //
 // Usage:
 //   ./build/test-voice-features S3GEN.gguf REF.wav PROMPT_FEAT.npy

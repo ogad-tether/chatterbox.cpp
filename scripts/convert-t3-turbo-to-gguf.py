@@ -265,9 +265,9 @@ def main() -> None:
 
     # VoiceEncoder weights (3-layer unidirectional LSTM + Linear projection).
     # Used by main.cpp to compute speaker_emb natively when --reference-audio
-    # is given, replacing one of the four tensors that prepare-voice.py still
-    # has to produce. LSTM layout is PyTorch's default: each weight_i{h,h}_l*
-    # is (4*hidden, ...) with the [i, f, g, o] gate rows stacked.
+    # is given, so no Python helper is needed at inference time.  LSTM layout
+    # is PyTorch's default: each weight_i{h,h}_l* is (4*hidden, ...) with the
+    # [i, f, g, o] gate rows stacked.
     ve_path = ckpt_dir / "ve.safetensors"
     if ve_path.exists():
         ve_state = load_file(ve_path)
