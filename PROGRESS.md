@@ -38,8 +38,16 @@ Plus `scripts/synthesize.sh` which composes the two into a single command.
 | ISTFT → waveform | 1.0e-04 |
 | End-to-end C++ wav vs Python wav (RMS) | 1.22e-04 vs 1.22e-04 |
 
-**Speed** on a 10-core EPYC for an 8.64 s utterance, after the optimization
-pass: **RTF 0.28 (3.6× faster than real-time)** — see §3.8.
+**Speed** (10 s sentence, seed 42, `gen_RTF = (T3_INFER + S3GEN_INFER) / audio_ms`):
+
+| Backend                     | `gen_RTF` | Wall  | vs ONNX addon |
+|-----------------------------|----------:|------:|--------------:|
+| CPU (10-core EPYC, F16)     | 0.70      | 8.2 s | 3.6× faster   |
+| **Vulkan (RTX 5090, Q4_0)** | **0.08**  | **1.8 s** | **7.8×** |
+| **Metal (M3 Ultra, Q4_0)**  | **0.18**  | **2.4 s** | **5.9×** |
+| ONNX q4 addon (CPU baseline) | 1.06     | 13.9 s | 1.0×         |
+
+GPU support and Metal kernel fixes are described in §3.11 and §3.12.
 
 ---
 
@@ -47,13 +55,23 @@ pass: **RTF 0.28 (3.6× faster than real-time)** — see §3.8.
 
 ```
 qvac-chatterbox.cpp/
-  ggml/                           pristine ggml checkout (vendored, unmodified)
+  ggml/                           vendored ggml checkout (see patches/)
+  patches/
+    ggml-metal-chatterbox-ops.patch   Metal op fixes: diag_mask_inf, pad_ext,
+                                      faster conv_transpose_1d (applied to ggml/
+                                      during setup; see patches/README.md)
+    README.md                         why each patch exists + how to drop it
   src/
-    main.cpp                      T3 runtime          (chatterbox binary)
+    main.cpp                      T3 runtime + unified CLI (chatterbox binary)
+    chatterbox_tts.cpp            S3Gen encoder + CFM + HiFT (reusable entry)
     gpt2_bpe.{h,cpp}              self-contained GPT-2 byte-level BPE tokenizer
+    voice_features.{h,cpp}        wav I/O, resample, mel, fbank, LUFS
+    voice_encoder.{h,cpp}         VoiceEncoder 256-d speaker embedding
+    campplus.{h,cpp}              CAMPPlus 192-d speaker embedding
+    s3tokenizer.{h,cpp}           S3TokenizerV2 (wav → S3 speech tokens)
     test_s3gen.cpp                staged verification harness (stages A..H5)
+    test_metal_ops.cpp            parity test for the patched Metal kernels
     mel2wav.cpp                   mel → wav demo binary (HiFT only)
-    chatterbox_tts.cpp            speech tokens → wav (S3Gen encoder + CFM + HiFT)
     npy.h                         minimal .npy loader + compare helpers
   scripts/
     convert-t3-turbo-to-gguf.py   T3 weights + conds → GGUF
@@ -61,11 +79,13 @@ qvac-chatterbox.cpp/
     dump-s3gen-reference.py       runs PyTorch, dumps every intermediate .npy
     reference-t3-turbo.py         PyTorch T3 + compare against C++
     compare-tokenizer.py          10-case tokenizer comparison against HF
-    synthesize.sh                 text → wav wrapper (T3 + chatterbox-tts)
+    prepare-voice.py              reference .wav → voice profile (.npy files)
+    synthesize.sh                 text → wav wrapper (chatterbox binary)
   models/
     chatterbox-t3-turbo.gguf      T3 + tokenizer conditionals
     chatterbox-s3gen.gguf         flow + mel2wav weights + built-in voice
-  CMakeLists.txt                  top-level: add_subdirectory(ggml) + 4 targets
+    t3-{q8_0,q5_0,q4_0}.gguf      quantized T3 variants (A3)
+  CMakeLists.txt                  top-level: add_subdirectory(ggml) + targets
   PROGRESS.md                     this file
 ```
 
@@ -487,6 +507,160 @@ the time the single `model.run()` call takes.)
 Numbers are for a ~6 s utterance; the ggml pipeline's ~2 s of fixed
 S3Gen+HiFT cost amortizes better on longer input, so the gap widens
 in ggml's favour as prompt length grows.
+
+### 3.11  Vulkan + Metal backends
+
+CPU performance was already past real-time, but a lot of the T3 and
+CFM work is embarrassingly parallel, so enabling the GGML GPU backends
+was the obvious next step. Touched three files:
+
+- `CMakeLists.txt` — added a `GGML_VULKAN` propagation block mirroring
+  the existing `GGML_CUDA` / `GGML_METAL` ones.
+- `src/main.cpp` — extended `init_backend(n_gpu_layers)` with a
+  `ggml_backend_vk_init(0)` path guarded by `#ifdef GGML_USE_VULKAN`.
+  CUDA / Metal paths were already there.
+- `src/chatterbox_tts.cpp` — added a symmetric `s3gen_init_backend`
+  so the S3Gen side honours the same `--n-gpu-layers` flag, plus a
+  new `n_gpu_layers` field on `s3gen_synthesize_opts`.
+
+Two op-level changes in our code were required *because* Metal's
+dispatcher didn't have those ops (the actual Metal kernel fixes land
+in §3.12):
+
+1. **T3 attention**: `ggml_soft_max(ggml_diag_mask_inf(ggml_scale(KQ,
+   s), n_past))` → `ggml_soft_max_ext(KQ, mask, s, 0.0f)` with an
+   explicit `[n_kv, N]` causal mask tensor uploaded from
+   `eval_prompt`. The step path (N=1) passes a null mask. No-op for
+   CPU / Vulkan; necessary for Metal.
+2. **S3Gen zero padding**: 6 call sites used `ggml_pad_ext` with
+   non-zero front padding. Added a `zero_pad_dim0(ctx, x, p_front,
+   p_back)` helper that expresses the same semantics via
+   `concat(scale(view, 0.0f), x)` so it runs on every backend with
+   well-defined zeros.
+
+First result on the Linux remote (RTX 5090 + Vulkan), same 10 s
+sentence as §3.10:
+
+| Variant       | T3 load | T3 gen | S3Gen load | S3Gen gen | Audio  | `gen_RTF` | Wall  |
+|---------------|--------:|-------:|-----------:|----------:|-------:|----------:|------:|
+| Vulkan F16    |  562 ms |  600 ms |  490 ms    | 279 ms    | 10.5 s | **0.08** | 2.10 s |
+| Vulkan Q8_0   |  450 ms |  557 ms |  472 ms    | 272 ms    | 10.6 s | 0.08     | 1.91 s |
+| Vulkan Q5_0   |  348 ms |  562 ms |  470 ms    | 276 ms    | 10.9 s | 0.08     | 1.82 s |
+| Vulkan Q4_0   |  331 ms |  522 ms |  493 ms    | 275 ms    | 10.3 s | 0.08     | 1.78 s |
+
+Quantization makes T3 load noticeably smaller but barely moves
+inference — T3 is autoregressive (one token at a time on a 5090 has
+plenty of spare lanes) and S3Gen is already short. End-to-end goes
+from 8.17 s (CPU F16) → **1.78 s** (Vulkan Q4), for the same 10 s of
+audio. `gen_RTF = 0.08` = 13× real-time.
+
+On the M3 Ultra Metal side, things didn't fly immediately: T3 aborted
+on the first attention layer with `unsupported op 'DIAG_MASK_INF'`,
+then S3Gen aborted with `unsupported op 'PAD'`. Once those two
+op-level workarounds above were in place, HiFT decode was completing
+but taking **~15 s for 1.2 s of audio** — Metal's
+`conv_transpose_1d` kernel is pathological for HiFT-sized inputs.
+
+Pragmatic interim fix: when the main backend is Metal, load a second
+CPU copy of the S3Gen GGUF and route `run_f0_predictor`,
+`run_stft`, and `run_hift_decode` through it. Encoder + CFM still run
+on Metal. Costs ~1 GB extra RAM but brings Metal `gen_RTF` to ~0.25.
+That's what committed as `795963a` ("backend: enable Vulkan + Metal
+for T3 and S3Gen").
+
+### 3.12  ggml-metal kernel patches
+
+To get rid of the CPU fallback for HiFT and close the gap with
+Vulkan, patched `ggml/src/ggml-metal/` itself. The patch is shipped
+as `patches/ggml-metal-chatterbox-ops.patch` (based on upstream
+`58c3805`, `sync : llama.cpp`); the main README instructs a fresh
+clone to `git apply` it after cloning ggml.
+
+A new `test-metal-ops` binary runs each patched kernel against the
+CPU reference at HiFT-realistic shapes. All cases pass with
+`max_abs ≤ 1.5e-6`.
+
+**Patch 1 — `DIAG_MASK_INF` on Metal** (was: op simply absent from
+the dispatcher):
+
+- New `kernel_diag_mask_inf_f32` — ports the CUDA formulation
+  (`dst[i] = src[i] - (col > n_past + row % rows_per_channel) *
+  FLT_MAX`) so downstream softmax yields proper zeros.
+- New `ggml_metal_kargs_diag_mask_inf`, library pipeline getter,
+  op encoder, dispatcher case, and `supports_op` entry.
+
+**Patch 2 — `PAD` with front padding** (was: kernel ignored
+`op_params[0,2,4,6]` which is where `ggml_pad_ext` stores the front
+amounts; `supports_op` hard-rejected any non-zero front pad):
+
+- Extended `ggml_metal_kargs_pad` with `lp0..lp3`.
+- Rewrote `kernel_pad_f32` to translate each output coord by
+  `i0x = i0 - lp0` etc., and write `0.0` outside `[0, ne00)`.
+- Relaxed `supports_op` to `src0->type == F32 && dst->type == F32`.
+
+**Patch 3 — `CONV_TRANSPOSE_1D` speedup** (was: ~100× slower than
+CPU on HiFT-sized inputs):
+
+The old kernel was scalar — one thread per output pixel, iterating
+over the full `IC × IL` inputs inside a branch `if (ol >= i*s0 && ol
+< i*s0 + K)`. Two orthogonal fixes:
+
+1. **Tighten the input-position loop** to only the `i`s that actually
+   contribute. For fixed `ol`, valid `i` is
+   `[max(0, ⌈(ol - K + 1)/s0⌉), min(IL-1, ol/s0)]` — at most
+   `K/s0 + 1` iterations. On ups[0] (s0=8, K=16, IL≈130) this
+   collapses the inner loop from 130 iterations → 3.
+2. **Parallelise `IC` across a 32-thread simdgroup** and reduce with
+   `simd_sum`. Host-side dispatch widens from 1 thread per
+   threadgroup → 32 (one simdgroup).
+
+Measured on M3 Ultra, HiFT decode (part of a 10 s sentence):
+
+```
+  hift_decode: 15021 ms → 350 ms          (≈ 40× speedup)
+  gen_RTF   :   0.25  → 0.18              (CPU-fallback removed)
+  wall      :   3.36 s → 2.51 s
+```
+
+With the patch applied and the CPU-fallback for HiFT removed,
+end-to-end on the M3 Ultra for the same 10 s sentence, seed 42,
+averaged over 3 runs:
+
+| Variant       | T3 load | T3 gen | S3Gen load | S3Gen gen | `gen_RTF` | Wall  |
+|---------------|--------:|-------:|-----------:|----------:|----------:|------:|
+| Metal F16     |  280 ms | 1326 ms |  295 ms    | 577 ms    | **0.19** | 2.51 s |
+| Metal Q8_0    |  216 ms | 1330 ms |  302 ms    | 598 ms    | 0.18     | 2.48 s |
+| Metal Q5_0    |  186 ms | 1393 ms |  293 ms    | 611 ms    | 0.19     | 2.51 s |
+| **Metal Q4_0**|  **175 ms** | **1274 ms** | **295 ms** | **594 ms** | **0.18** | **2.36 s** |
+
+Autoregressive T3 now dominates wall time (`T3_INFER` ≈ 1.3 s of
+~260 tokens at one-token-at-a-time on a 60-core Apple GPU) — that's
+the next thing to chip away at. On the 5090 the same token stream
+runs in ~0.55 s because the shader count is ~360× higher.
+
+Committed as `894c4b1` ("metal: patch ggml to fix diag_mask_inf,
+pad_ext, conv_transpose_1d"). `i`m not a fan of forking ggml just
+for this, so the patch is tiny and easy to drop once upstream picks
+up equivalent fixes; see `patches/README.md` for what to do in that
+case.
+
+### Cross-backend summary
+
+Same 10 s sentence, seed 42, `gen_RTF` is inference-only (excludes
+load time):
+
+| Backend (weights)             | T3 gen | S3Gen gen | `gen_RTF` | Wall  | Real-time mult |
+|-------------------------------|-------:|----------:|----------:|------:|---------------:|
+| CPU Linux (F16, 8 threads)    | 3998 ms | 2905 ms   | 0.70      | 8.17 s | 1.4×          |
+| Vulkan 5090 (F16)             |  600 ms |  279 ms   | 0.08      | 2.10 s | 12.0×         |
+| Vulkan 5090 (Q4_0)            |  522 ms |  275 ms   | 0.08      | 1.78 s | 13.0×         |
+| Metal M3 Ultra (F16)          | 1326 ms |  577 ms   | 0.19      | 2.51 s | 5.3×          |
+| Metal M3 Ultra (Q4_0)         | 1274 ms |  594 ms   | 0.18      | 2.36 s | 5.6×          |
+| ONNX q4 addon (CPU, Linux)    |     — (not exposed) |     — | 1.06      | 13.91 s | 0.94×        |
+
+The ONNX addon is shown as a baseline because it's what
+`qvac-lib-infer-onnx-tts` ships today. Every ggml configuration —
+including CPU F16 on the same host — beats it.
 
 ---
 
@@ -944,30 +1118,39 @@ Impact: Phase 1 unlocked voice cloning as a usable feature. Phases
 2a–2e replaced every Python preprocessing step with a native C++
 port, so the deployment story is now "one binary + two GGUFs".
 
-#### A2. GPU backend (Metal first, then CUDA)
+#### A2. GPU backend (Vulkan + Metal) — ✅ **DONE** (see §3.11 + §3.12)
 
-The code already uses `ggml_backend_t` abstractions everywhere and the
-CMake flags `GGML_METAL` / `GGML_CUDA` exist; only the CPU path has been
-tested so far. `chatterbox` has a `--n-gpu-layers N` flag — need to wire
-the same through to `chatterbox-tts` and then actually run it.
+Wired `--n-gpu-layers` through both T3 and S3Gen/HiFT. Now builds with
+any of `-DGGML_CUDA=ON`, `-DGGML_METAL=ON`, or `-DGGML_VULKAN=ON`;
+`init_backend()` in `main.cpp` and `s3gen_init_backend()` in
+`chatterbox_tts.cpp` pick the matching backend when `n_gpu_layers > 0`
+and fall back to CPU otherwise.
 
-Work items:
-- Wire `--n-gpu-layers` on `chatterbox-tts`.
-- Verify each custom op has a GPU kernel. Known fine on GPU:
-  `flash_attn_ext`, `mul_mat`, `conv_1d` via im2col (standard),
-  `soft_max`, `norm`. Probably fine: `ggml_sin` / `ggml_exp` /
-  `ggml_leaky_relu` / `ggml_gelu_erf`. Need verification:
-  `ggml_conv_1d` with **F32** `im2col` path (we pass `GGML_TYPE_F32` to
-  keep conv kernels F32), `ggml_conv_transpose_1d`.
-- Validate numerical parity — GPU `flash_attn_ext` often runs F16
-  internally; confirm rel error vs PyTorch stays <1e-4.
+Out-of-the-box Metal was missing three things that needed kernel-level
+fixes in `ggml/src/ggml-metal/`:
 
-Scope: 1–2 days if everything "just works", up to ~a week if two or three
-ops need custom wiring or fallbacks.
+- `GGML_OP_DIAG_MASK_INF` — no dispatcher entry. Added a kernel +
+  pipeline getter + op encoder + `supports_op` case.
+- `GGML_OP_PAD` with non-zero front padding — rejected by
+  `supports_op`. Extended `kargs_pad` with `lp0..lp3`, updated the
+  kernel to apply them, relaxed the check.
+- `GGML_OP_CONV_TRANSPOSE_1D` — kernel was scalar. Tightened the
+  input-position loop (`i_start..i_end` instead of `0..IL`) and
+  parallelised the `IC` reduction across a 32-thread simdgroup with
+  `simd_sum`. 40× speedup on HiFT-sized shapes.
 
-Impact: on Apple M-series Metal, RTF should comfortably drop **below 0.1**
-(sub-second generation for most utterances). Desktop discrete GPU: lower
-still. **The single biggest speedup lever left.**
+Patches live in `patches/ggml-metal-chatterbox-ops.patch` (applied to
+the vendored ggml during build); `src/test_metal_ops.cpp` validates
+each patched kernel against the CPU reference. CUDA and Vulkan needed
+no backend changes — only the chatterbox wiring.
+
+Result: `gen_RTF` on a 10 s sentence drops from **0.70 (CPU)** to
+**0.08 (Vulkan 5090)** and **0.18 (Metal M3 Ultra)**.
+
+Still open: T3 autoregressive inference dominates wall time on small
+GPUs (≈ 1.3 s for 260 tokens on a 60-core Apple GPU). Worth exploring
+speculative decoding or a smaller T3 draft model if further wins are
+needed — but current numbers are already interactive.
 
 #### A3. Quantize T3 — ✅ **DONE** (Q8_0 / Q5_0 / Q4_0)
 
@@ -1105,17 +1288,17 @@ users).
 
 ### Recommended next-up order
 
-For maximum usefulness per day of effort:
+With A1 (voice cloning), A2 (GPU backends) and A3 (T3 quantization)
+done, the remaining high-impact work is:
 
-1. **A3 — Quantize T3** (~4 h) → instant size/speed win, essentially
-   risk-free.
-2. **A1 — Voice cloning** (2–3 days) → unlocks the flagship
-   Chatterbox feature; without it this is only a demo.
-3. **A2 — Metal backend** (1–2 days if smooth) → biggest speedup left;
-   Mac users feel it immediately.
-4. **B1 — Streaming** (~1 week) → what gets this into interactive apps.
-5. **C3 — CI + prebuilt GGUFs** — pick up before announcing publicly.
+1. **B1 — Streaming** (~1 week) → what gets this into interactive apps;
+   currently blocked only by wiring, not correctness.
+2. **C3 — CI + prebuilt GGUFs** — pick up before announcing publicly.
+3. **T3 autoregressive speedup** (speculative decoding, or a smaller T3
+   draft model). Biggest chunk of wall time left on both Metal and
+   Vulkan now that HiFT is fast.
 
 B2 (server mode) and C1 (custom Conformer attn op) are worth doing once a
-concrete deployment is pressuring for them; right now the CPU numbers are
-already well past real-time for CLI use.
+concrete deployment is pressuring for them; the CPU numbers are already
+well past real-time for CLI use, and the GPU numbers are at
+multi-x real-time with zero extra work.
