@@ -238,6 +238,25 @@ def main() -> None:
     per_chunk_stats = []
 
     print(f"[3/3] streaming loop: {len(boundaries)-1} chunks × {chunk_tokens} tokens")
+
+    # Capture torch.randn_like (CFM's initial noise z) and encoder_proj output
+    # (CFM's `mu` conditioning) per chunk.  Both are fed to the C++ streaming
+    # harness so we can isolate where the mel divergence comes from — if mu
+    # matches and z matches, any remaining gap is CFM-internal.
+    import torch as _torch
+    orig_randn_like = _torch.randn_like
+    captured_z = {"z": None}
+    def _capture_randn_like(x, *a, **kw):
+        out = orig_randn_like(x, *a, **kw)
+        if captured_z["z"] is None:
+            captured_z["z"] = out.detach().clone().cpu()
+        return out
+
+    captured_mu = {"mu": None}
+    def _enc_proj_hook(mod, inp, out):
+        captured_mu["mu"] = out.detach().clone().cpu()
+    _mu_hook_handle = tts.s3gen.flow.encoder_proj.register_forward_hook(_enc_proj_hook)
+
     for k, end in enumerate(boundaries[1:], start=1):
         is_last = (end == n_speech)
         tokens_so_far = speech_tokens[:end]
@@ -245,11 +264,26 @@ def main() -> None:
         np.save(args.out / f"chunk_{k:02d}_tokens.npy",
                 np.ascontiguousarray(tokens_so_far.cpu().numpy().astype(np.int32)))
 
-        with torch.no_grad():
-            mels = tts.s3gen.flow_inference(
-                tokens_so_far, speech_token_lens=None,
-                ref_dict=cond_gen, n_cfm_timesteps=2, finalize=is_last,
-            ).to(dtype=tts.s3gen.dtype)
+        captured_z["z"] = None
+        captured_mu["mu"] = None
+        _torch.randn_like = _capture_randn_like
+        try:
+            with torch.no_grad():
+                mels = tts.s3gen.flow_inference(
+                    tokens_so_far, speech_token_lens=None,
+                    ref_dict=cond_gen, n_cfm_timesteps=2, finalize=is_last,
+                ).to(dtype=tts.s3gen.dtype)
+        finally:
+            _torch.randn_like = orig_randn_like
+
+        if captured_z["z"] is not None:
+            # z shape: (1, 80, T_mu).  Squeeze to (80, T_mu).
+            z_np = captured_z["z"].squeeze(0).numpy().astype(np.float32)
+            np.save(args.out / f"chunk_{k:02d}_cfm_z.npy", np.ascontiguousarray(z_np))
+        if captured_mu["mu"] is not None:
+            # encoder_proj output shape: (1, T_mu, 80).  Save as (T_mu, 80).
+            mu_np = captured_mu["mu"].squeeze(0).numpy().astype(np.float32)
+            np.save(args.out / f"chunk_{k:02d}_mu.npy", np.ascontiguousarray(mu_np))
 
         # How many NEW mel frames this chunk produces (beyond the last
         # chunk's emission):
@@ -300,6 +334,7 @@ def main() -> None:
         print(f"    chunk {k:02d}: finalize={is_last}  tokens_total={end}  "
               f"mels_new={mels_new_count}  wav={len(wav_k_np)} samples")
 
+    _mu_hook_handle.remove()
     np.save(args.out / "streamed_wav.npy", np.ascontiguousarray(streamed_wav))
 
     # Numerical comparison.  We can't expect bit-exact equality: HiFT's

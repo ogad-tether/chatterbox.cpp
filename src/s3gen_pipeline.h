@@ -83,6 +83,18 @@ struct s3gen_synthesize_opts {
     // as float32) to this path.  Used by the streaming validation harness
     // to compare each chunk's C++ mel against Python's chunk_{k}_mels_new.npy.
     std::string dump_mel_path;
+
+    // Full CFM-initial-noise override.  When non-empty, the pipeline uses
+    // these values verbatim instead of drawing from std::mt19937(seed).
+    // Expected layout: row-major (80, T_mu) — the same shape the C++ z buffer
+    // already uses internally, matching Python flow_matching's torch.randn_like(mu)
+    // squeezed to (80, T_mu).
+    //
+    // Lets the streaming validation harness run a C++ chunk with the EXACT
+    // noise Python used for the same chunk, getting bit-exact parity instead
+    // of the rel~0.25 gap that comes from torch.randn vs std::mt19937
+    // divergence.
+    std::vector<float> cfm_z0_override;
 };
 
 // Runs encoder + CFM + HiFT on the given T3 speech tokens and writes a WAV.

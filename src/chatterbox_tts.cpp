@@ -1348,6 +1348,24 @@ int s3gen_synthesize_to_wav(
     int T_mu = 2 * n_total;
     fprintf(stderr, "  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
 
+    // Streaming: trim the last `pre_lookahead_len * token_mel_ratio = 6`
+    // frames off the encoder output BEFORE CFM (matches Python's
+    // flow.inference(finalize=False) which does `h = h[:, :-6]` pre-
+    // decoder).  Doing it here — not post-CFM — keeps mu / cond / z and
+    // CFM's internal attention all sized consistently with Python, so
+    // a Python-dumped noise tensor produces bit-exact mel output in C++.
+    const int TOKEN_MEL_RATIO_PRE = 2;  // each speech token expands to 2 mels
+    if (!opts.finalize) {
+        const int trim = pre_lookahead_len * TOKEN_MEL_RATIO_PRE;  // 6
+        if (T_mu <= trim) {
+            fprintf(stderr, "error: streaming chunk too short (T_mu=%d ≤ trim=%d)\n", T_mu, trim);
+            return 1;
+        }
+        T_mu -= trim;
+        mu_T.resize((size_t)T_mu * MEL);  // numpy layout (T_mu, 80): drop last `trim` rows
+        fprintf(stderr, "  streaming: trimmed %d mel frames -> T_mu=%d\n", trim, T_mu);
+    }
+
     if (debug_mode) {
         npy_array ref_ie = npy_load(ref_dir + "/input_embedded.npy");
         const float * ref = (const float*)ref_ie.data.data();
@@ -1379,6 +1397,20 @@ int s3gen_synthesize_to_wav(
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
             mu[m2 * T_mu + t] = mu_T[t * MEL + m2];
+
+    // Streaming debug: optionally dump the encoder_proj output (same as Python's
+    // `mu` tensor fed into flow_matching.forward) so the test harness can
+    // isolate encoder-side vs CFM-side divergence.
+    if (!opts.dump_mel_path.empty()) {
+        std::string mu_path = opts.dump_mel_path;
+        if (mu_path.size() > 4 && mu_path.substr(mu_path.size() - 4) == ".npy") {
+            mu_path.replace(mu_path.size() - 4, 4, "_mu.npy");
+        } else {
+            mu_path += "_mu.npy";
+        }
+        npy_save_f32(mu_path, {(int64_t)T_mu, MEL}, mu_T.data());
+        fprintf(stderr, "  [stream] dumped mu (T_mu=%d, MEL=%d) → %s\n", T_mu, MEL, mu_path.c_str());
+    }
 
     // 4) Speaker embedding: F.normalize + spk_embed_affine_layer
     fprintf(stderr, "Computing speaker embedding...\n");
@@ -1447,7 +1479,18 @@ int s3gen_synthesize_to_wav(
     int prompt_len_in_mu = T_mu - n_speech_part;
     fprintf(stderr, "  T_mu=%d prompt_len_in_mu=%d n_speech_part=%d\n",
             T_mu, prompt_len_in_mu, n_speech_part);
-    if (debug_mode) {
+    if (!opts.cfm_z0_override.empty()) {
+        // Streaming validation path: use the exact noise Python used for
+        // this chunk so we can get bit-exact mel parity.
+        if ((int64_t)opts.cfm_z0_override.size() != (int64_t)T_mu * MEL) {
+            fprintf(stderr, "error: cfm_z0_override has %zu elements but T_mu*MEL=%d\n",
+                    opts.cfm_z0_override.size(), T_mu * MEL);
+            return 1;
+        }
+        std::memcpy(z.data(), opts.cfm_z0_override.data(), z.size() * sizeof(float));
+        fprintf(stderr, "  [stream] loaded %zu elems of CFM z0 from cfm_z0_override\n",
+                opts.cfm_z0_override.size());
+    } else if (debug_mode) {
         npy_array z_npy = npy_load(ref_dir + "/cfm_z0_raw.npy");
         std::memcpy(z.data(), z_npy.data.data(), z.size() * sizeof(float));
         fprintf(stderr, "  [debug] loaded z from cfm_z0_raw.npy\n");
@@ -1526,22 +1569,11 @@ int s3gen_synthesize_to_wav(
     // — these aren't "safe" yet (they'd change once the next chunk's tokens
     // provide more right-context).  Matches the trim in Python
     // CausalMaskedDiffWithXvec.inference(..., finalize=False).
-    // Beyond-prompt mel span: starts at mel_len1 in z, ends at T_mu.  For
-    // streaming (finalize=false) we drop the tail `pre_lookahead_len *
-    // token_mel_ratio = 6` frames (they aren't safe yet).  Then we skip
-    // the first `skip_mel_frames` frames (mels already emitted on prior
-    // chunks).
+    // Beyond-prompt mel span: starts at mel_len1 in z, ends at T_mu.
+    // Streaming's 6-frame tail trim is already baked into T_mu above (we
+    // shrunk it pre-CFM, matching Python).  Here we only apply the caller's
+    // skip offset to drop frames already emitted on prior chunks.
     int T_mel_full = T_mu - mel_len1;
-    const int TOKEN_MEL_RATIO = 2;
-    if (!opts.finalize) {
-        const int trim = pre_lookahead_len * TOKEN_MEL_RATIO;  // 6
-        if (T_mel_full > trim) T_mel_full -= trim;
-        else {
-            fprintf(stderr, "error: streaming chunk too short (T_mel_full=%d ≤ trim=%d)\n",
-                    T_mel_full, trim);
-            return 1;
-        }
-    }
     int skip = opts.skip_mel_frames;
     if (skip < 0) skip = 0;
     if (skip > T_mel_full) {

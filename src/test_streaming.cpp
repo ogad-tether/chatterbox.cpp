@@ -104,6 +104,18 @@ int main(int argc, char ** argv) {
         opts.skip_mel_frames           = prev_mels_emitted;
         opts.dump_mel_path             = dump_path;
 
+        // Inject Python's exact per-chunk CFM noise so the two pipelines
+        // become bit-exact comparable (bypasses the torch.randn vs
+        // std::mt19937 divergence).
+        const std::string z_path = ref + "/chunk_" + kbuf + "_cfm_z.npy";
+        if (path_exists(z_path)) {
+            npy_array z = npy_load(z_path);
+            const float * zp = (const float *)z.data.data();
+            opts.cfm_z0_override.assign(zp, zp + z.n_elements());
+        } else {
+            fprintf(stderr, "  (no cfm_z0 dump; using std::mt19937 — expect rel ≈ 0.25)\n");
+        }
+
         int rc = s3gen_synthesize_to_wav(chunk_tokens, opts);
         if (rc != 0) {
             fprintf(stderr, "error: s3gen_synthesize_to_wav returned %d\n", rc);
