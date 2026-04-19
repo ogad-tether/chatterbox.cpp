@@ -44,7 +44,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[3/3] running CAMPPlus forward\n");
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> emb;
-    if (!campplus_embed(fbank_flat, T, w, emb)) return 1;
+    if (!campplus_embed(fbank_flat, T, w, /*backend=*/nullptr, emb)) return 1;
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     fprintf(stderr, "      forward pass: %.1f ms  out=%zu\n", ms, emb.size());

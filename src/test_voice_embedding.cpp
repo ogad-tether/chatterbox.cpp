@@ -70,7 +70,7 @@ int main(int argc, char ** argv) {
 
     std::vector<float> emb;
     auto t2 = std::chrono::steady_clock::now();
-    if (!campplus_embed(fb_cpp, T, w, emb)) return 1;
+    if (!campplus_embed(fb_cpp, T, w, /*backend=*/nullptr, emb)) return 1;
     auto t3 = std::chrono::steady_clock::now();
     fprintf(stderr, "      CAMPPlus  %.1f ms  → %zu dims\n",
             std::chrono::duration<double, std::milli>(t3 - t2).count(), emb.size());

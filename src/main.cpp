@@ -145,6 +145,7 @@ static bool compute_prompt_feat_native(const std::string & wav_path,
 static bool compute_embedding_native(const std::string & wav_path,
                                      const std::string & s3gen_gguf_path,
                                      std::vector<float> & out_emb,
+                                     ggml_backend_t backend = nullptr,
                                      bool verbose = false)
 {
     campplus_weights w;
@@ -197,7 +198,7 @@ static bool compute_embedding_native(const std::string & wav_path,
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
 
-    if (!campplus_embed(fbank, T, w, out_emb)) return false;
+    if (!campplus_embed(fbank, T, w, backend, out_emb)) return false;
     if (verbose) fprintf(stderr, "voice: embedding shape=(%zu,) via CAMPPlus (%d fbank frames)\n",
             out_emb.size(), T);
     return true;
@@ -1152,7 +1153,8 @@ int main(int argc, char ** argv) {
             std::vector<float> emb_bake;
             {
                 const int64_t _t0 = ggml_time_us();
-                (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf, emb_bake, params.verbose);
+                (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
+                                               emb_bake, vc_backend, params.verbose);
                 fprintf(stderr, "BENCH: VC_STAGE_campplus_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
@@ -1198,7 +1200,8 @@ int main(int argc, char ** argv) {
                 // Best-effort: try to compute the S3Gen `embedding` natively too.
                 // Falls through to ref_dir/embedding.npy if the s3gen GGUF is pre-A1-2d-a.
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
-                                               opts.embedding_override, params.verbose);
+                                               opts.embedding_override,
+                                               /*backend=*/nullptr, params.verbose);
                 // And the S3Gen-side prompt_token via S3TokenizerV2 (Phase 2e).
                 // No backend available in this path yet (we haven't loaded T3);
                 // fall back to ggml-cpu.  Callers going through the bake path
@@ -1418,7 +1421,8 @@ int main(int argc, char ** argv) {
                                                 params.verbose))
                     throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
-                                               opts.embedding_override, params.verbose);
+                                               opts.embedding_override,
+                                               /*backend=*/model.backend, params.verbose);
                 if (!prompt_token_from_ref.empty()) {
                     opts.prompt_token_override = std::move(prompt_token_from_ref);
                 }
