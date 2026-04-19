@@ -95,6 +95,44 @@ struct s3gen_synthesize_opts {
     // of the rel~0.25 gap that comes from torch.randn vs std::mt19937
     // divergence.
     std::vector<float> cfm_z0_override;
+
+    // ---------------- HiFT streaming (PROGRESS.md B1 phase 3) ----------------
+    //
+    // Chatterbox's HiFT vocoder (`HiFTGenerator.inference`) supports
+    // cross-chunk continuity via a small "source cache": the last N samples of
+    // the previous chunk's SineGen output (post `m_source` tanh), which get
+    // pasted over the first N samples of the current chunk's source so F0
+    // phase is continuous across the seam.  The first chunk additionally
+    // applies a raised-cosine `trim_fade` to mask HiFT's resnet cold start.
+    //
+    //   hift_cache_source          When non-empty, overwrite the leading
+    //                              `hift_cache_source.size()` samples of the
+    //                              post-SineGen source with these values.
+    //                              Callers pass the tail of the previous
+    //                              chunk's source here.  Python uses a
+    //                              480-sample (1 mel hop = 20 ms) overlap.
+    //
+    //   apply_trim_fade            When true, multiply the first
+    //                              2 * (sr / 50) = 960 samples of the output
+    //                              wav by a raised-cosine fade-in (first half
+    //                              zero, second half 0→1).  Batch callers set
+    //                              this to true to mask reference-audio
+    //                              bleed-through; streaming callers set it
+    //                              only on chunk 0.  Defaults to true.
+    //
+    //   hift_source_tail_out       Output slot: the pipeline writes the last
+    //                              `source_tail_samples` values of the chunk's
+    //                              post-SineGen source here so the caller can
+    //                              feed them as `hift_cache_source` on the
+    //                              next chunk.
+    //
+    //   source_tail_samples        Size of the tail slice to export.  Must
+    //                              match `hift_cache_source.size()` on the
+    //                              next call.  Defaults to 480 (1 mel hop).
+    std::vector<float>   hift_cache_source;
+    bool                 apply_trim_fade       = true;
+    std::vector<float> * hift_source_tail_out  = nullptr;
+    int                  source_tail_samples   = 480;
 };
 
 // Runs encoder + CFM + HiFT on the given T3 speech tokens and writes a WAV.
@@ -102,3 +140,11 @@ struct s3gen_synthesize_opts {
 int s3gen_synthesize_to_wav(
     const std::vector<int32_t> & speech_tokens,
     const s3gen_synthesize_opts & opts);
+
+// Eagerly load the S3Gen GGUF into the internal model cache so the first
+// call to s3gen_synthesize_to_wav skips the ~700 ms tensor-load cost.
+// Useful for streaming pipelines: run this on a worker thread (or right
+// after the T3 GGUF load) while T3 is still inferring, then the first
+// streamed chunk is available as soon as T3 emits its first N tokens.
+// Returns 0 on success.
+int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers);

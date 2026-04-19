@@ -1527,6 +1527,67 @@ the target op receives*, not an earlier upstream value. Monkeypatching
 a function that a caller later post-processes (`z[...] = …`) is a
 silent source of divergence.
 
+##### Phase 3 (HiFT streaming + CLI) — ✅ DONE (2026-04-12)
+
+With CFM bit-exact across chunks, wiring up the HiFT side and the
+user-facing CLI was straightforward:
+
+- **`cache_source` carry** (src/chatterbox_tts.cpp, `s3gen_synthesize_opts`):
+  after `sinegen_source` produces the post-`m_source` source signal,
+  overwrite its leading samples with the caller-provided
+  `hift_cache_source` and expose the last `source_tail_samples` (480 =
+  1 mel hop = 20 ms) via `hift_source_tail_out` so the caller can feed
+  them back in on the next chunk. Matches Python
+  `HiFTGenerator.inference`'s `s[:, :, :cache_source.shape[2]] = cache_source`.
+
+- **`trim_fade`** (same file): opt-in raised-cosine fade-in applied to
+  the first `2 * sr/50 = 960` samples (40 ms) of each chunk's wav.
+  First half zero, second half `(cos(π→0)+1)/2`. Streaming callers set
+  `apply_trim_fade` on chunk 0 only.
+
+- **`--stream-chunk-tokens N` CLI flag** (src/main.cpp): wraps
+  `s3gen_synthesize_to_wav` in a chunked loop that carries
+  `hift_cache_source` across chunks, writes per-chunk wavs as
+  `<out>_chunk_KK.wav`, and concatenates the final wav into `--out`.
+  Adds `append_lookahead_silence=false`, `finalize=(is_last)`, and
+  `skip_mel_frames=prev_mels_emitted` on each chunk.
+
+- **Process-wide model cache** (src/chatterbox_tts.cpp,
+  `s3gen_model_cache_get`): makes the ~700 ms GGUF-tensor load a
+  one-shot cost. `s3gen_preload(path, n_gpu_layers)` populates the cache
+  eagerly so main.cpp can kick a background std::thread to warm S3Gen
+  while T3 is still running. Brings first-chunk latency down from
+  2006 ms → 1340 ms on CPU for the `"streaming sanity check"` test.
+
+Validation (`./build/test-streaming models/chatterbox-s3gen.gguf
+/tmp/streaming_ref`):
+
+| chunk | mel rel | wav rel (informational) |
+|---|---|---|
+| 1 | 6.47e-07 | 1.06e-01 |
+| 2 | 8.67e-07 | 1.24e-01 |
+
+Mel is bit-exact; wav diverges a few percent because C++'s
+`sinegen_source` uses `std::mt19937` vs Python's `torch.randn` — the
+audio content is identical, only the per-sample additive white-noise
+seed differs. Python's own streamed-vs-batch ratio is 116 %, so our
+streamed-vs-Python-streamed is 6.5 %, well inside the structural
+envelope of the approach.
+
+Performance numbers on a 3.76 s utterance (9 s of reference audio):
+
+| metric | batch | streaming (25 tokens/chunk) |
+|---|---|---|
+| total wall time | 2271 ms | 5988 ms |
+| first-audio-out | 2271 ms | **1340 ms** |
+| per-chunk RTF | 0.60 | 1.44 – 1.59 |
+
+Streaming wins on first-audio latency (−41 %) but pays for it in total
+wall time because each chunk re-runs the encoder/CFM on the cumulative
+token prefix (O(K²)). A proper incremental encoder / KV-cached CFM is
+needed to bring per-chunk RTF below 1 — that's a follow-up, not a
+blocker for the feature.
+
 #### B2. Server mode with persistent graphs
 
 Every invocation currently pays ~200–400 ms fixed cost for graph

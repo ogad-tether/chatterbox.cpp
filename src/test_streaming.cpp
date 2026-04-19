@@ -5,6 +5,13 @@
 // chunk with the matching `finalize` flag and token prefix, and compares
 // per-chunk mel output against Python's `chunk_{k}_mels_new.npy`.
 //
+// Phase 3 additions: carries `hift_cache_source` across chunks, applies
+// `apply_trim_fade` only to chunk 0, concatenates the per-chunk wavs into
+// `streamed_wav_cpp.npy`, and reports RMS error vs Python's
+// `streamed_wav.npy` — HiFT sinegen uses a different RNG than Python's
+// torch.randn so bit-exact parity is not expected, but the streamed RMS
+// should be close to Python's streamed-vs-batch gap (≈3%).
+//
 // Usage:
 //   ./build/test-streaming  models/chatterbox-s3gen.gguf  /tmp/streaming_ref/
 
@@ -13,10 +20,38 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+
+// Minimal .npy writer (float32 1-D / 2-D only; matches the harness needs).
+static void npy_write_f32(const std::string & path, const std::vector<float> & v,
+                          const std::vector<int64_t> & shape) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { fprintf(stderr, "error: cannot write %s\n", path.c_str()); return; }
+    std::string hdr = "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        hdr += std::to_string(shape[i]);
+        if (shape.size() == 1 || i + 1 < shape.size()) hdr += ", ";
+    }
+    hdr += "), }";
+    // pad so total header length (10 bytes preamble + hdr + newline) is % 64.
+    size_t total = 10 + hdr.size() + 1;
+    size_t pad = (64 - (total % 64)) % 64;
+    hdr.append(pad, ' ');
+    hdr += '\n';
+    uint16_t hlen = (uint16_t)hdr.size();
+    f.write("\x93NUMPY", 6);
+    char ver[2] = { 1, 0 };
+    f.write(ver, 2);
+    f.write((const char*)&hlen, 2);
+    f.write(hdr.data(), hdr.size());
+    f.write((const char*)v.data(), v.size() * sizeof(float));
+}
 
 static bool path_exists(const std::string & p) {
     struct stat st; return ::stat(p.c_str(), &st) == 0;
@@ -59,6 +94,9 @@ int main(int argc, char ** argv) {
     int prev_mels_emitted = 0;
     double max_rel = 0;
     double total_rms = 0;
+    std::vector<float> hift_cache_source;   // tail of prev chunk's post-SineGen source
+    std::vector<float> streamed_wav_cpp;    // accumulated across chunks
+    double wav_max_rel = 0, wav_total_rms = 0; int wav_chunks = 0;
     while (true) {
         char kbuf[16];
         std::snprintf(kbuf, sizeof(kbuf), "%02d", k + 1);
@@ -104,6 +142,14 @@ int main(int argc, char ** argv) {
         opts.skip_mel_frames           = prev_mels_emitted;
         opts.dump_mel_path             = dump_path;
 
+        // HiFT streaming: carry source tail across chunks, fade-in only on
+        // chunk 0 (matches Python dump-streaming-reference.py).
+        opts.hift_cache_source         = hift_cache_source;
+        opts.apply_trim_fade           = (k == 0);
+        std::vector<float> source_tail_out;
+        opts.hift_source_tail_out      = &source_tail_out;
+        opts.source_tail_samples       = 480;   // 1 mel hop at 24 kHz = 20 ms
+
         // Inject Python's exact per-chunk CFM noise so the two pipelines
         // become bit-exact comparable (bypasses the torch.randn vs
         // std::mt19937 divergence).
@@ -148,10 +194,68 @@ int main(int argc, char ** argv) {
         if (s.rel > max_rel) max_rel = s.rel;
         total_rms += s.rms;
         prev_mels_emitted += (int)cpp_rows;
+
+        // Carry cache_source over to the next chunk.
+        hift_cache_source = std::move(source_tail_out);
+
+        // Read the per-chunk C++ wav (just written to disk) and splice into
+        // the running streamed wav.  Compare to Python's chunk_KK_wav.npy:
+        // C++ SineGen RNG differs from torch.randn so bit-exact parity is
+        // not achievable here — we just report RMS as an informational
+        // sanity signal.
+        const std::string cpp_wav_path = opts.out_wav_path;
+        // Minimal WAV reader (mono 16-bit PCM from write_wav()).
+        std::vector<float> cpp_wav;
+        {
+            std::ifstream wf(cpp_wav_path, std::ios::binary);
+            if (wf) {
+                char hdr[44]; wf.read(hdr, 44);
+                // Read 16-bit PCM samples
+                std::vector<int16_t> pcm;
+                int16_t s16;
+                while (wf.read((char*)&s16, 2)) pcm.push_back(s16);
+                cpp_wav.resize(pcm.size());
+                for (size_t i = 0; i < pcm.size(); ++i) cpp_wav[i] = (float)pcm[i] / 32768.0f;
+            }
+        }
+        const std::string py_wav_path = ref + "/chunk_" + kbuf + "_wav.npy";
+        if (path_exists(py_wav_path) && !cpp_wav.empty()) {
+            npy_array py_wav_arr = npy_load(py_wav_path);
+            const float * pywav = (const float *)py_wav_arr.data.data();
+            size_t wn = std::min((size_t)py_wav_arr.n_elements(), cpp_wav.size());
+            auto ws = cmp_f32(cpp_wav.data(), pywav, wn);
+            fprintf(stderr, "  wav  diff:    max_abs=%.4e  rms=%.4e  rel=%.4e  (informational, RNG mismatch expected)\n",
+                    ws.max_abs, ws.rms, ws.rel);
+            if (ws.rel > wav_max_rel) wav_max_rel = ws.rel;
+            wav_total_rms += ws.rms;
+            wav_chunks += 1;
+        }
+        streamed_wav_cpp.insert(streamed_wav_cpp.end(), cpp_wav.begin(), cpp_wav.end());
         k += 1;
     }
 
-    fprintf(stderr, "\nresult: %d chunks verified, worst rel=%.4e, mean rms=%.4e\n",
+    fprintf(stderr, "\nresult: %d chunks verified, worst mel rel=%.4e, mean mel rms=%.4e\n",
             k, max_rel, total_rms / std::max(k, 1));
+    if (wav_chunks > 0) {
+        fprintf(stderr, "        per-chunk wav: worst rel=%.4e, mean rms=%.4e\n",
+                wav_max_rel, wav_total_rms / wav_chunks);
+    }
+
+    // Save streamed_wav_cpp for offline comparison vs Python's streamed_wav.
+    if (!streamed_wav_cpp.empty()) {
+        npy_write_f32(ref + "/streamed_wav_cpp.npy",
+                      streamed_wav_cpp, {(int64_t)streamed_wav_cpp.size()});
+        fprintf(stderr, "        streamed wav (%zu samples) → %s/streamed_wav_cpp.npy\n",
+                streamed_wav_cpp.size(), ref.c_str());
+        const std::string py_streamed = ref + "/streamed_wav.npy";
+        if (path_exists(py_streamed)) {
+            npy_array py_sw = npy_load(py_streamed);
+            const float * py = (const float *)py_sw.data.data();
+            size_t n = std::min((size_t)py_sw.n_elements(), streamed_wav_cpp.size());
+            auto sw = cmp_f32(streamed_wav_cpp.data(), py, n);
+            fprintf(stderr, "        streamed vs Python: rms=%.4e max_abs=%.4e rel=%.4e\n",
+                    sw.rms, sw.max_abs, sw.rel);
+        }
+    }
     return 0;
 }

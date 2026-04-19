@@ -53,6 +53,25 @@ static bool file_exists(const std::string & path) {
 // conditioning tensors (prompt_token=125 instead of 250, etc.) which falls
 // back on whatever is in the built-in voice slots.  That's misleading — give
 // a clear error instead.  Recommended length is 10–15 seconds.
+// Minimal 16-bit PCM WAV writer; matches the one in chatterbox_tts.cpp / mel2wav.cpp.
+// Used by the streaming synthesis path to write the final concatenated wav.
+static void stream_write_wav(const std::string & path, const std::vector<float> & wav, int sr) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { fprintf(stderr, "error: cannot write %s\n", path.c_str()); return; }
+    auto w32 = [&](uint32_t v){ f.write((const char*)&v, 4); };
+    auto w16 = [&](uint16_t v){ f.write((const char*)&v, 2); };
+    uint32_t data_bytes = (uint32_t)(wav.size() * sizeof(int16_t));
+    f.write("RIFF", 4); w32(36 + data_bytes); f.write("WAVE", 4);
+    f.write("fmt ", 4); w32(16); w16(1); w16(1); w32(sr); w32(sr * 2); w16(2); w16(16);
+    f.write("data", 4); w32(data_bytes);
+    for (float v : wav) {
+        int s = (int)std::lround(v * 32767.0f);
+        if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+        int16_t s16 = (int16_t)s;
+        f.write((const char*)&s16, 2);
+    }
+}
+
 static bool validate_reference_audio(const std::string & path) {
     std::vector<float> wav;
     int sr = 0;
@@ -426,6 +445,13 @@ struct cli_params {
     float   top_p          = 0.95f;
     float   temp           = 0.8f;
     float   repeat_penalty = 1.2f;
+
+    // Streaming synthesis (PROGRESS.md B1).  When > 0, speech tokens from
+    // T3 are fed to S3Gen+HiFT in chunks of this size, with `cache_source`
+    // carried across chunks for phase continuity and `trim_fade` only on
+    // chunk 0.  Per-chunk wavs are written next to --out (stream_chunk_K.wav)
+    // and concatenated into --out when the loop finishes.
+    int32_t stream_chunk_tokens = 0;
 };
 
 static void print_usage(const char * argv0) {
@@ -463,6 +489,12 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --top-p P               (default: 0.95)\n");
     fprintf(stderr, "  --temp T                (default: 0.8)\n");
     fprintf(stderr, "  --repeat-penalty R      (default: 1.2)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  --stream-chunk-tokens N Synthesize the wav in streaming chunks of N speech\n");
+    fprintf(stderr, "                          tokens each (~1 s audio per 25-token chunk).  Writes\n");
+    fprintf(stderr, "                          per-chunk wavs next to --out as\n");
+    fprintf(stderr, "                          <out>_chunk_KK.wav and the full concatenation to --out.\n");
+    fprintf(stderr, "                          Requires --s3gen-gguf.  (default: 0 = batch)\n");
     fprintf(stderr, "  -h, --help\n");
 }
 
@@ -493,6 +525,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--top-p")          { auto v = next("--top-p");          if (!v) return false; params.top_p = std::stof(v); }
         else if (arg == "--temp")           { auto v = next("--temp");           if (!v) return false; params.temp = std::stof(v); }
         else if (arg == "--repeat-penalty") { auto v = next("--repeat-penalty"); if (!v) return false; params.repeat_penalty = std::stof(v); }
+        else if (arg == "--stream-chunk-tokens") { auto v = next("--stream-chunk-tokens"); if (!v) return false; params.stream_chunk_tokens = std::stoi(v); }
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); std::exit(0); }
         else { fprintf(stderr, "error: unknown argument: %s\n", arg.c_str()); return false; }
@@ -1197,6 +1230,18 @@ int main(int argc, char ** argv) {
         const int64_t _t3_load_ms = (ggml_time_us() - _t3_load_t0) / 1000;
         fprintf(stderr, "BENCH: T3_LOAD_MS=%lld\n", (long long)_t3_load_ms);
 
+        // Warm the S3Gen GGUF cache in the background while T3 inference
+        // runs.  This cuts first-audio-out latency by ~700 ms in streaming
+        // mode — by the time T3 emits its first chunk of tokens, S3Gen is
+        // already in RAM with its tensors allocated on the right backend.
+        std::thread s3gen_preload_thread;
+        if (!params.s3gen_gguf.empty()) {
+            s3gen_preload_thread = std::thread([path = params.s3gen_gguf,
+                                                ngpu = params.n_gpu_layers]() {
+                s3gen_preload(path, ngpu);
+            });
+        }
+
         // Voice-profile override on the T3 side.  We resolve two tensors
         // independently:
         //
@@ -1373,6 +1418,10 @@ int main(int argc, char ** argv) {
 
         // If --s3gen-gguf is set, chain into the S3Gen + HiFT vocoder to write a wav.
         if (!params.s3gen_gguf.empty()) {
+            // Make sure the background preload finished before we call into
+            // s3gen_synthesize_to_wav — otherwise we race with its own lazy
+            // load and pay the ~700 ms cost anyway.
+            if (s3gen_preload_thread.joinable()) s3gen_preload_thread.join();
             s3gen_synthesize_opts opts;
             opts.s3gen_gguf_path = params.s3gen_gguf;
             opts.out_wav_path    = params.out_wav;
@@ -1403,8 +1452,99 @@ int main(int argc, char ** argv) {
                                        opts.prompt_feat_rows_override);
                 }
             }
-            int rc = s3gen_synthesize_to_wav(generated, opts);
-            if (rc != 0) return rc;
+            if (params.stream_chunk_tokens <= 0) {
+                int rc = s3gen_synthesize_to_wav(generated, opts);
+                if (rc != 0) return rc;
+            } else {
+                // Streaming synthesis: chunk the speech tokens, carry
+                // cache_source across chunks, apply trim_fade only on chunk 0,
+                // and emit per-chunk wavs as they're produced.
+                //
+                // Mirrors scripts/dump-streaming-reference.py.  Appends 3
+                // S3GEN_SIL tokens ONCE at the end of the full sequence so
+                // each call's `append_lookahead_silence=false` is safe.
+                constexpr int S3GEN_SIL = 4299;
+                std::vector<int32_t> full_tokens = generated;
+                full_tokens.push_back(S3GEN_SIL);
+                full_tokens.push_back(S3GEN_SIL);
+                full_tokens.push_back(S3GEN_SIL);
+
+                const int chunk_n = params.stream_chunk_tokens;
+                const int total_n = (int)full_tokens.size();
+                std::vector<int> boundaries;
+                for (int b = 0; b <= total_n; b += chunk_n)
+                    boundaries.push_back(std::min(b, total_n));
+                if (boundaries.back() != total_n) boundaries.push_back(total_n);
+
+                std::vector<float> hift_cache_source;
+                std::vector<float> streamed_wav;
+                int prev_mels_emitted = 0;
+
+                const std::string base = params.out_wav;
+                std::string base_noext = base;
+                if (base_noext.size() > 4 && base_noext.substr(base_noext.size()-4) == ".wav")
+                    base_noext.resize(base_noext.size()-4);
+
+                fprintf(stderr, "\n=== streaming synthesis: %d chunks of %d tokens ===\n",
+                        (int)boundaries.size() - 1, chunk_n);
+                const double stream_t0_ms = 1e-3 * ggml_time_us();
+                double first_chunk_t_ms = -1.0;
+
+                for (int k = 1; k < (int)boundaries.size(); ++k) {
+                    const int end    = boundaries[k];
+                    const bool is_last = (end == total_n);
+                    std::vector<int32_t> toks(full_tokens.begin(), full_tokens.begin() + end);
+
+                    s3gen_synthesize_opts copts = opts;
+                    char kbuf[16]; std::snprintf(kbuf, sizeof(kbuf), "%02d", k);
+                    copts.out_wav_path              = base_noext + "_chunk_" + kbuf + ".wav";
+                    copts.append_lookahead_silence  = false;
+                    copts.finalize                  = is_last;
+                    copts.skip_mel_frames           = prev_mels_emitted;
+                    copts.apply_trim_fade           = (k == 1);
+                    copts.hift_cache_source         = hift_cache_source;
+                    std::vector<float> tail_out;
+                    copts.hift_source_tail_out      = &tail_out;
+                    copts.source_tail_samples       = 480;
+
+                    fprintf(stderr, "\n--- chunk %d/%d: tokens_total=%d finalize=%s ---\n",
+                            k, (int)boundaries.size() - 1, end, is_last ? "true" : "false");
+                    int rc = s3gen_synthesize_to_wav(toks, copts);
+                    if (rc != 0) return rc;
+
+                    if (first_chunk_t_ms < 0.0)
+                        first_chunk_t_ms = 1e-3 * ggml_time_us() - stream_t0_ms;
+
+                    // Read back the per-chunk wav (16-bit PCM @ 24 kHz) and
+                    // append to the streamed buffer.
+                    std::ifstream wf(copts.out_wav_path, std::ios::binary);
+                    if (wf) {
+                        char hdr[44]; wf.read(hdr, 44);
+                        int16_t s16;
+                        while (wf.read((char*)&s16, 2))
+                            streamed_wav.push_back((float)s16 / 32768.0f);
+                    }
+                    hift_cache_source = std::move(tail_out);
+
+                    // The number of mel frames emitted by this chunk equals
+                    // wav_samples / 480 (HiFT's fixed upsample factor).
+                    // Wav samples this chunk = streamed_wav.size() - prev.
+                    // Use the per-chunk .wav size to advance skip_mel_frames.
+                    static size_t last_streamed = 0;
+                    size_t chunk_samples = streamed_wav.size() - last_streamed;
+                    prev_mels_emitted  += (int)(chunk_samples / 480);
+                    last_streamed = streamed_wav.size();
+                }
+
+                // Write the concatenated streamed wav to --out.
+                stream_write_wav(params.out_wav, streamed_wav, 24000);
+                fprintf(stderr, "\n=== streaming done: %zu samples (%.3fs), first-chunk latency=%.1f ms, total=%.1f ms ===\n",
+                        streamed_wav.size(),
+                        (float)streamed_wav.size() / 24000.0f,
+                        first_chunk_t_ms,
+                        1e-3 * ggml_time_us() - stream_t0_ms);
+                fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
+            }
         } else {
             // Legacy: print the tokens to stdout too (handy for piping).
             for (size_t i = 0; i < generated.size(); ++i) { if (i) printf(","); printf("%d", generated[i]); }
