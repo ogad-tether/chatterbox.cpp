@@ -1726,6 +1726,82 @@ finalises; writing a placeholder then patching after the fact doesn't
 compose with pipe output.  Raw s16le is what `ffplay`, `aplay`,
 `pacat`, `sox` etc. accept natively, so no one loses in practice.
 
+##### Phase 3d (real-world validation on M4 + Metal) — ✅ DONE (2026-04-13)
+
+End-to-end streaming verified audible on an Apple M4 with the Metal
+backend and the recommended low-latency preset:
+
+```bash
+./build/chatterbox \
+    --model models/chatterbox-t3-turbo.gguf \
+    --s3gen-gguf models/chatterbox-s3gen.gguf \
+    --text "…long paragraph…" \
+    --stream-first-chunk-tokens 10 \
+    --stream-chunk-tokens       25 \
+    --stream-cfm-steps          1 \
+    --n-gpu-layers              99 \
+    --out - \
+  | play -q -t raw -r 24000 -b 16 -e signed -c 1 -
+```
+
+Measured on the 48-text-token sentence *"Hello from streaming
+Chatterbox, I am john and i work in google since 2010. I love to go
+out with my friends, eat some pizza and also drink some wine. I also
+love to traverl around the world alone."* → 317 speech tokens →
+12.68 s audio → 14 streaming chunks:
+
+| chunk | tokens_total | T_mu | encoder | CFM step0 | HiFT | total ms | RTF |
+|------:|-------------:|-----:|--------:|----------:|-----:|---------:|----:|
+|     1 |           10 |  514 |   84 ms |    144 ms | 37 ms|    278 ms| 0.99|
+|     2 |           35 |  564 |   69 ms |    126 ms |116 ms|    324 ms| 0.32|
+|     3 |           60 |  614 |   91 ms |    143 ms |115 ms|    370 ms| 0.37|
+|     4 |           85 |  664 |  117 ms |    159 ms |115 ms|    409 ms| 0.41|
+|     5 |          110 |  714 |  126 ms |    173 ms |115 ms|    433 ms| 0.43|
+|     6 |          135 |  764 |  153 ms |    182 ms |116 ms|    468 ms| 0.47|
+|     7 |          160 |  814 |  163 ms |    197 ms |117 ms|    499 ms| 0.50|
+|     8 |          185 |  864 |  153 ms |    213 ms |114 ms|    499 ms| 0.50|
+|     9 |          210 |  914 |  191 ms |    230 ms |115 ms|    558 ms| 0.56|
+|    10 |          235 |  964 |  210 ms |    250 ms |114 ms|    591 ms| 0.59|
+|    11 |          260 | 1014 |  187 ms |    257 ms |115 ms|    579 ms| 0.58|
+|    12 |          285 | 1064 |  231 ms |    266 ms |115 ms|    634 ms| 0.63|
+|    13 |          310 | 1114 |  208 ms |    280 ms |113 ms|    614 ms| 0.61|
+|    14 |          317 | 1134 |  212 ms |    290 ms | 49 ms|    568 ms| 1.42|
+
+```
+=== streaming done: 304320 samples (12.680 s),
+    first-chunk latency = 278.9 ms,
+    total wall = 11474.7 ms  (overall RTF = 0.90) ===
+```
+
+Observations:
+
+- **First-audio-out: 279 ms** on M4 + Metal.  Chunk 1 is 10 tokens
+  (~0.28 s of audio) and lands at RTF ~1.0 because the fixed encoder
+  + CFM overhead dominates such a small chunk — but the wall-time
+  number is what matters, and it's low.
+- **Steady-state RTF 0.3 – 0.6** for chunks 2–13 (each 1 s of audio).
+  Well below real-time, so `sox play` stays ahead of playback on every
+  chunk and there are no audible gaps.
+- Chunk 14 is the "tail" finalise (only 0.4 s of audio; whatever's
+  left after the last full 25-token boundary) so its RTF naturally
+  drifts above 1.  It completes before playback reaches it because
+  chunks 11–13 produced excess buffered audio.
+- Total wall time **11.47 s** for 12.68 s of audio → overall RTF
+  **0.90**, i.e. even adding up every per-chunk cost, the pipeline is
+  faster than real-time end-to-end.
+
+Playback caveat on macOS 26 / ffmpeg 8.1: `ffplay -f s16le -i -` is
+silent for piped raw PCM on our M4 test box (known SDL2 + CoreAudio
+regression).  `sox play` and Python `sounddevice.play()` work
+reliably.  README now recommends `sox` and shows the exact
+invocation.
+
+README gained a new "Streaming mode — low-latency playback" section
+under "Useful flags" documenting the three `--stream-*` tunables, the
+`--out -` stdout mode, the `sox play` recipe, and the table above.
+That section plus this Phase 3d write-up are the canonical places for
+future readers to pick up streaming from.
+
 #### B2. Server mode with persistent graphs
 
 Every invocation currently pays ~200–400 ms fixed cost for graph
