@@ -128,22 +128,39 @@ static void compute_partials(int n_frames, int partial, float rate,
 }
 
 // ============================================================================
-// GGML graph: 3-layer unidirectional LSTM + proj + ReLU over one 160-frame
-// partial window.
+// GGML graph: 3-layer unidirectional LSTM + proj + ReLU over a batch of
+// partial windows (dim [H, n_wins]) in a single graph compute.
 //
-// The graph is unrolled across both layers and timesteps so that every kernel
-// dispatched to the main backend (Metal / Vulkan / CUDA / NEON-ggml-cpu) is a
-// small dense GEMV + pointwise op — exactly the shapes those backends already
-// hit on the T3 step path.  Per step each layer evaluates:
+// Structure:
+//   Input  X    : [n_mels, T, n_wins]     -- all windows stacked along dim 2
+//   State  h0/c0: [H, n_wins]             -- zeros, supplied by host
+//   Weights (shared across batch):
+//          W_ih : [I, 4H]     W_hh : [H, 4H]     b_ih, b_hh : [4H]
+//          proj_w : [H, E]    proj_b : [E]
+//   Output emb  : [E, n_wins]
 //
-//     gates_t = gates_ih_seq[:, t] + W_hh @ h_prev + b_hh          (*)
-//     i,f,g,o = sigmoid/tanh of split(gates_t, H)
-//     c_t     = f * c_prev + i * g
-//     h_t     = o * tanh(c_t)
+// Per-layer:
+//   gates_ih_seq = W_ih @ X + b_ih                     -- one matmul,
+//                  shape [4H, T, n_wins]                  batched
+//   for t in 0..T-1:
+//       gates_hh = W_hh @ h_prev + b_hh                -- shape [4H, n_wins]
+//                                                        (proper GEMM, not
+//                                                         GEMV — this is the
+//                                                         reason for batching)
+//       gates    = gates_ih_seq[:,t,:] + gates_hh      -- [4H, n_wins]
+//       i,f,g,o  = sigmoid/tanh of split(gates, H)     -- each [H, n_wins]
+//       c        = f*c_prev + i*g                      -- [H, n_wins]
+//       h        = o*tanh(c)                           -- [H, n_wins]
+//       h_seq[:,t,:] = h                               -- for intermediate
+//                                                        layers only
 //
-// The per-sequence input projection (W_ih @ X + b_ih) is a single matmul per
-// layer, computed once up front — saves 160 GEMVs per layer vs. the
-// per-timestep formulation.
+// Rationale: the previous per-window graph issued ~960 sequential
+// mul_mat(W_hh, [H]) GEMVs per window × 7 windows = 6720 tiny dispatches
+// per utterance.  At M3 Ultra sizes that's dispatch-bound on Metal.  Batching
+// along n_wins turns every per-timestep matmul into a single GEMM of shape
+// [H, 4H] × [H, n_wins] → [4H, n_wins], so the effective work per dispatch
+// grows by ~n_wins× while the dispatch count stays the same, modulo a
+// small constant factor for the wider element-wise ops.
 // ============================================================================
 
 struct ve_graph {
@@ -162,11 +179,12 @@ struct ve_graph {
     ggml_tensor *             proj_b  = nullptr; // [E]    F32
 
     // Geometry snapshot.
-    int H       = 0;
-    int E       = 0;
-    int partial = 0;
-    int n_mels  = 0;
+    int H        = 0;
+    int E        = 0;
+    int partial  = 0;
+    int n_mels   = 0;
     int n_layers = 0;
+    int n_wins   = 0;   // batch dimension -- bound when the first graph is built
 };
 
 static void ve_graph_free(ve_graph & g) {
@@ -266,13 +284,14 @@ static bool ve_graph_init_weights(ve_graph & G, const voice_encoder_weights & w)
     return true;
 }
 
-static ggml_cgraph * build_ve_window_graph(const ve_graph & G) {
+static ggml_cgraph * build_ve_batched_graph(const ve_graph & G) {
     // Per timestep per layer: ~18 graph tensors (view into gates_ih_seq +
     // matmul_hh + add_bhh + add_gates + 4 split views + 4 activations +
     // 2 muls + c_t add + c_t tanh + h_t mul + cpy-to-h_seq view + cpy).
     // × partial × n_layers, plus per-layer (1 matmul + 1 add) for the seq
     // input projection, plus 1 h_seq buffer per inner layer, plus
-    // output proj/relu, plus a few I/O tensors.
+    // output proj/relu, plus a few I/O tensors.  Node count does not grow
+    // with n_wins — only tensor shapes do.
     const int max_nodes = 32 * G.partial * G.n_layers + 256;
 
     const size_t buf_size =
@@ -284,78 +303,101 @@ static ggml_cgraph * build_ve_window_graph(const ve_graph & G) {
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf   = ggml_new_graph_custom(ctx, max_nodes, false);
 
-    const int H = G.H;
-    const int E = G.E;
-    const int T = G.partial;
+    const int H  = G.H;
+    const int E  = G.E;
+    const int T  = G.partial;
     const int G4 = 4 * H;
+    const int B  = G.n_wins;
 
-    // Input mel (uploaded per-window): ne[0]=n_mels (fastest), ne[1]=T.
-    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, G.n_mels, T);
+    // Input mel (uploaded in batched layout): ne[0]=n_mels (fastest), ne[1]=T,
+    // ne[2]=n_wins.  Per-window slabs sit contiguously along dim 2 so the host
+    // can just memcpy each window's (T × n_mels) block into place.
+    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, G.n_mels, T, B);
     ggml_set_name(x, "x"); ggml_set_input(x);
 
-    // h0 / c0 are tiny [H] zero tensors supplied by the host.  They have to
-    // exist as graph inputs rather than being synthesised in-graph because
-    // we need them zero-initialised once, on whichever backend we're using.
-    ggml_tensor * h0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+    // h0 / c0: [H, n_wins].  Host uploads zeros once.
+    ggml_tensor * h0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, B);
     ggml_set_name(h0, "h0"); ggml_set_input(h0);
-    ggml_tensor * c0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+    ggml_tensor * c0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, B);
     ggml_set_name(c0, "c0"); ggml_set_input(c0);
 
-    ggml_tensor * x_layer = x;                        // [I_l, T]
+    ggml_tensor * x_layer = x;                        // [I_l, T, B]
 
     for (int l = 0; l < G.n_layers; ++l) {
-        // Sequence-wide input projection: single matmul per layer.
-        //   A = w_ih (shape [I, 4H])   B = x_layer (shape [I, T])
-        //   → [4H, T] = A^T @ B
-        ggml_tensor * gates_ih_seq = ggml_mul_mat(ctx, G.w_ih[l], x_layer);    // [4H, T]
-        gates_ih_seq = ggml_add(ctx, gates_ih_seq, G.b_ih[l]);                  // bias broadcast
+        // Sequence-wide, batched input projection — single matmul per layer.
+        //   A = w_ih (shape [I, 4H])   B = x_layer (shape [I, T, B])
+        //   → [4H, T, B] = A^T @ B   (batched over the trailing axis)
+        ggml_tensor * gates_ih_seq = ggml_mul_mat(ctx, G.w_ih[l], x_layer);  // [4H, T, B]
+        gates_ih_seq = ggml_add(ctx, gates_ih_seq, G.b_ih[l]);                // bias broadcasts
 
-        // For intermediate layers we need to materialise h_seq [H, T] so the
-        // next layer's seq-matmul can see it as a contiguous tensor.  Pre-
-        // allocate the buffer once; write each column with ggml_cpy (KV-cache
-        // style).  For the last layer we skip the buffer and just keep
-        // h_prev alive.
+        // For intermediate layers we materialise h_seq [H, T, B] so the next
+        // layer's seq-matmul can see it as a contiguous 3D tensor.
         const bool need_seq = (l + 1 < G.n_layers);
         ggml_tensor * h_seq = nullptr;
         if (need_seq) {
-            h_seq = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+            h_seq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, T, B);
             char name[32]; std::snprintf(name, sizeof(name), "h_seq_l%d", l);
             ggml_set_name(h_seq, name);
         }
 
-        ggml_tensor * h_prev = h0;
-        ggml_tensor * c_prev = c0;
+        ggml_tensor * h_prev = h0;                    // [H, B]
+        ggml_tensor * c_prev = c0;                    // [H, B]
 
-        const size_t gates_col_stride = (size_t) G4 * sizeof(float);
-        const size_t hseq_col_stride  = (size_t) H  * sizeof(float);
+        // gates_ih_seq layout: ne = [4H, T, B], nb = [4, 4*4H, 4*4H*T].
+        //   To pick column t across all windows (→ [4H, B]):
+        //     stride between 4H-columns within one batch = 4*4H       (nb1)
+        //     stride between batches                    = 4*4H*T      (nb2)
+        //     offset for timestep t                    = t * 4 * 4H
+        const size_t gates_batch_stride = (size_t) G4 * T * sizeof(float);
+        const size_t gates_t_offset     = (size_t) G4 *     sizeof(float);
+        // h_seq layout: ne=[H, T, B], nb=[4, 4H, 4HT].
+        //   Destination view for timestep t:  [H, B] with nb1 = 4HT (batch stride),
+        //   offset = t * 4H.
+        const size_t hseq_batch_stride  = (size_t) H  * T * sizeof(float);
+        const size_t hseq_t_offset      = (size_t) H  *     sizeof(float);
 
         for (int t = 0; t < T; ++t) {
-            ggml_tensor * gates_ih_t = ggml_view_1d(ctx, gates_ih_seq, G4,
-                                                     gates_col_stride * (size_t) t);
+            // gates_ih_t: [4H, B] column pulled out of gates_ih_seq at timestep t.
+            ggml_tensor * gates_ih_t = ggml_view_2d(ctx, gates_ih_seq,
+                                                     G4, B,
+                                                     gates_batch_stride,
+                                                     gates_t_offset * (size_t) t);
 
+            // gates_hh = W_hh @ h_prev + b_hh  → [4H, B] (batched matmul)
             ggml_tensor * gates_hh = ggml_mul_mat(ctx, G.w_hh[l], h_prev);
             gates_hh = ggml_add(ctx, gates_hh, G.b_hh[l]);
-            ggml_tensor * gates = ggml_add(ctx, gates_ih_t, gates_hh);
 
-            ggml_tensor * i_raw = ggml_view_1d(ctx, gates, H, 0 * H * sizeof(float));
-            ggml_tensor * f_raw = ggml_view_1d(ctx, gates, H, 1 * H * sizeof(float));
-            ggml_tensor * g_raw = ggml_view_1d(ctx, gates, H, 2 * H * sizeof(float));
-            ggml_tensor * o_raw = ggml_view_1d(ctx, gates, H, 3 * H * sizeof(float));
+            ggml_tensor * gates = ggml_add(ctx, gates_ih_t, gates_hh);         // [4H, B]
+
+            // Split [i, f, g, o] chunks of H each — each split is [H, B].
+            // Within each batch column, the 4H gates sit contiguously; pick
+            // the k-th H-slab with nb1 = gates_col_stride (4H*sizeof) and
+            // offset = k*H*sizeof.  gates's nb1 is exactly 4H*sizeof since it
+            // was produced by add over two matching shapes.
+            const size_t gates_col_stride = (size_t) G4 * sizeof(float);
+            ggml_tensor * i_raw = ggml_view_2d(ctx, gates, H, B, gates_col_stride,
+                                                0 * (size_t) H * sizeof(float));
+            ggml_tensor * f_raw = ggml_view_2d(ctx, gates, H, B, gates_col_stride,
+                                                1 * (size_t) H * sizeof(float));
+            ggml_tensor * g_raw = ggml_view_2d(ctx, gates, H, B, gates_col_stride,
+                                                2 * (size_t) H * sizeof(float));
+            ggml_tensor * o_raw = ggml_view_2d(ctx, gates, H, B, gates_col_stride,
+                                                3 * (size_t) H * sizeof(float));
 
             ggml_tensor * i_t = ggml_sigmoid(ctx, i_raw);
             ggml_tensor * f_t = ggml_sigmoid(ctx, f_raw);
             ggml_tensor * g_t = ggml_tanh   (ctx, g_raw);
             ggml_tensor * o_t = ggml_sigmoid(ctx, o_raw);
 
-            ggml_tensor * fc  = ggml_mul(ctx, f_t, c_prev);
-            ggml_tensor * ig  = ggml_mul(ctx, i_t, g_t);
-            ggml_tensor * c_t = ggml_add(ctx, fc, ig);
-            ggml_tensor * h_t = ggml_mul(ctx, o_t, ggml_tanh(ctx, c_t));
+            ggml_tensor * fc  = ggml_mul(ctx, f_t, c_prev);                    // [H, B]
+            ggml_tensor * ig  = ggml_mul(ctx, i_t, g_t);                       // [H, B]
+            ggml_tensor * c_t = ggml_add(ctx, fc, ig);                         // [H, B]
+            ggml_tensor * h_t = ggml_mul(ctx, o_t, ggml_tanh(ctx, c_t));       // [H, B]
 
             if (need_seq) {
-                // h_seq[:, t] ← h_t
-                ggml_tensor * dst = ggml_view_1d(ctx, h_seq, H,
-                                                  hseq_col_stride * (size_t) t);
+                ggml_tensor * dst = ggml_view_2d(ctx, h_seq, H, B,
+                                                  hseq_batch_stride,
+                                                  hseq_t_offset * (size_t) t);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, h_t, dst));
             }
 
@@ -366,9 +408,8 @@ static ggml_cgraph * build_ve_window_graph(const ve_graph & G) {
         x_layer = need_seq ? h_seq : h_prev;
     }
 
-    // Last-layer final hidden state h_T is in x_layer ([H]).
-    // emb = ReLU(proj_w @ h_T + proj_b)  → [E]
-    ggml_tensor * emb = ggml_mul_mat(ctx, G.proj_w, x_layer);  // [E]
+    // Output projection: proj_w [H, E] @ h_T [H, B] + proj_b → [E, B]
+    ggml_tensor * emb = ggml_mul_mat(ctx, G.proj_w, x_layer);  // [E, B]
     emb = ggml_add(ctx, emb, G.proj_b);
     emb = ggml_relu(ctx, emb);
     ggml_set_name(emb, "emb"); ggml_set_output(emb);
@@ -424,61 +465,64 @@ bool voice_encoder_embed(const std::vector<float> & wav_16k,
         ve_graph_free(G);
         return false;
     }
+    G.n_wins = n_wins;
 
-    // Build graph once, reuse allocator across windows.
-    ggml_cgraph * gf = build_ve_window_graph(G);
+    // Build the batched graph once; run once.  All n_wins partial windows
+    // ride along the third tensor axis.
+    ggml_cgraph * gf = build_ve_batched_graph(G);
     G.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(G.backend));
     if (!G.allocr || !ggml_gallocr_reserve(G.allocr, gf)) {
         fprintf(stderr, "voice_encoder_embed: gallocr_reserve failed\n");
         ve_graph_free(G);
         return false;
     }
+    ggml_gallocr_alloc_graph(G.allocr, gf);
 
     const int H       = w.hidden;
     const int E       = w.embedding;
     const int partial = w.partial_frames;
+    const int n_mels  = w.n_mels;
 
-    std::vector<float> emb(E);
-    std::vector<float> emb_accum(E, 0.0f);
-    std::vector<float> zeros(H, 0.0f);
-
-    // 4. One graph run per partial window.
+    // 4. Build batched mel input  [n_mels, T, n_wins]: concatenate each window's
+    //    (T × n_mels) slab along the trailing axis.  `mel` is row-major
+    //    (T_total, n_mels), so each window is already contiguous.
+    std::vector<float> x_buf((size_t) n_mels * partial * n_wins);
     for (int wi = 0; wi < n_wins; ++wi) {
         const int t0 = wi * step;
+        std::memcpy(x_buf.data() + (size_t) wi * partial * n_mels,
+                    mel.data()   + (size_t) t0 * n_mels,
+                    (size_t) partial * n_mels * sizeof(float));
+    }
 
-        // Rebuild the graph each step: the allocator relies on fresh node
-        // pointers.  (The graph builder is cheap compared to the graph
-        // compute — ~a few thousand tensor allocations, no kernel compiles.)
-        ggml_cgraph * step_gf = build_ve_window_graph(G);
-        ggml_gallocr_alloc_graph(G.allocr, step_gf);
+    ggml_tensor * x_t = ggml_graph_get_tensor(gf, "x");
+    ggml_tensor * h0  = ggml_graph_get_tensor(gf, "h0");
+    ggml_tensor * c0  = ggml_graph_get_tensor(gf, "c0");
+    ggml_backend_tensor_set(x_t, x_buf.data(), 0, x_buf.size() * sizeof(float));
 
-        // Upload inputs.
-        ggml_tensor * x_t = ggml_graph_get_tensor(step_gf, "x");
-        ggml_tensor * h0  = ggml_graph_get_tensor(step_gf, "h0");
-        ggml_tensor * c0  = ggml_graph_get_tensor(step_gf, "c0");
-        ggml_backend_tensor_set(x_t, mel.data() + (size_t) t0 * w.n_mels, 0,
-                                (size_t) partial * w.n_mels * sizeof(float));
-        ggml_backend_tensor_set(h0, zeros.data(), 0, (size_t) H * sizeof(float));
-        ggml_backend_tensor_set(c0, zeros.data(), 0, (size_t) H * sizeof(float));
+    std::vector<float> zeros((size_t) H * n_wins, 0.0f);
+    ggml_backend_tensor_set(h0, zeros.data(), 0, zeros.size() * sizeof(float));
+    ggml_backend_tensor_set(c0, zeros.data(), 0, zeros.size() * sizeof(float));
 
-        ggml_backend_graph_compute(G.backend, step_gf);
+    ggml_backend_graph_compute(G.backend, gf);
 
-        ggml_tensor * emb_tensor = ggml_graph_get_tensor(step_gf, "emb");
-        ggml_backend_tensor_get(emb_tensor, emb.data(), 0, (size_t) E * sizeof(float));
+    // 5. Read back [E, n_wins]; per-partial L2-norm → mean → final L2-norm.
+    std::vector<float> emb_buf((size_t) E * n_wins);
+    ggml_tensor * emb_tensor = ggml_graph_get_tensor(gf, "emb");
+    ggml_backend_tensor_get(emb_tensor, emb_buf.data(), 0, emb_buf.size() * sizeof(float));
 
-        // Per-partial L2-normalise the projected embedding (matches the
-        // reference VoiceEncoder's proj → ReLU → normalise).
+    std::vector<float> emb_accum(E, 0.0f);
+    for (int wi = 0; wi < n_wins; ++wi) {
+        float * v = emb_buf.data() + (size_t) wi * E;
         double sq = 0.0;
-        for (int o = 0; o < E; ++o) sq += (double) emb[o] * (double) emb[o];
+        for (int o = 0; o < E; ++o) sq += (double) v[o] * (double) v[o];
         double nrm = std::sqrt(sq);
         if (nrm > 1e-12) {
             float s = (float) (1.0 / nrm);
-            for (int o = 0; o < E; ++o) emb[o] *= s;
+            for (int o = 0; o < E; ++o) v[o] *= s;
         }
-        for (int o = 0; o < E; ++o) emb_accum[o] += emb[o];
+        for (int o = 0; o < E; ++o) emb_accum[o] += v[o];
     }
 
-    // 5. Mean over partials + final L2-norm.
     float inv_n = 1.0f / (float) n_wins;
     for (int o = 0; o < E; ++o) emb_accum[o] *= inv_n;
 
