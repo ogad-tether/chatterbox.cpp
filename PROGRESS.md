@@ -1452,96 +1452,6 @@ Remaining: Q4_K / Q5_K path. Drop-in win would come from
 once that tool's loader is pointed at our non-llama GGUF, or by
 porting one of the K-quant kernels to the Python `gguf` package.
 
-#### A4. Move T3 per-token sampler to GPU — done
-
-Before: each T3 step did `ggml_backend_graph_compute` → GPU computed
-logits → `ggml_backend_tensor_get(logits, …)` pulled 6561 floats back
-→ CPU ran the sampling ladder (repetition penalty, temperature, top-k
-nth_element, top-p cumulative, uniform draw).  One GPU→CPU sync per
-step × ~260 steps.
-
-Now: the sampler is tacked onto the T3 step graph as ~10 extra ggml
-ops; the backend returns a single int32 token per step.  CPU still
-syncs once per step (needed to check EOS and feed `speech_token` into
-the next step's graph) but no longer pulls `n_vocab` floats back or
-runs the sampling ladder on CPU.
-
-**Graph tail (`build_step_graph`, `src/main.cpp`):**
-```
-scaled = mul(logits, penalty_mask)                   # [n_vocab]
-idx    = cont(argsort_top_k(scaled, K))              # [K]    I32  (desc)
-vals   = get_rows(scaled_col, idx)                   # [K]
-probs  = soft_max_ext(vals, mask=null, scale=1/T)    # [K]
-cum    = cumsum(probs)                               # [K]
-geq    = step(cum - rand_target)                     # [K]   rand_target broadcasts
-score  = geq - arange(0, 1, 1/K)                     # [K]   first positive wins argmax
-i      = argmax(score)                               # [1]   I32
-token  = get_rows(idx_col, i)                        # [1]   I32   "sampled_token"
-```
-
-CPU side: `eval_step_sampled` builds `penalty_mask[n_vocab]` (1.0
-everywhere, `1/repeat_penalty` at already-generated positions — a
-uniform scale rather than the sign-aware HF rule, trading a full
-logits readback for a ~6-char divergence per utterance), precomputes
-`rand_target = uniform()*top_p`, uploads both, reads back 4 bytes.
-
-**Measured on M3 Ultra, Metal, RTF-equivalent prompts:**
-
-| sampler params         | ms/token (CPU sampler) | ms/token (GPU sampler) | delta |
-|------------------------|------------------------|------------------------|-------|
-| top_k=1, temp=0.8      | 11.38                  | 10.51                  | **-7.6 %** |
-| top_k=1000, top_p=0.95 | 11.72                  | ~12.0                  | wash (within run-to-run noise) |
-
-- `top_k=1`: all the GPU sampler kernels are cheap (argsort_top_k
-  degenerates to argmax, softmax is on K=1 element, cumsum/step/argmax
-  are O(1)).  Net: **~0.87 ms/step saved**.
-- `top_k=1000`: the `argsort_top_k` over 6561 logits on GPU costs
-  roughly what the CPU `nth_element` + cumsum saved, so the two paths
-  draw.  No regression.
-
-The real win is **structural, not cycle-level**: the per-step
-CPU→GPU sync now returns a scalar instead of a 26 kB logit vector,
-which is a prerequisite for chained-step execution (streaming, batch),
-and the numeric path is identical across CPU / Metal / Vulkan / CUDA
-(no more "sample on CPU from logits pulled from GPU" interleaving).
-
-### What still runs on CPU today
-
-Even with `--n-gpu-layers 99` on Metal/Vulkan/CUDA, a few stages stay
-on CPU.  Most are deliberate (small one-off work not worth a GPU
-port); a few are actionable wins.
-
-**GPU backend handles:**
-
-- T3 prompt + step graphs (`build_prompt_graph`, `build_step_graph`).
-- S3Gen encoder, CFM meanflow (2 steps), HiFT decode, f0_predictor,
-  the two STFTs, ISTFT — all one big graph on the main backend.
-
-**CPU, always:**
-
-| Stage                         | Where                                     | Cost        | Move to GPU? |
-|-------------------------------|-------------------------------------------|-------------|--------------|
-| BPE tokenizer (text → ids)    | `main.cpp:bpe.tokenize`                   | ~1 ms       | No — not worth it |
-| Per-token sampler             | moved to GPU via `eval_step_sampled` (see A4) | ~50-100 µs/step saved on Metal at top_k=1 | **Done** |
-| Sinegen source (harmonic excitation for HiFT) | `chatterbox_tts.cpp:sinegen_source` uses `std::mt19937` | ~22 ms one-off | No — RNG parity matters |
-| WAV write-out                 | `chatterbox_tts.cpp:write_wav`            | < 1 ms      | No |
-
-**CPU, only when `--reference-audio PATH.wav` is used (voice-cloning preprocessing):**
-
-| Stage                         | Where                           | Cost per 10 s ref       |
-|-------------------------------|---------------------------------|-------------------------|
-| WAV loading (`dr_wav`)        | `voice_features.cpp:wav_load`   | < 5 ms                  |
-| Kaiser-windowed sinc resample | `resample_sinc`                 | ~50 ms                  |
-| 80-ch log-mel 24 kHz          | `mel_extract_24k_80`            | ~500 ms (naive DFT)     |
-| 40-ch power-mel 16 kHz        | `mel_extract_16k_40`            | ~300 ms                 |
-| Kaldi fbank 80                | `fbank_kaldi_80`                | ~200 ms                 |
-| **VoiceEncoder** (3-LSTM, 256-d `speaker_emb`) | `voice_encoder.cpp` | plain C++, no ggml graph |
-| **CAMPPlus** (192-d `embedding`) | `campplus.cpp`                | plain C++ + OpenMP, no ggml graph |
-| **S3TokenizerV2** (wav → speech tokens) | `s3tokenizer.cpp:330` *hard-codes* `ggml_backend_cpu_init()` | **Candidate** — one-line change to use main backend |
-
-All voice-cloning preprocessing is once-per-voice; cache the voice
-profile and the CPU cost disappears after the first request.
-
 ### Tier B — serious work, impactful for specific use cases
 
 #### B1. Streaming / chunked generation for first-token latency
@@ -1620,11 +1530,11 @@ users).
 
 ### Recommended next-up order
 
-With A1 (voice cloning), A2 (GPU backends), A3 (T3 quantization) and
-A4 (GPU-side sampler) done, the remaining high-impact work is:
+With A1 (voice cloning), A2 (GPU backends) and A3 (T3 quantization)
+done, the remaining high-impact work is:
 
 1. **B1 — Streaming** (~1 week) → what gets this into interactive apps;
-   A4 set up the "scalar round trip" needed for chained-step execution.
+   currently blocked only by wiring, not correctness.
 2. **C3 — CI + prebuilt GGUFs** — pick up before announcing publicly.
 3. **T3 autoregressive speedup** (speculative decoding, or a smaller T3
    draft model). Biggest chunk of wall time left on both Metal and

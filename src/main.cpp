@@ -878,31 +878,7 @@ static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_te
     return gf;
 }
 
-// Step graph with an on-GPU sampler tail.  The traditional step graph outputs
-// the full `logits[n_vocab]` vector, then CPU runs temp/top-k/top-p/repetition
-// penalty and samples.  That path forces a per-token GPU->CPU sync of ~26 kB
-// of float logits, followed by an nth_element + cumsum on CPU.  This variant
-// keeps everything on the main backend and returns a single int32 token.
-//
-// Pipeline (all existing ggml ops, supported on CPU / Metal / Vulkan / CUDA):
-//   scaled     = logits * penalty_mask                (ggml_mul,   repetition penalty)
-//   scaled     = scaled * (1/temperature)             (ggml_scale)
-//   top_k_idx  = argsort_top_k(scaled, K)             (sorted: largest logit first)
-//   top_k_vals = get_rows(scaled, top_k_idx)
-//   probs      = soft_max(top_k_vals)
-//   cum        = cumsum(probs)
-//   margins    = cum - rand_target                    (rand_target = uniform()*top_p on CPU)
-//   geq        = step(margins)                        (1 where cum >= rand_target, else 0)
-//   score      = geq - arange(K)/K                    (first positive geq wins argmax)
-//   i          = argmax(score)
-//   sampled_token = get_rows(top_k_idx, i)            (int32, shape [1])
-//
-// Inputs added to the graph:
-//   penalty_mask [n_vocab] F32 — CPU builds each step: 1.0 everywhere, 1/penalty
-//                                at positions of recently-generated tokens.
-//   rand_target  [1]      F32  — precomputed uniform(0,1) * top_p on CPU.
-static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past,
-                                      int top_k_sampler, float temperature) {
+static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past) {
     static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
     static std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
@@ -919,64 +895,6 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
         ggml_get_rows(ctx, model.wpe, position));
 
     build_transformer_core(ctx, gf, model, inp, n_past, 1);
-
-    // Sampler tail on the main backend.  `logits` is already in the graph
-    // (produced by build_transformer_core).  Shape: [n_vocab, 1].
-    if (top_k_sampler > 0 && temperature > 0.0f) {
-        const int n_vocab = model.hparams.n_speech_vocab;
-        const int K       = std::min(top_k_sampler, n_vocab);
-        const float inv_t = 1.0f / temperature;
-
-        ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");  // [n_vocab, 1]
-
-        ggml_tensor * penalty_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_vocab);
-        ggml_set_name(penalty_mask, "penalty_mask"); ggml_set_input(penalty_mask);
-
-        ggml_tensor * rand_target = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        ggml_set_name(rand_target, "rand_target"); ggml_set_input(rand_target);
-
-        // repetition penalty (broadcast mul).
-        ggml_tensor * scaled_2d = ggml_mul(ctx, logits, penalty_mask);  // [n_vocab, 1]
-
-        // top-K sort (descending).  argsort_top_k returns an I32 view [K, 1];
-        // force contiguous + reshape to [K] so the downstream scalar-gather
-        // get_rows sees a clean index buffer.
-        ggml_tensor * top_k_idx_1d = ggml_reshape_1d(
-            ctx, ggml_cont(ctx, ggml_argsort_top_k(ctx, scaled_2d, K)), K);
-
-        // Gather per-token logits in top-k order: treat scaled as [1, n_vocab]
-        // (n_vocab rows of 1 column) so get_rows returns [1, K] — single scalars.
-        ggml_tensor * top_k_vals = ggml_reshape_1d(
-            ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, scaled_2d, 1, n_vocab), top_k_idx_1d), K);
-
-        // soft_max_ext fuses (scale by 1/temp) + softmax in one kernel.
-        ggml_tensor * probs = ggml_soft_max_ext(ctx, top_k_vals, /*mask=*/nullptr, inv_t, 0.0f);
-        ggml_tensor * cum   = ggml_cumsum(ctx, probs);
-
-        // margins = cum - rand_target (rand_target [1] broadcasts into [K]).
-        ggml_tensor * margins = ggml_sub(ctx, cum, rand_target);
-        ggml_tensor * geq     = ggml_step(ctx, margins);
-
-        // Score that makes argmax pick the *lowest* index among positive geq:
-        //   score[i] = geq[i] - i/K
-        // arange(0, 1, 1/K) yields exactly K evenly spaced positions in [0, 1).
-        ggml_tensor * idx_pen  = ggml_arange(ctx, 0.0f, 1.0f, 1.0f / (float) K);
-        ggml_tensor * score_1d = ggml_sub(ctx, geq, idx_pen);
-
-        // argmax requires a matrix (ne[2]=ne[3]=1 and ne[1]>=1), so reshape.
-        ggml_tensor * i_arg = ggml_argmax(ctx, ggml_reshape_2d(ctx, score_1d, K, 1));  // [1] I32
-
-        // token = top_k_idx_1d[i_arg].  Same scalar-gather trick: shape top_k
-        // indices as [1, K] then get_rows with a [1] index yields [1, 1] I32.
-        ggml_tensor * sampled = ggml_reshape_1d(
-            ctx,
-            ggml_get_rows(ctx, ggml_reshape_2d(ctx, top_k_idx_1d, 1, K), i_arg),
-            1);
-        ggml_set_name(sampled, "sampled_token");
-        ggml_set_output(sampled);
-        ggml_build_forward_expand(gf, sampled);
-    }
-
     ggml_free(ctx);
     return gf;
 }
@@ -1033,12 +951,11 @@ static bool eval_prompt(
     return true;
 }
 
-// Legacy path: returns logits on CPU for a later CPU sampler pass.
 static bool eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
     int n_past, int32_t token, std::vector<float> & logits_out) {
 
-    ggml_cgraph * gf = build_step_graph(model, n_past, /*top_k_sampler=*/0, /*temperature=*/0.0f);
+    ggml_cgraph * gf = build_step_graph(model, n_past);
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
 
@@ -1052,63 +969,6 @@ static bool eval_step(
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, (size_t)model.hparams.n_speech_vocab*sizeof(float));
-    return true;
-}
-
-// Fused-sampler path: the graph returns a single sampled token, no logits
-// readback.  CPU prepares the per-step penalty mask (1.0 everywhere, scaled at
-// positions of already-generated tokens) and a uniform*top_p target, uploads
-// both, reads back one int32.
-static bool eval_step_sampled(
-    const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
-    int n_past, int32_t token_in,
-    int top_k, float top_p, float temperature, float repeat_penalty,
-    const std::vector<int32_t> & generated,
-    std::mt19937 & rng,
-    int32_t & token_out) {
-
-    ggml_cgraph * gf = build_step_graph(model, n_past, top_k, temperature);
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
-
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token_in, 0, sizeof(token_in));
-    int32_t position = n_past;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
-
-    // penalty_mask: 1.0 everywhere, 1/repeat_penalty at already-generated
-    // token positions.  HF convention differentiates positive vs negative
-    // logits (divide / multiply) but by the time we've accumulated tens of
-    // previous tokens most logits for "seen" ids are positive in practice;
-    // using the unconditional scale here preserves the direction of the
-    // penalty without needing a per-step readback of the logits.
-    const int n_vocab = model.hparams.n_speech_vocab;
-    std::vector<float> penalty_mask(n_vocab, 1.0f);
-    if (repeat_penalty != 1.0f) {
-        const float inv_p = 1.0f / repeat_penalty;
-        for (int32_t t : generated) {
-            if (t >= 0 && t < n_vocab) penalty_mask[t] = inv_p;
-        }
-    }
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "penalty_mask"),
-                            penalty_mask.data(), 0, n_vocab * sizeof(float));
-
-    // rand_target = uniform[0,1) * top_p.  Sampling searches for the first
-    // index where the softmax'd cumulative probability reaches rand_target;
-    // bounding at top_p truncates the low-prob tail.
-    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
-    float rand_target = u01(rng) * top_p;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "rand_target"),
-                            &rand_target, 0, sizeof(float));
-
-    if (ggml_backend_is_cpu(model.backend)) ggml_backend_cpu_set_n_threads(model.backend, n_threads);
-    ggml_backend_graph_compute(model.backend, gf);
-
-    ggml_tensor * sampled = ggml_graph_get_tensor(gf, "sampled_token");
-    if (!sampled) {
-        fprintf(stderr, "%s: sampled_token tensor missing; build_step_graph was called without a sampler\n", __func__);
-        return false;
-    }
-    ggml_backend_tensor_get(sampled, &token_out, 0, sizeof(int32_t));
     return true;
 }
 
@@ -1475,31 +1335,16 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> generated;
         generated.reserve(params.n_predict + 1);
 
-        // First token is sampled on CPU from the prompt's logits (the prompt
-        // graph returns the full last-row logits; we already paid for the
-        // readback).  Subsequent tokens go through the on-GPU sampler path
-        // when the runtime supports it (top_k > 0 and temp > 0).
         int32_t current = sample_next_token(logits, generated, params, rng);
         generated.push_back(current);
-
-        const bool gpu_sampler = (params.top_k > 0) && (params.temp > 0.0f);
 
         for (int i = 0; i < params.n_predict; ++i) {
             if (current == model.hparams.stop_speech_token) break;
             if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
-            int32_t next_tok = 0;
-            if (gpu_sampler) {
-                if (!eval_step_sampled(model, allocr, params.n_threads, n_past, current,
-                                       params.top_k, params.top_p, params.temp, params.repeat_penalty,
-                                       generated, rng, next_tok))
-                    throw std::runtime_error("step eval (sampled) failed");
-            } else {
-                if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
-                    throw std::runtime_error("step eval failed");
-                next_tok = sample_next_token(logits, generated, params, rng);
-            }
+            if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
+                throw std::runtime_error("step eval failed");
             ++n_past;
-            current = next_tok;
+            current = sample_next_token(logits, generated, params, rng);
             generated.push_back(current);
         }
 
