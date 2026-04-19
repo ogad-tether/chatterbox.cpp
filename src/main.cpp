@@ -83,15 +83,16 @@ static bool validate_reference_audio(const std::string & path) {
 static bool compute_prompt_feat_native(const std::string & wav_path,
                                        const std::string & s3gen_gguf_path,
                                        std::vector<float> & out_feat,
-                                       int & out_rows)
+                                       int & out_rows,
+                                       bool verbose = false)
 {
-    fprintf(stderr, "voice: loading %s\n", wav_path.c_str());
+    if (verbose) fprintf(stderr, "voice: loading %s\n", wav_path.c_str());
     std::vector<float> wav;
     int sr = 0;
     if (!wav_load(wav_path, wav, sr)) return false;
-    fprintf(stderr, "voice:   sr=%d samples=%zu (%.2f s)\n", sr, wav.size(), (double)wav.size() / sr);
+    if (verbose) fprintf(stderr, "voice:   sr=%d samples=%zu (%.2f s)\n", sr, wav.size(), (double)wav.size() / sr);
     if (sr != 24000) {
-        fprintf(stderr, "voice: resampling %d -> 24000\n", sr);
+        if (verbose) fprintf(stderr, "voice: resampling %d -> 24000\n", sr);
         wav = resample_sinc(wav, sr, 24000);
     }
 
@@ -101,7 +102,7 @@ static bool compute_prompt_feat_native(const std::string & wav_path,
     // would pull the output towards the default voice.
     double pre  = measure_lufs(wav, 24000);
     normalise_lufs(wav, 24000, -27.0);
-    fprintf(stderr, "voice:   loudness %.2f LUFS → -27 LUFS (+%.2f dB)\n", pre, -27.0 - pre);
+    if (verbose) fprintf(stderr, "voice:   loudness %.2f LUFS → -27 LUFS (+%.2f dB)\n", pre, -27.0 - pre);
 
     // Match Python's tts_turbo.prepare_conditionals:
     //   s3gen_ref_wav = s3gen_ref_wav[:DEC_COND_LEN]  # 10 * S3GEN_SR = 240000
@@ -134,7 +135,7 @@ static bool compute_prompt_feat_native(const std::string & wav_path,
     out_feat = mel_extract_24k_80(wav, mel_fb);
     if (out_feat.empty()) return false;
     out_rows = (int)(out_feat.size() / 80);
-    fprintf(stderr, "voice: prompt_feat shape=(%d, 80)\n", out_rows);
+    if (verbose) fprintf(stderr, "voice: prompt_feat shape=(%d, 80)\n", out_rows);
     return true;
 }
 
@@ -143,7 +144,8 @@ static bool compute_prompt_feat_native(const std::string & wav_path,
 // false silently if the s3gen GGUF predates Phase 2d-a (no CAMPPlus tensors).
 static bool compute_embedding_native(const std::string & wav_path,
                                      const std::string & s3gen_gguf_path,
-                                     std::vector<float> & out_emb)
+                                     std::vector<float> & out_emb,
+                                     bool verbose = false)
 {
     campplus_weights w;
     if (!campplus_load(s3gen_gguf_path, w)) {
@@ -196,7 +198,7 @@ static bool compute_embedding_native(const std::string & wav_path,
         for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
 
     if (!campplus_embed(fbank, T, w, out_emb)) return false;
-    fprintf(stderr, "voice: embedding shape=(%zu,) via CAMPPlus (%d fbank frames)\n",
+    if (verbose) fprintf(stderr, "voice: embedding shape=(%zu,) via CAMPPlus (%d fbank frames)\n",
             out_emb.size(), T);
     return true;
 }
@@ -212,7 +214,9 @@ static bool compute_speech_tokens_native(const std::string & wav_path,
                                          int max_cond_tokens,
                                          std::vector<int32_t> & out_prompt_tokens,
                                          std::vector<int32_t> & out_cond_tokens,
-                                         int n_threads)
+                                         int n_threads,
+                                         ggml_backend_t backend,
+                                         bool verbose = false)
 {
     s3tokv2_weights w;
     if (!s3tokv2_load(s3gen_gguf_path, w)) {
@@ -230,14 +234,14 @@ static bool compute_speech_tokens_native(const std::string & wav_path,
     // prompt_token: first 10 s of the reference → up to 250 tokens (S3Gen side).
     const int dec_cond_samples = 10 * 16000;
     std::vector<float> prompt_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), dec_cond_samples));
-    if (!s3tokv2_tokenize(prompt_wav, w, /*max_tokens=*/-1, out_prompt_tokens, n_threads)) return false;
+    if (!s3tokv2_tokenize(prompt_wav, w, /*max_tokens=*/-1, out_prompt_tokens, n_threads, backend)) return false;
 
     // cond_prompt_speech_tokens: first 15 s → up to max_cond_tokens (T3 side).
     const int enc_cond_samples = 15 * 16000;
     std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), enc_cond_samples));
-    if (!s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, n_threads)) return false;
+    if (!s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, n_threads, backend)) return false;
 
-    fprintf(stderr, "voice: prompt_token=(%zu,) cond_prompt_speech_tokens=(%zu,) via S3TokenizerV2\n",
+    if (verbose) fprintf(stderr, "voice: prompt_token=(%zu,) cond_prompt_speech_tokens=(%zu,) via S3TokenizerV2\n",
             out_prompt_tokens.size(), out_cond_tokens.size());
     return true;
 }
@@ -412,6 +416,7 @@ struct cli_params {
     std::string reference_audio; // wav file; computes prompt_feat natively in C++
     std::string save_voice_dir;  // if set, dump the 5 conditioning tensors here for reuse
     bool    debug          = false;  // --debug: load Python-dumped intermediates for validation
+    bool    verbose        = false;  // --verbose: per-stage profile timings (human-readable)
     bool    dump_tokens_only = false;
     int32_t seed           = 0;
     int32_t n_threads      = std::min(4, (int32_t) std::thread::hardware_concurrency());
@@ -454,6 +459,9 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          skips VoiceEncoder/CAMPPlus/S3TokenizerV2 entirely.\n");
     fprintf(stderr, "  --debug                 Load reference intermediates from --ref-dir for\n");
     fprintf(stderr, "                          bit-exact numerical validation (requires --ref-dir).\n");
+    fprintf(stderr, "  --verbose               Print per-stage wall-time breakdown for T3, S3Gen,\n");
+    fprintf(stderr, "                          HiFT and (when --reference-audio is used) the voice-\n");
+    fprintf(stderr, "                          cloning preprocessing pipeline.\n");
     fprintf(stderr, "  --seed N                RNG seed (default: 0)\n");
     fprintf(stderr, "  --threads N             CPU threads (default: %d)\n", std::min(4, (int32_t) std::thread::hardware_concurrency()));
     fprintf(stderr, "  --n-predict N           Max speech tokens (default: 1000)\n");
@@ -484,6 +492,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--reference-audio"){ auto v = next("--reference-audio");if (!v) return false; params.reference_audio = v; }
         else if (arg == "--save-voice")     { auto v = next("--save-voice");     if (!v) return false; params.save_voice_dir = v; }
         else if (arg == "--debug")          { params.debug = true; }
+        else if (arg == "--verbose" || arg == "-v") { params.verbose = true; }
         else if (arg == "--seed")           { auto v = next("--seed");           if (!v) return false; params.seed = std::stoi(v); }
         else if (arg == "--threads")        { auto v = next("--threads");        if (!v) return false; params.n_threads = std::stoi(v); }
         else if (arg == "--n-predict")      { auto v = next("--n-predict");      if (!v) return false; params.n_predict = std::stoi(v); }
@@ -1134,7 +1143,8 @@ int main(int argc, char ** argv) {
                 const int64_t _t0 = ggml_time_us();
                 (void)compute_speech_tokens_native(params.reference_audio, params.s3gen_gguf,
                                                    cond_prompt_len, pt_bake, ct_bake,
-                                                   params.n_threads);
+                                                   params.n_threads, vc_backend,
+                                                   params.verbose);
                 fprintf(stderr, "BENCH: VC_STAGE_s3tokenizer_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
@@ -1142,7 +1152,7 @@ int main(int argc, char ** argv) {
             std::vector<float> emb_bake;
             {
                 const int64_t _t0 = ggml_time_us();
-                (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf, emb_bake);
+                (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf, emb_bake, params.verbose);
                 fprintf(stderr, "BENCH: VC_STAGE_campplus_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
@@ -1152,7 +1162,7 @@ int main(int argc, char ** argv) {
             {
                 const int64_t _t0 = ggml_time_us();
                 (void)compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
-                                                 pf_bake, pf_rows);
+                                                 pf_bake, pf_rows, params.verbose);
                 fprintf(stderr, "BENCH: VC_STAGE_prompt_feat_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
@@ -1177,22 +1187,28 @@ int main(int argc, char ** argv) {
             opts.seed            = params.seed;
             opts.n_threads       = params.n_threads;
             opts.debug           = params.debug;
+            opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
-                                                opts.prompt_feat_rows_override))
+                                                opts.prompt_feat_rows_override,
+                                                params.verbose))
                     throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
                 // Best-effort: try to compute the S3Gen `embedding` natively too.
                 // Falls through to ref_dir/embedding.npy if the s3gen GGUF is pre-A1-2d-a.
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
-                                               opts.embedding_override);
+                                               opts.embedding_override, params.verbose);
                 // And the S3Gen-side prompt_token via S3TokenizerV2 (Phase 2e).
+                // No backend available in this path yet (we haven't loaded T3);
+                // fall back to ggml-cpu.  Callers going through the bake path
+                // above or the main T3 path below pass the real backend.
                 std::vector<int32_t> dummy_cond;
                 (void)compute_speech_tokens_native(params.reference_audio, params.s3gen_gguf,
                                                    /*max_cond_tokens=*/-1,
                                                    opts.prompt_token_override, dummy_cond,
-                                                   params.n_threads);
+                                                   params.n_threads, /*backend=*/nullptr,
+                                                   params.verbose);
             }
             return s3gen_synthesize_to_wav(speech_tokens, opts);
         }
@@ -1267,7 +1283,9 @@ int main(int argc, char ** argv) {
             if (compute_speech_tokens_native(params.reference_audio, params.s3gen_gguf,
                                              /*max_cond_tokens=*/model.hparams.cond_prompt_len,
                                              prompt_token_from_ref, cond_tokens,
-                                             params.n_threads)) {
+                                             params.n_threads,
+                                             /*backend=*/model.backend,
+                                             params.verbose)) {
                 ct_data = std::move(cond_tokens);
                 have_ct = true;
                 ct_from_cpp = true;
@@ -1339,8 +1357,10 @@ int main(int argc, char ** argv) {
                 return 0;
             }
 
-            fprintf(stderr, "%s: text: \"%s\"\n", __func__, normalized.c_str());
-            fprintf(stderr, "%s: %zu text tokens\n", __func__, text_tokens.size());
+            if (params.verbose) {
+                fprintf(stderr, "%s: text: \"%s\"\n", __func__, normalized.c_str());
+                fprintf(stderr, "%s: %zu text tokens\n", __func__, text_tokens.size());
+            }
         } else {
             text_tokens = read_token_file(params.tokens_file);
         }
@@ -1389,14 +1409,16 @@ int main(int argc, char ** argv) {
             opts.seed            = params.seed;
             opts.n_threads       = params.n_threads;
             opts.debug           = params.debug;
+            opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
-                                                opts.prompt_feat_rows_override))
+                                                opts.prompt_feat_rows_override,
+                                                params.verbose))
                     throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
-                                               opts.embedding_override);
+                                               opts.embedding_override, params.verbose);
                 if (!prompt_token_from_ref.empty()) {
                     opts.prompt_token_override = std::move(prompt_token_from_ref);
                 }

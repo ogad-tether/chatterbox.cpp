@@ -1186,12 +1186,20 @@ int s3gen_synthesize_to_wav(
     const int  seed       = opts.seed;
     const int  sr         = opts.sr;
     const bool debug_mode = opts.debug;
+    const bool verbose    = opts.verbose;
     const int  pre_lookahead_len = 3;  // Chatterbox default
+
+    // Verbose progress / per-stage timing goes through this helper so all of
+    // it can be disabled with `--verbose` unset.  Errors and machine-parseable
+    // BENCH: lines stay unconditional below.
+    auto vlog = [&](const char * fmt, auto... args) {
+        if (verbose) fprintf(stderr, fmt, args...);
+    };
 
     int n_threads = opts.n_threads;
     if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
     g_n_threads = n_threads;
-    fprintf(stderr, "Using %d threads\n", g_n_threads);
+    vlog("Using %d threads\n", g_n_threads);
     if (gguf_path.empty() || out_path.empty()) {
         fprintf(stderr, "s3gen_synthesize_to_wav: s3gen_gguf_path and out_wav_path are required\n");
         return 1;
@@ -1215,13 +1223,13 @@ int s3gen_synthesize_to_wav(
 
     if (ref_dir.empty() && opts.embedding_override.empty() && opts.prompt_feat_override.empty()
         && opts.prompt_token_override.empty()) {
-        fprintf(stderr, "No --ref-dir given; loading built-in voice from GGUF.\n");
+        vlog("No --ref-dir given; loading built-in voice from GGUF.\n");
     } else {
-        if (!ref_dir.empty()) fprintf(stderr, "Loading ref dict from %s\n", ref_dir.c_str());
+        if (!ref_dir.empty()) vlog("Loading ref dict from %s\n", ref_dir.c_str());
 
         if (!opts.prompt_token_override.empty()) {
             pt_data = opts.prompt_token_override;
-            fprintf(stderr, "  prompt_token: using C++ override (S3TokenizerV2, %zu tokens)\n",
+            vlog("  prompt_token: using C++ override (S3TokenizerV2, %zu tokens)\n",
                     pt_data.size());
         } else {
             npy_array pt_npy = npy_load(ref_dir + "/prompt_token.npy");
@@ -1231,7 +1239,7 @@ int s3gen_synthesize_to_wav(
 
         if (!opts.embedding_override.empty()) {
             emb_data = opts.embedding_override;
-            fprintf(stderr, "  embedding: using C++ override (CAMPPlus, %zu dims)\n", emb_data.size());
+            vlog("  embedding: using C++ override (CAMPPlus, %zu dims)\n", emb_data.size());
         } else {
             npy_array emb_npy = npy_load(ref_dir + "/embedding.npy");
             emb_data.assign((const float*)emb_npy.data.data(),
@@ -1241,7 +1249,7 @@ int s3gen_synthesize_to_wav(
         if (!opts.prompt_feat_override.empty()) {
             pf_data = opts.prompt_feat_override;
             pf_rows = opts.prompt_feat_rows_override;
-            fprintf(stderr, "  prompt_feat: using C++ override (%d mel frames)\n", pf_rows);
+            vlog("  prompt_feat: using C++ override (%d mel frames)\n", pf_rows);
         } else {
             npy_array pf_npy = npy_load(ref_dir + "/prompt_feat.npy");
             pf_data.assign((const float*)pf_npy.data.data(),
@@ -1250,7 +1258,7 @@ int s3gen_synthesize_to_wav(
         }
     }
 
-    fprintf(stderr, "Speech tokens: %zu\n", speech_tokens.size());
+    vlog("Speech tokens: %zu\n", speech_tokens.size());
 
     // Trim tokens >= vocab_size.  In batch / last-chunk (`finalize=true`) we
     // append 3 S3GEN_SIL lookahead tokens to give the encoder right-context
@@ -1268,11 +1276,11 @@ int s3gen_synthesize_to_wav(
         for (int i = 0; i < pre_lookahead_len; ++i) padded.push_back(S3GEN_SIL);
     }
 
-    fprintf(stderr, "Loading %s\n", gguf_path.c_str());
+    vlog("Loading %s\n", gguf_path.c_str());
     double load_t0 = now_ms();
     model_ctx m = load_s3gen_gguf(gguf_path, opts.n_gpu_layers);
     const double load_ms = now_ms() - load_t0;
-    fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), load_ms);
+    vlog("  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), load_ms);
     fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
 
     // HiFT-side graphs (f0_predictor, STFT, hift_decode) used to need a
@@ -1300,7 +1308,7 @@ int s3gen_synthesize_to_wav(
         ggml_backend_tensor_get(t_pf,  pf_data.data(),  0, ggml_nbytes(t_pf));
         // prompt_feat is stored ggml ne=[80, 500] = numpy (500, 80).
         pf_rows = (int)t_pf->ne[1];
-        fprintf(stderr, "  built-in voice: embedding=(%zu,) prompt_token=(%zu,) prompt_feat=(%d, %lld)\n",
+        vlog("  built-in voice: embedding=(%zu,) prompt_token=(%zu,) prompt_feat=(%d, %lld)\n",
                 emb_data.size(), pt_data.size(), pf_rows, (long long)t_pf->ne[0]);
     }
     double pipeline_t0 = now_ms();
@@ -1311,18 +1319,18 @@ int s3gen_synthesize_to_wav(
     // 1) Concat prompt_token + padded speech_tokens
     int n_prompt = (int)pt_data.size();
     int n_total = n_prompt + (int)padded.size();
-    fprintf(stderr, "n_prompt=%d n_speech_padded=%zu n_total=%d\n", n_prompt, padded.size(), n_total);
+    vlog("n_prompt=%d n_speech_padded=%zu n_total=%d\n", n_prompt, padded.size(), n_total);
 
     std::vector<int32_t> flow_tokens(n_total);
     std::memcpy(flow_tokens.data(), pt_data.data(), n_prompt * sizeof(int32_t));
     std::memcpy(flow_tokens.data() + n_prompt, padded.data(), padded.size() * sizeof(int32_t));
 
     // 2) input_embedding lookup + multiply by mask
-    fprintf(stderr, "Running input_embedding...\n");
+    vlog("Running input_embedding...\n");
     ggml_tensor * emb_w = find_tensor(m, "flow/input_embedding");
     std::vector<float> emb_w_data(ggml_nelements(emb_w));
     ggml_backend_tensor_get(emb_w, emb_w_data.data(), 0, ggml_nbytes(emb_w));
-    fprintf(stderr, "  emb_w ne=[%lld, %lld]\n", (long long)emb_w->ne[0], (long long)emb_w->ne[1]);
+    vlog("  emb_w ne=[%lld, %lld]\n", (long long)emb_w->ne[0], (long long)emb_w->ne[1]);
     int vocab_size = (int)emb_w->ne[1];
     std::vector<float> input_embed(n_total * D);
     for (int i = 0; i < n_total; ++i) {
@@ -1341,12 +1349,12 @@ int s3gen_synthesize_to_wav(
     }
 
     // 3) Run encoder -> mu_T (numpy (T_mu, 80) layout, to match encoder_proj.npy)
-    fprintf(stderr, "Running encoder (T=%d)...\n", n_total);
+    vlog("Running encoder (T=%d)...\n", n_total);
     double encoder_t0 = now_ms();
     std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
-    fprintf(stderr, "  [encoder] %.1f ms\n", now_ms() - encoder_t0);
+    vlog("  [encoder] %.1f ms\n", now_ms() - encoder_t0);
     int T_mu = 2 * n_total;
-    fprintf(stderr, "  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
+    vlog("  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
 
     // Streaming: trim the last `pre_lookahead_len * token_mel_ratio = 6`
     // frames off the encoder output BEFORE CFM (matches Python's
@@ -1409,7 +1417,7 @@ int s3gen_synthesize_to_wav(
     }
 
     // 4) Speaker embedding: F.normalize + spk_embed_affine_layer
-    fprintf(stderr, "Computing speaker embedding...\n");
+    vlog("Computing speaker embedding...\n");
     const float * emb_raw = emb_data.data();
     float norm = 0.0f;
     for (int i = 0; i < 192; ++i) norm += emb_raw[i] * emb_raw[i];
@@ -1484,11 +1492,11 @@ int s3gen_synthesize_to_wav(
     }
 
     // 6) For meanflow: z = randn(80, T_mu); then z[:, prompt_len:] = noised_mels (randn(80, T_speech*2))
-    fprintf(stderr, "Initializing CFM noise (seed=%d, meanflow)...\n", seed);
+    vlog("Initializing CFM noise (seed=%d, meanflow)...\n", seed);
     std::vector<float> z(T_mu * MEL);
     int n_speech_part = 2 * (int)padded.size();
     int prompt_len_in_mu = T_mu - n_speech_part;
-    fprintf(stderr, "  T_mu=%d prompt_len_in_mu=%d n_speech_part=%d\n",
+    vlog("  T_mu=%d prompt_len_in_mu=%d n_speech_part=%d\n",
             T_mu, prompt_len_in_mu, n_speech_part);
     if (!opts.cfm_z0_override.empty()) {
         // Streaming validation path: use the exact noise Python used for
@@ -1537,7 +1545,7 @@ int s3gen_synthesize_to_wav(
     for (size_t s = 0; s < t_span.size() - 1; ++s) {
         float t = t_span[s], r = t_span[s + 1];
         float dt = r - t;
-        fprintf(stderr, "CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
+        vlog("CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
         auto t_mlp = compute_time_mlp(m, t);
         auto r_mlp = compute_time_mlp(m, r);
         auto t_emb = compute_time_mixed(m, t_mlp, r_mlp);
@@ -1561,7 +1569,7 @@ int s3gen_synthesize_to_wav(
 
         double step_t0 = now_ms();
         auto dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu);
-        fprintf(stderr, "  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
+        vlog("  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
 
         if (debug_mode) {
             npy_array ref = npy_load(ref_dir + "/cfm_step" + std::to_string(s) + "_dxdt.npy");
@@ -1584,7 +1592,7 @@ int s3gen_synthesize_to_wav(
 
         for (size_t i = 0; i < z.size(); ++i) z[i] = z[i] + dt * dxdt[i];
     }
-    fprintf(stderr, "  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
+    vlog("  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
 
     // 8) Slice mel = z[:, mel_len1:] -> shape (80, T_mu - mel_len1).
     //
@@ -1605,7 +1613,7 @@ int s3gen_synthesize_to_wav(
         return 1;
     }
     int T_mel = T_mel_full - skip;
-    fprintf(stderr, "Mel slicing: T_mu=%d mel_len1=%d full=%d skip=%d -> T_mel=%d  "
+    vlog("Mel slicing: T_mu=%d mel_len1=%d full=%d skip=%d -> T_mel=%d  "
                     "(finalize=%s, pad_silence=%s)\n",
             T_mu, mel_len1, T_mel_full, skip, T_mel,
             opts.finalize ? "true" : "false",
@@ -1643,17 +1651,17 @@ int s3gen_synthesize_to_wav(
 
     // 9) HiFT
     double hift_t0 = now_ms();
-    fprintf(stderr, "Running f0_predictor...\n");
+    vlog("Running f0_predictor...\n");
     double t0 = now_ms();
     auto f0 = run_f0_predictor(m_hift, mel, T_mel);
-    fprintf(stderr, "  [f0_predictor] %.1f ms\n", now_ms() - t0);
+    vlog("  [f0_predictor] %.1f ms\n", now_ms() - t0);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
 
-    fprintf(stderr, "Running SineGen...\n");
+    vlog("Running SineGen...\n");
     t0 = now_ms();
     std::vector<float> l_linear_w(9);
     ggml_tensor * llw = find_tensor(m_hift, "hift/m_source/l_linear/weight");
@@ -1662,20 +1670,20 @@ int s3gen_synthesize_to_wav(
     float l_linear_b;
     ggml_backend_tensor_get(llb, &l_linear_b, 0, sizeof(float));
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, l_linear_w, l_linear_b, (uint32_t)(seed + 1));
-    fprintf(stderr, "  [sinegen] %.1f ms\n", now_ms() - t0);
+    vlog("  [sinegen] %.1f ms\n", now_ms() - t0);
 
-    fprintf(stderr, "Running STFT...\n");
+    vlog("Running STFT...\n");
     t0 = now_ms();
     auto s_stft = run_stft(m_hift, src);
-    fprintf(stderr, "  [stft] %.1f ms\n", now_ms() - t0);
+    vlog("  [stft] %.1f ms\n", now_ms() - t0);
     int T_stft = (int)(s_stft.size() / 18);
 
-    fprintf(stderr, "Running HiFT decode...\n");
+    vlog("Running HiFT decode...\n");
     t0 = now_ms();
     auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft);
-    fprintf(stderr, "  [hift_decode] %.1f ms\n", now_ms() - t0);
-    fprintf(stderr, "  [hift_total] %.1f ms\n", now_ms() - hift_t0);
-    fprintf(stderr, "  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
+    vlog("  [hift_decode] %.1f ms\n", now_ms() - t0);
+    vlog("  [hift_total] %.1f ms\n", now_ms() - hift_t0);
+    vlog("  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
 
     double pipeline_total = now_ms() - pipeline_t0;
     double audio_ms = 1000.0 * wav.size() / sr;
