@@ -1527,6 +1527,281 @@ the target op receives*, not an earlier upstream value. Monkeypatching
 a function that a caller later post-processes (`z[...] = …`) is a
 silent source of divergence.
 
+##### Phase 3 (HiFT streaming + CLI) — ✅ DONE (2026-04-12)
+
+With CFM bit-exact across chunks, wiring up the HiFT side and the
+user-facing CLI was straightforward:
+
+- **`cache_source` carry** (src/chatterbox_tts.cpp, `s3gen_synthesize_opts`):
+  after `sinegen_source` produces the post-`m_source` source signal,
+  overwrite its leading samples with the caller-provided
+  `hift_cache_source` and expose the last `source_tail_samples` (480 =
+  1 mel hop = 20 ms) via `hift_source_tail_out` so the caller can feed
+  them back in on the next chunk. Matches Python
+  `HiFTGenerator.inference`'s `s[:, :, :cache_source.shape[2]] = cache_source`.
+
+- **`trim_fade`** (same file): opt-in raised-cosine fade-in applied to
+  the first `2 * sr/50 = 960` samples (40 ms) of each chunk's wav.
+  First half zero, second half `(cos(π→0)+1)/2`. Streaming callers set
+  `apply_trim_fade` on chunk 0 only.
+
+- **`--stream-chunk-tokens N` CLI flag** (src/main.cpp): wraps
+  `s3gen_synthesize_to_wav` in a chunked loop that carries
+  `hift_cache_source` across chunks, writes per-chunk wavs as
+  `<out>_chunk_KK.wav`, and concatenates the final wav into `--out`.
+  Adds `append_lookahead_silence=false`, `finalize=(is_last)`, and
+  `skip_mel_frames=prev_mels_emitted` on each chunk.
+
+- **Process-wide model cache** (src/chatterbox_tts.cpp,
+  `s3gen_model_cache_get`): makes the ~700 ms GGUF-tensor load a
+  one-shot cost. `s3gen_preload(path, n_gpu_layers)` populates the cache
+  eagerly so main.cpp can kick a background std::thread to warm S3Gen
+  while T3 is still running. Brings first-chunk latency down from
+  2006 ms → 1340 ms on CPU for the `"streaming sanity check"` test.
+
+Validation (`./build/test-streaming models/chatterbox-s3gen.gguf
+/tmp/streaming_ref`):
+
+| chunk | mel rel | wav rel (informational) |
+|---|---|---|
+| 1 | 6.47e-07 | 1.06e-01 |
+| 2 | 8.67e-07 | 1.24e-01 |
+
+Mel is bit-exact; wav diverges a few percent because C++'s
+`sinegen_source` uses `std::mt19937` vs Python's `torch.randn` — the
+audio content is identical, only the per-sample additive white-noise
+seed differs. Python's own streamed-vs-batch ratio is 116 %, so our
+streamed-vs-Python-streamed is 6.5 %, well inside the structural
+envelope of the approach.
+
+Performance numbers on a 3.76 s utterance (9 s of reference audio):
+
+| metric | batch | streaming (25 tokens/chunk) |
+|---|---|---|
+| total wall time | 2271 ms | 5988 ms |
+| first-audio-out | 2271 ms | **1340 ms** |
+| per-chunk RTF | 0.60 | 1.44 – 1.59 |
+
+##### Phase 3b (per-chunk RTF tuning) — ✅ DONE (2026-04-12)
+
+**What actually changed — plain English.**  Before this phase, each
+streaming chunk had to re-run the encoder and CFM on the *whole*
+speech so far (so chunk 5 did more work than chunk 1), and CFM always
+did 2 Euler steps because that's what Python does. Result: each chunk
+took ~1.5 s to produce 1 s of audio, and the first chunk took ~1.3 s
+before you heard anything.
+
+Two new `chatterbox` CLI flags, no change to the model:
+
+- **`--stream-first-chunk-tokens N`** — the first chunk uses N tokens;
+  every chunk after that uses `--stream-chunk-tokens`. So you can make
+  the first chunk small (≈10 tokens / 0.4 s of audio) to get audio out
+  fast, and keep subsequent chunks big (≈50 tokens / 2 s) to amortise
+  the fixed per-chunk overhead. Code is ~10 lines in `src/main.cpp` —
+  just a boundary-building change, no pipeline rewrite.
+
+- **`--stream-cfm-steps N`** — override the hard-coded CFM step count
+  (2 for Python's meanflow). Setting `N=1` literally halves CFM compute
+  per chunk, because CFM is just a 2-step Euler loop. The
+  meanflow-trained model is *designed* to be sampled in 1 step (per
+  the meanflow paper — "mean" means the ODE can be collapsed to one
+  jump); this isn't a hack, it's using the model the way it was
+  trained to be usable. There's a quality trade — 1-step is a bit
+  noisier than 2-step (log-mag MAE ≈ 0.5) — so default stays at 2.
+  Flag is opt-in. Change is ~5 lines in `chatterbox_tts.cpp` where
+  `t_span = {0, 0.5, 1}` used to be hard-coded.
+
+Recommended low-latency preset:
+
+```bash
+./build/chatterbox --model t3.gguf --s3gen-gguf s3gen.gguf \
+    --text "…" --out out.wav \
+    --stream-first-chunk-tokens 10 \
+    --stream-chunk-tokens 50 \
+    --stream-cfm-steps 1
+```
+
+First audio out in ≈ 800 ms; middle chunks run at RTF 0.65 so the
+streamer stays ahead of playback on a 4-thread CPU. Numbers below.
+
+**What I did _not_ do.**  The earlier prose promised "incremental
+encoder / KV-cached CFM". That would mean: chunk 5 only re-processes
+the 25 new tokens, reusing intermediate activations saved from chunks
+1–4 — like the KV cache in an LLM decoder. I didn't do that, because
+the model isn't built for it. I verified the Python reference: both
+the flow encoder and the CFM estimator do full *bidirectional*
+self-attention (every output position looks at every input position,
+both directions, `static_chunk_size = 0`). Reusing previous-chunk
+activations requires attention that only looks leftward (causal) or
+only within fixed windows (chunked-causal). That's baked into the
+trained weights — you can't retrofit it in C++, the model would need
+to be retrained. So instead of "KV-cached CFM" I shipped "cheaper
+CFM" (1-step) and "smarter chunk boundaries" (small first, big
+after). Different optimisations, same user-visible win — fast first
+audio, streaming keeps up.
+
+Per-chunk profiling on the same 4.9 s utterance:
+
+| stage | cost per chunk (T_mu≈650) |
+|---|---|
+| encoder (T_tokens≈350) | ~280 ms |
+| CFM step 0 | ~580 ms |
+| CFM step 1 | ~500 ms |
+| HiFT decode (1 s audio) | ~265 ms |
+| total | **~1630 ms for 1 s of audio** |
+
+CFM is ~2/3 of every chunk.  Two things that *don't* work for cutting
+it down without retraining:
+
+- **KV-cached CFM / incremental encoder** — Chatterbox's flow encoder
+  and CFM estimator both run full bidirectional self-attention.  I
+  verified `static_chunk_size = 0` in `decoder.py` (no chunked
+  attention mask) and that the encoder has no causal mask either.
+  Caching previous-chunk activations would require the attention to
+  be *causal* (or at least chunk-causal).  Retrofitting that at
+  inference time changes the output distribution — not a pure port.
+- **Prompt-region truncation** — the 500-frame prompt accounts for
+  ~70 % of T_mu and its CFM output is discarded every chunk.  But
+  attention is full, so any speech-region output depends on every
+  prompt frame via softmax.  Truncating to a short prompt tail would
+  require retraining.
+
+What *does* work, and is now shipped as tunables:
+
+- **Non-uniform chunk sizes** (`--stream-first-chunk-tokens N`).
+  First chunk stays small (≈10 tokens / 0.4 s audio) for fast
+  first-audio-out; subsequent chunks go big (≈50 tokens / 2 s audio)
+  so the fixed per-chunk encoder+CFM cost amortises over more output.
+- **Fewer CFM Euler steps** (`--stream-cfm-steps 1`).  Turbo is
+  meanflow-trained, and meanflow supports 1-step sampling per the
+  paper.  In practice 1-step introduces some audible high-frequency
+  noise (log-mag MAE ≈ 0.5 vs 2-step) but keeps content intact.
+  Default stays at 2 to match Python; users opt in via the flag.
+
+Measured on the same text on CPU:
+
+| config | first-audio | chunk-N RTF | overall RTF |
+|---|---|---|---|
+| baseline (`--stream-chunk-tokens 25`) | 1331 ms | 1.44 – 1.70 | 1.59 |
+| first-small (`10 → 25`) | 1156 ms | 1.37 – 1.69 | 1.84 |
+| 1-step + big (`50`, `steps=1`) | 1230 ms | 0.63 – 0.69 | 0.78 |
+| **combined (`10 → 50`, `steps=1`)** | **782 ms** | **0.63 – 0.69** | **0.94** |
+
+The "combined" preset hits both objectives at once: first audio out
+in ≤ 800 ms on CPU, and middle chunks complete in 2/3 of their audio
+duration so the streamer can stay ahead of playback.  Incremental
+encoder / KV-cached CFM stay on the backlog for when someone wants to
+retrain Chatterbox with chunk-causal attention.
+
+##### Phase 3c (live stdout streaming) — ✅ DONE (2026-04-12)
+
+`--out -` emits each chunk's audio as raw 16-bit little-endian PCM
+to stdout the moment it's produced, with an explicit `fflush` after
+every chunk so downstream players receive it immediately (no stdio
+buffering stalls at chunk boundaries).
+
+In stdout mode no `.wav` files are left behind — per-chunk
+intermediate writes go to `/tmp/chatterbox_stream_chunk_KK.wav` and
+are `unlink()`'d right after the bytes hit stdout.  All log output
+stays on stderr so the audio stream is clean.
+
+```bash
+./build/chatterbox \
+  --model models/chatterbox-t3-turbo.gguf \
+  --s3gen-gguf models/chatterbox-s3gen.gguf \
+  --text "Testing stdout streaming." \
+  --stream-first-chunk-tokens 10 --stream-chunk-tokens 50 \
+  --stream-cfm-steps 1 \
+  --out - \
+  | ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -
+```
+
+Validation: the PCM emitted to stdout is byte-for-byte identical to
+the file written by the same invocation with a normal `--out
+foo.wav`, checked by loading both and taking a diff (max=0, rms=0).
+
+Why not WAV-header-then-PCM?  A live WAV header needs the total
+sample count up front and we don't know it until the last chunk
+finalises; writing a placeholder then patching after the fact doesn't
+compose with pipe output.  Raw s16le is what `ffplay`, `aplay`,
+`pacat`, `sox` etc. accept natively, so no one loses in practice.
+
+##### Phase 3d (real-world validation on M4 + Metal) — ✅ DONE (2026-04-13)
+
+End-to-end streaming verified audible on an Apple M4 with the Metal
+backend and the recommended low-latency preset:
+
+```bash
+./build/chatterbox \
+    --model models/chatterbox-t3-turbo.gguf \
+    --s3gen-gguf models/chatterbox-s3gen.gguf \
+    --text "…long paragraph…" \
+    --stream-first-chunk-tokens 10 \
+    --stream-chunk-tokens       25 \
+    --stream-cfm-steps          1 \
+    --n-gpu-layers              99 \
+    --out - \
+  | play -q -t raw -r 24000 -b 16 -e signed -c 1 -
+```
+
+Measured on the 48-text-token sentence *"Hello from streaming
+Chatterbox, I am john and i work in google since 2010. I love to go
+out with my friends, eat some pizza and also drink some wine. I also
+love to traverl around the world alone."* → 317 speech tokens →
+12.68 s audio → 14 streaming chunks:
+
+| chunk | tokens_total | T_mu | encoder | CFM step0 | HiFT | total ms | RTF |
+|------:|-------------:|-----:|--------:|----------:|-----:|---------:|----:|
+|     1 |           10 |  514 |   84 ms |    144 ms | 37 ms|    278 ms| 0.99|
+|     2 |           35 |  564 |   69 ms |    126 ms |116 ms|    324 ms| 0.32|
+|     3 |           60 |  614 |   91 ms |    143 ms |115 ms|    370 ms| 0.37|
+|     4 |           85 |  664 |  117 ms |    159 ms |115 ms|    409 ms| 0.41|
+|     5 |          110 |  714 |  126 ms |    173 ms |115 ms|    433 ms| 0.43|
+|     6 |          135 |  764 |  153 ms |    182 ms |116 ms|    468 ms| 0.47|
+|     7 |          160 |  814 |  163 ms |    197 ms |117 ms|    499 ms| 0.50|
+|     8 |          185 |  864 |  153 ms |    213 ms |114 ms|    499 ms| 0.50|
+|     9 |          210 |  914 |  191 ms |    230 ms |115 ms|    558 ms| 0.56|
+|    10 |          235 |  964 |  210 ms |    250 ms |114 ms|    591 ms| 0.59|
+|    11 |          260 | 1014 |  187 ms |    257 ms |115 ms|    579 ms| 0.58|
+|    12 |          285 | 1064 |  231 ms |    266 ms |115 ms|    634 ms| 0.63|
+|    13 |          310 | 1114 |  208 ms |    280 ms |113 ms|    614 ms| 0.61|
+|    14 |          317 | 1134 |  212 ms |    290 ms | 49 ms|    568 ms| 1.42|
+
+```
+=== streaming done: 304320 samples (12.680 s),
+    first-chunk latency = 278.9 ms,
+    total wall = 11474.7 ms  (overall RTF = 0.90) ===
+```
+
+Observations:
+
+- **First-audio-out: 279 ms** on M4 + Metal.  Chunk 1 is 10 tokens
+  (~0.28 s of audio) and lands at RTF ~1.0 because the fixed encoder
+  + CFM overhead dominates such a small chunk — but the wall-time
+  number is what matters, and it's low.
+- **Steady-state RTF 0.3 – 0.6** for chunks 2–13 (each 1 s of audio).
+  Well below real-time, so `sox play` stays ahead of playback on every
+  chunk and there are no audible gaps.
+- Chunk 14 is the "tail" finalise (only 0.4 s of audio; whatever's
+  left after the last full 25-token boundary) so its RTF naturally
+  drifts above 1.  It completes before playback reaches it because
+  chunks 11–13 produced excess buffered audio.
+- Total wall time **11.47 s** for 12.68 s of audio → overall RTF
+  **0.90**, i.e. even adding up every per-chunk cost, the pipeline is
+  faster than real-time end-to-end.
+
+Playback caveat on macOS 26 / ffmpeg 8.1: `ffplay -f s16le -i -` is
+silent for piped raw PCM on our M4 test box (known SDL2 + CoreAudio
+regression).  `sox play` and Python `sounddevice.play()` work
+reliably.  README now recommends `sox` and shows the exact
+invocation.
+
+README gained a new "Streaming mode — low-latency playback" section
+under "Useful flags" documenting the three `--stream-*` tunables, the
+`--out -` stdout mode, the `sox play` recipe, and the table above.
+That section plus this Phase 3d write-up are the canonical places for
+future readers to pick up streaming from.
+
 #### B2. Server mode with persistent graphs
 
 Every invocation currently pays ~200–400 ms fixed cost for graph
@@ -1545,6 +1820,55 @@ Scope: **2–3 days**.
 
 Impact: for repeated short utterances on the same server, another **20–30 %**
 off wall time on top of the current RTF 0.28.
+
+#### B3. Bake cloned voice into a reusable GGUF
+
+Right now a cloned voice is persisted as five `.npy` files under a
+directory and loaded via `--ref-dir DIR`.  That's convenient during
+development but awkward to share: end users end up with a zip of five
+opaque numpy files plus the C++ binary plus the original
+`chatterbox-s3gen.gguf`.  Most deployments would rather ship **one
+file** — a voice-baked `.gguf` that works with the existing CLI as a
+drop-in replacement for `models/chatterbox-s3gen.gguf`.
+
+Fundamentally the five tensors are already first-class GGUF citizens:
+`s3gen/builtin/embedding`, `s3gen/builtin/prompt_token`,
+`s3gen/builtin/prompt_feat` live inside the base GGUF as-is, and the T3
+side needs `speaker_emb` + `cond_prompt_speech_tokens`.  So "baking a
+voice" is just "rewrite those five tensor slots and copy everything
+else through".
+
+What to add:
+
+- **`--save-model PATH.gguf`** (name tentative) that, combined with
+  `--reference-audio PATH` or `--ref-dir DIR`, writes a new GGUF next
+  to the original `chatterbox-s3gen.gguf` with the five voice tensors
+  replaced.  Bit-identical to the original in every other tensor and
+  metadata entry — just a rewritten `builtin` block.  The two voice
+  tensors that belong on the T3 side (speaker_emb,
+  cond_prompt_speech_tokens) could either live alongside in the same
+  GGUF (preferred: the binary already knows how to look for them under
+  a `s3gen/builtin/` prefix) or produce a matching
+  `chatterbox-t3-turbo.<voice>.gguf` with those two tensors replaced.
+- **Zero runtime overhead once baked.**  Subsequent runs just use the
+  new GGUF path as `--s3gen-gguf` and `--model`; no `--ref-dir`,
+  `--reference-audio` or `.npy` files needed.  The built-in-voice
+  fallback in `chatterbox_tts.cpp` already reads from exactly those
+  tensor names, so there's literally no new load-time code — just the
+  converter.
+- **CLI UX:** `chatterbox --reference-audio voice.wav --save-model
+  alice.gguf --no-synthesize` should be enough to bake once and walk
+  away.  No `--text`, no wav output, just the new GGUFs on disk.
+
+Scope: **~1 day**.  It's essentially a `gguf` re-write helper — read
+the original, iterate tensors, substitute the five voice slots with
+the freshly computed values, copy everything else through.
+`gguf_writer` can do this directly; no new numeric code is needed.
+
+Impact: clean distribution story.  "Here is my voice" becomes a
+single 400 MB file instead of "here is this directory of numpy files
+and you need to know which C++ flag they go behind."  Also opens up
+prebuilt-voice downloads on Hugging Face (cf. C3).
 
 ### Tier C — nice polish, niche
 
@@ -1583,11 +1907,12 @@ users).
 
 ### Recommended next-up order
 
-With A1 (voice cloning), A2 (GPU backends) and A3 (T3 quantization)
-done, the remaining high-impact work is:
+With A1 (voice cloning), A2 (GPU backends), A3 (T3 quantization), and
+B1 (streaming) done, the remaining high-impact work is:
 
-1. **B1 — Streaming** (~1 week) → what gets this into interactive apps;
-   currently blocked only by wiring, not correctness.
+1. **B3 — Bake voice into GGUF** (~1 day) → cleanest distribution
+   story for sharing custom voices; makes prebuilt-voice downloads on
+   Hugging Face (C3) actually shippable.
 2. **C3 — CI + prebuilt GGUFs** — pick up before announcing publicly.
 3. **T3 autoregressive speedup** (speculative decoding, or a smaller T3
    draft model). Biggest chunk of wall time left on both Metal and

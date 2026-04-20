@@ -352,6 +352,88 @@ Full development history and older backend combinations (F16 vs
 Q4_0 / Q5_0 / Q8_0, plus other machines) are in
 [`PROGRESS.md §3.10 / §3.13`](PROGRESS.md).
 
+### Streaming mode — low-latency playback
+
+For interactive use cases, the binary can emit audio **chunk-by-chunk**
+as it's generated instead of waiting for the whole sentence to finish.
+Any non-zero `--stream-chunk-tokens N` turns streaming on.
+
+**Flags:**
+
+- `--stream-chunk-tokens N` — main knob; N speech tokens per chunk
+  (25 ≈ 1 s of audio, 50 ≈ 2 s).
+- `--stream-first-chunk-tokens N` — override the *first* chunk's size
+  so first-audio-out lands early while later chunks stay big and keep
+  overall RTF low.  Typical: 10.
+- `--stream-cfm-steps N` — CFM Euler step count.  Default 2 (matches
+  Python meanflow).  `1` halves CFM cost with a small quality penalty;
+  Turbo's meanflow training makes 1-step a valid sampling mode per the
+  paper.
+- `--out -` — emit raw `s16le` mono @ 24 kHz to stdout instead of
+  writing a wav file, so the output can be piped straight into a
+  player.
+
+**Recommended low-latency preset for interactive use:**
+
+```bash
+brew install sox      # one-time, for the `play` command
+
+./build/chatterbox \
+    --model      models/chatterbox-t3-turbo.gguf \
+    --s3gen-gguf models/chatterbox-s3gen.gguf \
+    --text       "Hello from streaming Chatterbox." \
+    --stream-first-chunk-tokens 10 \
+    --stream-chunk-tokens       25 \
+    --stream-cfm-steps          1 \
+    --n-gpu-layers              99 \
+    --out - \
+  | play -q -t raw -r 24000 -b 16 -e signed -c 1 -
+```
+
+`play` ships with `sox` and routes straight to CoreAudio.  If you
+prefer, the same stdout stream works with `ffplay -f s16le -ar 24000
+-ch_layout mono -nodisp -i -` or piped through a Python
+`sounddevice.play()` one-liner; on some macOS 26 builds ffplay's SDL
+output is silent for raw piped audio, so `sox play` is the safest
+default.
+
+You can also drop the `--out -` to get a regular wav:
+
+```bash
+./build/chatterbox … --stream-chunk-tokens 50 --out out.wav
+afplay out.wav
+```
+
+In streaming mode per-chunk wavs are additionally written next to
+`--out` as `<out>_chunk_KK.wav` so you can scrub through individual
+chunks.
+
+**Latency and throughput** on an Apple M4 with the Metal backend and
+the preset above, feeding the sentence *"Hello from streaming
+Chatterbox, I am John and I work in Google since 2010. I love to go
+out with my friends, eat some pizza and also drink some wine. I also
+love to travel around the world alone."* (produces 317 speech tokens,
+~12.7 s of audio):
+
+| metric | value |
+|---|---|
+| first-audio-out latency | **279 ms** |
+| chunk 1 (10-token bootstrap) | RTF 0.99 |
+| chunks 2–13 (steady-state, 25 tokens each) | **RTF 0.30 – 0.63** |
+| chunk 14 (tail finalise) | RTF 1.42 |
+| total wall time | 11.5 s for 12.7 s of audio |
+| overall RTF | **0.90** |
+
+The steady-state RTFs stay comfortably below 1.0, so the streamer
+sustainably pushes audio faster than real-time playback consumes it.
+Chunk 1 is small by design so first audio lands in ~280 ms; the final
+chunk is short and relatively slow (fixed encoder/CFM overhead
+amortised over only 0.4 s of audio).
+
+For the full journal of how streaming got there — bit-exact CFM parity,
+`cache_source` + `trim_fade` port, `--out -` stdout wiring, per-chunk
+tuning — see [`PROGRESS.md §B1`](PROGRESS.md).
+
 ## 4. Optional: validate against PyTorch
 
 Every stage of the pipeline has a numerical regression test against
@@ -462,3 +544,12 @@ between `std::mt19937` and `torch.rand`).
 **Slower than real-time** — make sure you built `-DCMAKE_BUILD_TYPE=Release`
 and that `--threads` picks up all your cores. The binary defaults to
 `std::thread::hardware_concurrency()`.
+
+## License
+
+Released under the [MIT License](LICENSE) — Copyright (c) 2026 Gianfranco
+Cordella. The bundled `ggml/` is also MIT-licensed
+([ggml/LICENSE](ggml/LICENSE)). The upstream Python implementation
+([Chatterbox](https://github.com/resemble-ai/chatterbox), Copyright (c) 2025
+Resemble AI) is likewise MIT-licensed; see `LICENSE` for the third-party
+attribution block.

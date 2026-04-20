@@ -43,9 +43,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -115,6 +118,76 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
     if (verbose) fprintf(stderr, "s3gen: using CPU backend\n");
     return b;
 }
+
+// Process-wide cache of the loaded S3Gen GGUF so repeated calls (streaming
+// or server mode) pay the ~700 ms tensor-load cost only once.  Keyed on
+// (path, n_gpu_layers) — switching backend invalidates the cache.
+//
+// Thread-safety: simple mutex around load/lookup.  The returned pointer
+// stays alive for the lifetime of the process (we never evict), which
+// matches the streaming CLI's single-voice use case.  A proper LRU would
+// belong in a server front-end.
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose);
+
+namespace {
+struct s3gen_cache_entry { std::string path; int gpu = 0; std::unique_ptr<model_ctx> m; };
+static std::mutex                            g_s3gen_cache_mu;
+static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
+static double                                g_s3gen_cache_last_load_ms = 0.0;
+}  // namespace
+
+// Release any cached model_ctx (frees its backend buffer, ggml context and
+// backend).  Must run before the ggml-metal / ggml-cuda / ggml-vulkan dylib
+// tears down its static device list; otherwise their static destructors hit
+// a "rsets->data count != 0" assert (residency sets still referenced by an
+// orphan backend buffer).  We register it with atexit() on first cache
+// insertion so it runs before process-exit dylib finalisers.
+static void s3gen_model_cache_release() {
+    std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
+    if (!g_s3gen_cache_entry) return;
+    model_ctx * m = g_s3gen_cache_entry->m.get();
+    if (m) {
+        if (m->buffer_w) { ggml_backend_buffer_free(m->buffer_w); m->buffer_w = nullptr; }
+        if (m->ctx_w)    { ggml_free(m->ctx_w);                   m->ctx_w    = nullptr; }
+        if (m->backend)  { ggml_backend_free(m->backend);         m->backend  = nullptr; }
+        m->tensors.clear();
+    }
+    g_s3gen_cache_entry.reset();
+}
+
+static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_layers, bool verbose) {
+    std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
+    if (g_s3gen_cache_entry &&
+        g_s3gen_cache_entry->path == path &&
+        g_s3gen_cache_entry->gpu  == n_gpu_layers) {
+        if (verbose) {
+            fprintf(stderr, "  %zu tensors (cached — skip GGUF load)\n",
+                    g_s3gen_cache_entry->m->tensors.size());
+        }
+        g_s3gen_cache_last_load_ms = 0.0;
+        return g_s3gen_cache_entry->m.get();
+    }
+    if (verbose) fprintf(stderr, "Loading %s\n", path.c_str());
+    double t0 = now_ms();
+    auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, n_gpu_layers, verbose));
+    g_s3gen_cache_last_load_ms = now_ms() - t0;
+    if (verbose) fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m->tensors.size(), g_s3gen_cache_last_load_ms);
+    g_s3gen_cache_entry = std::make_unique<s3gen_cache_entry>(
+        s3gen_cache_entry{path, n_gpu_layers, std::move(m)});
+
+    // Register the release on first insertion.  atexit() handlers run in
+    // LIFO and execute before any static destructors in DSOs loaded *after*
+    // this point — which on macOS / Linux is how we avoid Metal's device
+    // teardown assert on process exit.
+    static bool registered = false;
+    if (!registered) {
+        std::atexit(s3gen_model_cache_release);
+        registered = true;
+    }
+    return g_s3gen_cache_entry->m.get();
+}
+
+static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 
 static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose) {
     model_ctx m;
@@ -1291,12 +1364,12 @@ int s3gen_synthesize_to_wav(
         for (int i = 0; i < pre_lookahead_len; ++i) padded.push_back(S3GEN_SIL);
     }
 
-    vlog("Loading %s\n", gguf_path.c_str());
-    double load_t0 = now_ms();
-    model_ctx m = load_s3gen_gguf(gguf_path, opts.n_gpu_layers, verbose);
-    const double load_ms = now_ms() - load_t0;
-    vlog("  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), load_ms);
-    fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
+    // Cache the loaded model across invocations so the streaming driver
+    // pays the ~700 ms GGUF-load cost only once.  Keyed on (path,
+    // n_gpu_layers) so switching backends still works.  Verbose gates the
+    // banner prints but the BENCH line always goes out for perf checks.
+    model_ctx & m = *s3gen_model_cache_get(gguf_path, opts.n_gpu_layers, verbose);
+    fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", s3gen_model_cache_last_load_ms());
 
     // HiFT-side graphs (f0_predictor, STFT, hift_decode) used to need a
     // dedicated CPU copy of the S3Gen GGUF on Metal because conv_transpose_1d,
@@ -1553,8 +1626,15 @@ int s3gen_synthesize_to_wav(
                 z[m2 * T_mu + t] = gauss2(rng2);
     }
 
-    // 7) CFM loop: 2 steps with t_span = [0, 0.5, 1]
-    std::vector<float> t_span = {0.0f, 0.5f, 1.0f};
+    // 7) CFM loop: default 2-step meanflow (t_span = [0, 0.5, 1]); streaming
+    // callers can override via opts.cfm_steps = 1 for a single Euler jump
+    // (~2× CFM speedup at the cost of a small quality degradation — Turbo
+    // is meanflow-trained so 1-step is a valid sampling mode, just noisier).
+    std::vector<float> t_span;
+    const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps : 2;
+    t_span.reserve(cfm_steps + 1);
+    for (int i = 0; i <= cfm_steps; ++i)
+        t_span.push_back((float)i / (float)cfm_steps);
     cfm_estimator_cache cfm_cache;
     double cfm_t0 = now_ms();
     for (size_t s = 0; s < t_span.size() - 1; ++s) {
@@ -1687,6 +1767,22 @@ int s3gen_synthesize_to_wav(
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, l_linear_w, l_linear_b, (uint32_t)(seed + 1));
     fprintf(stderr, "  [sinegen] %.1f ms\n", now_ms() - t0);
 
+    // Streaming: splice in the previous chunk's source tail so the F0 phase
+    // (and hence the vocoded waveform) stays continuous at the chunk seam.
+    // Python equivalent: `s[:, :, :cache_source.shape[2]] = cache_source`
+    // inside HiFTGenerator.inference.
+    if (!opts.hift_cache_source.empty()) {
+        size_t n = std::min(opts.hift_cache_source.size(), src.size());
+        std::memcpy(src.data(), opts.hift_cache_source.data(), n * sizeof(float));
+        vlog("  [sinegen] spliced %zu cache_source samples at head\n", n);
+    }
+    // Export the tail for the next chunk's cache_source BEFORE running STFT
+    // (Python returns `s` unmodified; our tail copy matches that convention).
+    if (opts.hift_source_tail_out != nullptr && opts.source_tail_samples > 0) {
+        int tail_n = std::min((int)src.size(), opts.source_tail_samples);
+        opts.hift_source_tail_out->assign(src.end() - tail_n, src.end());
+    }
+
     vlog("Running STFT...\n");
     t0 = now_ms();
     auto s_stft = run_stft(m_hift, src);
@@ -1700,6 +1796,23 @@ int s3gen_synthesize_to_wav(
     fprintf(stderr, "  [hift_total] %.1f ms\n", now_ms() - hift_t0);
     vlog("  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
 
+    // First-chunk / batch-mode: apply raised-cosine fade-in to mask HiFT's
+    // resnet cold start.  Length = 2*(sr/50) = 960 samples (40 ms) at 24 kHz.
+    // First half is zero, second half is (cos(π→0)+1)/2 (0→1 ramp).
+    // Python equivalent: `output_wavs[:, :len(self.trim_fade)] *= self.trim_fade`.
+    if (opts.apply_trim_fade) {
+        const int n_trim = sr / 50;  // 480 at 24 kHz
+        const int fade_len = 2 * n_trim;
+        if ((int)wav.size() >= fade_len) {
+            for (int i = 0; i < n_trim; ++i) wav[i] = 0.0f;
+            for (int i = 0; i < n_trim; ++i) {
+                float theta = (float)M_PI * (1.0f - (float)i / (float)n_trim);
+                float w = 0.5f * (std::cos(theta) + 1.0f);
+                wav[n_trim + i] *= w;
+            }
+        }
+    }
+
     double pipeline_total = now_ms() - pipeline_t0;
     double audio_ms = 1000.0 * wav.size() / sr;
     fprintf(stderr, "BENCH: S3GEN_INFER_MS=%.0f AUDIO_MS=%.0f\n", pipeline_total, audio_ms);
@@ -1712,4 +1825,14 @@ int s3gen_synthesize_to_wav(
     write_wav(out_path, wav, sr);
     fprintf(stderr, "Wrote %s\n", out_path.c_str());
     return 0;
+}
+
+int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
+    try {
+        (void)s3gen_model_cache_get(s3gen_gguf_path, n_gpu_layers);
+        return 0;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "s3gen_preload: %s\n", e.what());
+        return 1;
+    }
 }
