@@ -9,23 +9,44 @@ builds work with stock upstream ggml and can skip this step entirely.
 
 ## Apply
 
-```bash
-# From the repo root, after cloning upstream ggml into ./ggml.
-(cd ggml && git apply ../patches/ggml-metal-chatterbox-ops.patch)
+The top-level [`scripts/setup-ggml.sh`](../scripts/setup-ggml.sh) does
+everything for you:
 
-# Then configure + build as usual.  To enable Metal:
+```bash
+# From the repo root.  Clones ggml if needed, checks out the pinned
+# commit, and applies this patch.  Idempotent — re-running is a no-op.
+./scripts/setup-ggml.sh
+```
+
+Then configure + build as usual. To enable Metal:
+
+```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
 cmake --build build -j$(sysctl -n hw.ncpu)
 ```
 
-To confirm the patch applied cleanly:
+If you'd rather run the two steps by hand (e.g. to pin a different
+upstream commit), the script is effectively:
+
+```bash
+git clone https://github.com/ggml-org/ggml.git ggml
+cd ggml && git checkout $GGML_COMMIT
+git apply ../patches/ggml-metal-chatterbox-ops.patch
+```
+
+`GGML_COMMIT` lives at the top of `scripts/setup-ggml.sh` as the
+single source of truth — bump it when re-generating this patch
+against a newer upstream ggml.  To confirm the patch applied cleanly:
 
 ```bash
 (cd ggml && git status --short)
-# Expected: three modified files under ggml/src/ggml-metal/
+# Expected: 7 modified files under ggml/src/ggml-metal/
 ```
 
-Skip the `git apply` step on Linux or when building CPU-only.
+Skip the whole patch step on Linux or when building CPU-only (the
+stock upstream ggml works). `setup-ggml.sh` still clones at the
+pinned commit either way, which keeps builds deterministic even
+without the patch.
 
 ## `ggml-metal-chatterbox-ops.patch`
 

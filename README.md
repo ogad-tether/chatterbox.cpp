@@ -75,17 +75,23 @@ cd -
 git clone git@github.com:gianni-cor/chatterbox.cpp.git
 cd chatterbox.cpp
 
-# ggml is vendored as a sibling subdirectory
-git clone https://github.com/ggml-org/ggml.git ggml
-
-# Apply our Metal op fixes (diag_mask_inf, pad_ext, faster conv_transpose_1d).
-# Skip this if you're not building with -DGGML_METAL=ON.
-(cd ggml && git apply ../patches/ggml-metal-chatterbox-ops.patch)
+# Clone ggml at the pinned commit and apply our Metal op patches.
+# Skip the patch part (i.e. just `git clone ... ggml`) if you're not
+# building with -DGGML_METAL=ON.
+./scripts/setup-ggml.sh
 
 # Configure + build every target in one shot.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
+
+`scripts/setup-ggml.sh` is idempotent: it clones upstream
+[`ggml`](https://github.com/ggml-org/ggml) into `./ggml`, checks out the
+commit our patch is pinned against (`GGML_COMMIT` at the top of the
+script), and applies
+[`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch).
+Re-running it is a no-op; bump the pinned commit inside the script
+whenever the patch is re-generated against a newer upstream.
 
 To enable GPU acceleration, add the matching backend flag at configure
 time: `-DGGML_METAL=ON` on Apple Silicon, `-DGGML_VULKAN=ON` on
