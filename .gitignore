@@ -1,6 +1,3 @@
-# Vendored ggml (cloned separately at setup time; see README)
-ggml/
-
 # Build artifacts
 build/
 build-*/
