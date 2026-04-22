@@ -1860,3 +1860,7 @@ int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
         return 1;
     }
 }
+
+void s3gen_unload() {
+    s3gen_model_cache_release();
+}

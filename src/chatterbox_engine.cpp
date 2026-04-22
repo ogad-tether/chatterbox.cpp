@@ -112,6 +112,12 @@ struct Engine::Impl {
 
     ~Impl() {
         wait_for_preload(s3gen_preload_thread);
+        // Release the S3Gen cache (which holds its own backend + buffers)
+        // BEFORE freeing the T3 backend.  If we don't, the cache's
+        // backend resources get torn down by static destructors at
+        // process exit, after ggml-metal's global device has already
+        // been finalised, tripping its "rsets count == 0" assertion.
+        s3gen_unload();
         if (allocr) {
             ggml_gallocr_free(allocr);
             allocr = nullptr;
