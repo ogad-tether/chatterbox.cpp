@@ -25,6 +25,7 @@ set(QVAC_TTS_LIB_SOURCES
     src/main.cpp
     src/gpt2_bpe.cpp
     src/chatterbox_tts.cpp
+    src/chatterbox_engine.cpp
     src/voice_features.cpp
     src/mel_extract_stft.cpp
     src/voice_encoder.cpp
