@@ -1262,7 +1262,7 @@ static std::vector<int32_t> read_tokens_file(const std::string & path) {
 // s3gen GGUF) and writes a 24 kHz wav.
 // ============================================================================
 
-#include "s3gen_pipeline.h"
+#include "qvac-tts/chatterbox/s3gen_pipeline.h"
 
 int s3gen_synthesize_to_wav(
     const std::vector<int32_t> & speech_tokens,
@@ -1281,7 +1281,15 @@ int s3gen_synthesize_to_wav(
     // it can be disabled with `--verbose` unset.  Errors and machine-parseable
     // BENCH: lines stay unconditional below.
     auto vlog = [&](const char * fmt, auto... args) {
-        if (verbose) fprintf(stderr, fmt, args...);
+        if (!verbose) return;
+        // `fmt` is always a string literal at call sites but the compiler
+        // can't prove that through the variadic lambda.  Android NDK's
+        // default `-Werror=format-security` (together with `_FORTIFY_SOURCE=2`)
+        // then refuses to build unless we silence the warning locally.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+        fprintf(stderr, fmt, args...);
+#pragma GCC diagnostic pop
     };
 
     int n_threads = opts.n_threads;
@@ -1851,4 +1859,8 @@ int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
         fprintf(stderr, "s3gen_preload: %s\n", e.what());
         return 1;
     }
+}
+
+void s3gen_unload() {
+    s3gen_model_cache_release();
 }

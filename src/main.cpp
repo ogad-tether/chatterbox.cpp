@@ -34,7 +34,9 @@
 #include <thread>
 #include <vector>
 
-#include "s3gen_pipeline.h"
+#include "qvac-tts/qvac-tts.h"
+#include "qvac-tts/chatterbox/s3gen_pipeline.h"
+#include "chatterbox_t3_internal.h"
 #include "npy.h"
 #include "voice_features.h"
 #include "voice_encoder.h"
@@ -217,7 +219,7 @@ static void append_pcm_crossfade(std::vector<float> & dst, const std::vector<flo
     dst.insert(dst.end(), src.begin() + fade_n, src.end());
 }
 
-static bool validate_reference_audio(const std::string & path) {
+bool validate_reference_audio(const std::string & path) {
     std::vector<float> wav;
     int sr = 0;
     if (!wav_load(path, wav, sr)) {
@@ -244,7 +246,7 @@ static bool validate_reference_audio(const std::string & path) {
 // Load REF.wav, resample to 24 kHz if needed, pull the 80-ch mel filterbank out
 // of the s3gen GGUF, and compute prompt_feat (log-mel) in C++.  out_rows is the
 // number of mel frames (= T_mel in the row-major (T_mel, 80) layout).
-static bool compute_prompt_feat_native(const std::string & wav_path,
+bool compute_prompt_feat_native(const std::string & wav_path,
                                        const std::string & s3gen_gguf_path,
                                        std::vector<float> & out_feat,
                                        int & out_rows,
@@ -306,7 +308,7 @@ static bool compute_prompt_feat_native(const std::string & wav_path,
 // Compute the 192-d `embedding` tensor natively by running the reference wav
 // through the C++ Kaldi fbank → mean-subtract → CAMPPlus pipeline.  Returns
 // false silently if the s3gen GGUF predates Phase 2d-a (no CAMPPlus tensors).
-static bool compute_embedding_native(const std::string & wav_path,
+bool compute_embedding_native(const std::string & wav_path,
                                      const std::string & s3gen_gguf_path,
                                      std::vector<float> & out_emb,
                                      ggml_backend_t backend = nullptr,
@@ -374,7 +376,7 @@ static bool compute_embedding_native(const std::string & wav_path,
 // stream (first 15 s → up to max_cond_tokens tokens).
 //
 // Returns false if the s3gen GGUF pre-dates Phase 2e (no s3tokv2.* tensors).
-static bool compute_speech_tokens_native(const std::string & wav_path,
+bool compute_speech_tokens_native(const std::string & wav_path,
                                          const std::string & s3gen_gguf_path,
                                          int max_cond_tokens,
                                          std::vector<int32_t> & out_prompt_tokens,
@@ -470,100 +472,9 @@ static void save_voice_profile(const std::string & dir,
     fprintf(stderr, "save_voice_profile: wrote %d .npy files into %s\n", n_saved, dir.c_str());
 }
 
-static constexpr int CHBX_MAX_NODES = 8192;
-
-// --------------------------------------------------------------------------
-// GGUF metadata keys
-// --------------------------------------------------------------------------
-
-static constexpr const char * KEY_TEXT_VOCAB_SIZE   = "chatterbox.text_vocab_size";
-static constexpr const char * KEY_SPEECH_VOCAB_SIZE = "chatterbox.speech_vocab_size";
-static constexpr const char * KEY_START_SPEECH      = "chatterbox.start_speech_token";
-static constexpr const char * KEY_STOP_SPEECH       = "chatterbox.stop_speech_token";
-static constexpr const char * KEY_SPEAKER_EMBED     = "chatterbox.speaker_embed_size";
-static constexpr const char * KEY_LAYER_NORM_EPS    = "chatterbox.layer_norm_eps";
-static constexpr const char * KEY_COND_PROMPT_LEN   = "chatterbox.cond_prompt_length";
-static constexpr const char * KEY_N_CTX             = "chatterbox.n_ctx";
-static constexpr const char * KEY_N_EMBD            = "chatterbox.n_embd";
-static constexpr const char * KEY_N_HEAD            = "chatterbox.n_head";
-static constexpr const char * KEY_N_LAYER           = "chatterbox.n_layer";
-
-// --------------------------------------------------------------------------
-// Model structs
-// --------------------------------------------------------------------------
-
-struct chatterbox_hparams {
-    int32_t n_text_vocab       = 0;
-    int32_t n_speech_vocab     = 0;
-    int32_t start_speech_token = 0;
-    int32_t stop_speech_token  = 0;
-    int32_t n_ctx              = 0;
-    int32_t n_embd             = 0;
-    int32_t n_head             = 0;
-    int32_t n_layer            = 0;
-    int32_t speaker_embed_size = 0;
-    int32_t cond_prompt_len    = 0;
-    float   eps                = 1e-5f;
-};
-
-struct gpt2_layer {
-    ggml_tensor * ln_1_g = nullptr;
-    ggml_tensor * ln_1_b = nullptr;
-    ggml_tensor * ln_2_g = nullptr;
-    ggml_tensor * ln_2_b = nullptr;
-
-    ggml_tensor * c_attn_attn_w = nullptr;
-    ggml_tensor * c_attn_attn_b = nullptr;
-    ggml_tensor * c_attn_proj_w = nullptr;
-    ggml_tensor * c_attn_proj_b = nullptr;
-
-    ggml_tensor * c_mlp_fc_w   = nullptr;
-    ggml_tensor * c_mlp_fc_b   = nullptr;
-    ggml_tensor * c_mlp_proj_w = nullptr;
-    ggml_tensor * c_mlp_proj_b = nullptr;
-};
-
-struct chatterbox_model {
-    chatterbox_hparams hparams;
-
-    ggml_tensor * wpe              = nullptr;
-    ggml_tensor * ln_f_g           = nullptr;
-    ggml_tensor * ln_f_b           = nullptr;
-    ggml_tensor * text_emb         = nullptr;
-    ggml_tensor * speech_emb       = nullptr;
-    ggml_tensor * speech_head      = nullptr;
-    ggml_tensor * speech_head_bias = nullptr;
-    ggml_tensor * cond_spkr_w      = nullptr;
-    ggml_tensor * cond_spkr_b      = nullptr;
-
-    ggml_tensor * builtin_speaker_emb        = nullptr;
-    ggml_tensor * builtin_cond_prompt_tokens = nullptr;
-
-    std::vector<gpt2_layer> layers;
-
-    ggml_tensor * memory_k = nullptr;
-    ggml_tensor * memory_v = nullptr;
-
-    ggml_context * ctx_w  = nullptr;
-    ggml_context * ctx_kv = nullptr;
-
-    ggml_backend_t backend = nullptr;
-
-    ggml_backend_buffer_t buffer_w  = nullptr;
-    ggml_backend_buffer_t buffer_kv = nullptr;
-
-    // Override buffer: populated only when --ref-dir supplies a cond_prompt
-    // tensor whose length differs from the GGUF's built-in. The original
-    // built-in tensor stays alive (reachable via ctx_w) but unused.
-    ggml_context *        ctx_override    = nullptr;
-    ggml_backend_buffer_t buffer_override = nullptr;
-
-    std::map<std::string, ggml_tensor *> tensors;
-
-    // GPT-2 BPE tokenizer, carried in the GGUF as tokenizer.ggml.* metadata.
-    std::vector<std::string> tok_tokens;
-    std::vector<std::string> tok_merges;
-};
+// The GGUF metadata key constants, CHBX_MAX_NODES, and the chatterbox_hparams /
+// gpt2_layer / chatterbox_model / chatterbox_sampling_params structs now live
+// in src/chatterbox_t3_internal.h so src/chatterbox_engine.cpp can share them.
 
 // --------------------------------------------------------------------------
 // CLI
@@ -816,10 +727,11 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
 
 // Verbose flag: set once in main() before any ggml init so helpers
 // below (init_backend, load_model_gguf) can gate their startup prints on it.
-// 0 = quiet, 1 = --verbose mode.
-static int g_log_verbose = 0;
+// 0 = quiet, 1 = --verbose mode.  Declared extern in chatterbox_t3_internal.h
+// so chatterbox_engine.cpp can flip it from its Engine ctor without a copy.
+int g_log_verbose = 0;
 
-static ggml_backend_t init_backend(int n_gpu_layers) {
+ggml_backend_t init_backend(int n_gpu_layers) {
     const bool v = g_log_verbose != 0;
 #ifdef GGML_USE_CUDA
     if (n_gpu_layers > 0) {
@@ -856,7 +768,7 @@ static ggml_backend_t init_backend(int n_gpu_layers) {
 // Model loading
 // --------------------------------------------------------------------------
 
-static bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
+bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gguf_params = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
@@ -1151,7 +1063,7 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
 // Evaluation
 // --------------------------------------------------------------------------
 
-static bool eval_prompt(
+bool eval_prompt(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
 
@@ -1199,7 +1111,7 @@ static bool eval_prompt(
     return true;
 }
 
-static bool eval_step(
+bool eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
     int n_past, int32_t token, std::vector<float> & logits_out) {
 
@@ -1230,22 +1142,24 @@ static bool eval_step(
 //   3. TopPLogitsWarper          (if top_p < 1)
 //   4. RepetitionPenaltyLogitsProcessor (if penalty != 1)
 // Then softmax + multinomial.
-static int32_t sample_next_token(
+//
+// The chatterbox_sampling_params-taking version is the canonical one and is
+// also used from src/chatterbox_engine.cpp.  The cli_params-taking wrapper
+// below is preserved so the existing CLI call sites keep working unchanged.
+int32_t sample_next_token_ex(
     const std::vector<float> & logits,
     const std::vector<int32_t> & generated,
-    const cli_params & params,
+    const chatterbox_sampling_params & params,
     std::mt19937 & rng) {
 
     const int n = (int)logits.size();
     std::vector<float> scores(logits.begin(), logits.end());
 
-    // 1. Temperature
     if (params.temp > 0.0f && params.temp != 1.0f) {
         float inv_t = 1.0f / params.temp;
         for (float & s : scores) s *= inv_t;
     }
 
-    // 2. TopK  — set everything outside the top-k to -inf
     if (params.top_k > 0 && params.top_k < n) {
         std::vector<float> tmp(scores);
         std::nth_element(tmp.begin(), tmp.begin() + params.top_k, tmp.end(), std::greater<float>());
@@ -1256,7 +1170,6 @@ static int32_t sample_next_token(
         for (float & s : scores) if (s <= threshold) s = -INFINITY;
     }
 
-    // 3. TopP — set tokens below the cumulative probability cutoff to -inf
     if (params.top_p < 1.0f) {
         struct IS { int idx; float s; };
         std::vector<IS> sorted;
@@ -1281,7 +1194,6 @@ static int32_t sample_next_token(
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
 
-    // 4. Repetition penalty (HF convention: divide positive, multiply negative)
     if (params.repeat_penalty != 1.0f && !generated.empty()) {
         std::set<int32_t> seen(generated.begin(), generated.end());
         for (int32_t t : seen) {
@@ -1291,7 +1203,6 @@ static int32_t sample_next_token(
         }
     }
 
-    // Softmax + sample (or argmax for greedy)
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
 
@@ -1312,6 +1223,19 @@ static int32_t sample_next_token(
     return dist(rng);
 }
 
+static int32_t sample_next_token(
+    const std::vector<float> & logits,
+    const std::vector<int32_t> & generated,
+    const cli_params & params,
+    std::mt19937 & rng) {
+    chatterbox_sampling_params sp;
+    sp.top_k          = params.top_k;
+    sp.top_p          = params.top_p;
+    sp.temp           = params.temp;
+    sp.repeat_penalty = params.repeat_penalty;
+    return sample_next_token_ex(logits, generated, sp, rng);
+}
+
 // --------------------------------------------------------------------------
 // Main
 // --------------------------------------------------------------------------
@@ -1322,13 +1246,13 @@ static int32_t sample_next_token(
 // none of which a non-debugging user cares about.  Errors still go through
 // so real failures are never hidden.
 // (g_log_verbose is declared near init_backend; see above.)
-static void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*ud*/) {
+void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*ud*/) {
     if (g_log_verbose || level >= GGML_LOG_LEVEL_ERROR) {
         fputs(text, stderr);
     }
 }
 
-int main(int argc, char ** argv) {
+int qvac_tts_cli_main(int argc, char ** argv) {
     ggml_time_init();
     cli_params params;
     if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }

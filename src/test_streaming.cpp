@@ -15,7 +15,7 @@
 // Usage:
 //   ./build/test-streaming  models/chatterbox-s3gen.gguf  /tmp/streaming_ref/
 
-#include "s3gen_pipeline.h"
+#include "qvac-tts/chatterbox/s3gen_pipeline.h"
 #include "npy.h"
 
 #include <algorithm>

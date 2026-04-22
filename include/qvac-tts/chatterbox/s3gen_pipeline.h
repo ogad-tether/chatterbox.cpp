@@ -4,7 +4,7 @@
 // HiFT vocoder. Takes T3-generated speech tokens + reference voice conditioning
 // and writes a 24 kHz WAV.
 //
-// Implementation in src/s3gen_pipeline.cpp.
+// Implementation in src/chatterbox_tts.cpp.
 
 #include <cstdint>
 #include <string>
@@ -164,3 +164,13 @@ int s3gen_synthesize_to_wav(
 // streamed chunk is available as soon as T3 emits its first N tokens.
 // Returns 0 on success.
 int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers);
+
+// Release the internal S3Gen cache (weights + backend + allocator).  Long-
+// running processes that cycle through models, as well as wrappers that
+// need deterministic teardown before the host backend is destroyed (e.g.
+// the qvac-tts-ggml Bare addon), should call this before tearing down
+// their own ggml backend.  Otherwise the cache is freed at process exit
+// via static destructors, after which the ggml-metal global device may
+// have already been finalised — tripping its resource-leak assertion.
+// Idempotent; safe to call when the cache is empty.
+void s3gen_unload();
