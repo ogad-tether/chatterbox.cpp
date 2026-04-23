@@ -1423,7 +1423,14 @@ static void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*
 int main(int argc, char ** argv) {
     ggml_time_init();
     cli_params params;
-    if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }
+    if (!parse_args(argc, argv, params)) {
+        // Don't dump the full usage here — parse_args already printed the
+        // specific error (missing / malformed value, unknown flag).  Dumping
+        // ~90 lines of option descriptions below it just pushes the actual
+        // message off-screen.  Point users at --help if they want it.
+        fprintf(stderr, "Run `%s --help` for the full list of options.\n", argv[0]);
+        return 1;
+    }
 
     // Apply the log filter BEFORE any ggml_backend_*_init() runs, otherwise
     // Metal / Vulkan device-init messages leak out.
