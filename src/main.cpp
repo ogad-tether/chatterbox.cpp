@@ -748,6 +748,38 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
             if (i + 1 >= argc) { fprintf(stderr, "error: %s requires an argument\n", flag); return nullptr; }
             return argv[++i];
         };
+        // Safe numeric parsers: turn std::stoi / std::stof "no conversion"
+        // exceptions into a user-friendly error + clean exit.  Catches the
+        // common mistake of a flag being followed by *another flag* because
+        // the intended value was forgotten (e.g. `--n-gpu-layers --out ...`).
+        auto parse_int = [&](const char * flag, int32_t & out) -> bool {
+            auto v = next(flag);
+            if (!v) return false;
+            try {
+                size_t pos = 0;
+                long long n = std::stoll(v, &pos);
+                if (pos != std::strlen(v)) throw std::invalid_argument("trailing garbage");
+                out = (int32_t) n;
+                return true;
+            } catch (const std::exception & e) {
+                fprintf(stderr, "error: %s expects an integer value, got '%s' (%s)\n", flag, v, e.what());
+                return false;
+            }
+        };
+        auto parse_float = [&](const char * flag, float & out) -> bool {
+            auto v = next(flag);
+            if (!v) return false;
+            try {
+                size_t pos = 0;
+                float f = std::stof(v, &pos);
+                if (pos != std::strlen(v)) throw std::invalid_argument("trailing garbage");
+                out = f;
+                return true;
+            } catch (const std::exception & e) {
+                fprintf(stderr, "error: %s expects a number, got '%s' (%s)\n", flag, v, e.what());
+                return false;
+            }
+        };
 
         if      (arg == "--model")          { auto v = next("--model");          if (!v) return false; params.model = v; }
         else if (arg == "--text")           { auto v = next("--text");           if (!v) return false; params.text = v; }
@@ -760,24 +792,24 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--save-voice")     { auto v = next("--save-voice");     if (!v) return false; params.save_voice_dir = v; }
         else if (arg == "--debug")          { params.debug = true; }
         else if (arg == "--verbose" || arg == "-v") { params.verbose = true; }
-        else if (arg == "--seed")           { auto v = next("--seed");           if (!v) return false; params.seed = std::stoi(v); }
-        else if (arg == "--threads")        { auto v = next("--threads");        if (!v) return false; params.n_threads = std::stoi(v); }
-        else if (arg == "--n-predict")      { auto v = next("--n-predict");      if (!v) return false; params.n_predict = std::stoi(v); }
-        else if (arg == "--context")        { auto v = next("--context");        if (!v) return false; params.n_ctx = std::stoi(v); }
-        else if (arg == "--n-gpu-layers")   { auto v = next("--n-gpu-layers");   if (!v) return false; params.n_gpu_layers = std::stoi(v); }
-        else if (arg == "--top-k")          { auto v = next("--top-k");          if (!v) return false; params.top_k = std::stoi(v); }
-        else if (arg == "--top-p")          { auto v = next("--top-p");          if (!v) return false; params.top_p = std::stof(v); }
-        else if (arg == "--temp")           { auto v = next("--temp");           if (!v) return false; params.temp = std::stof(v); }
-        else if (arg == "--repeat-penalty") { auto v = next("--repeat-penalty"); if (!v) return false; params.repeat_penalty = std::stof(v); }
-        else if (arg == "--max-sentence-chars") { auto v = next("--max-sentence-chars"); if (!v) return false; params.max_sentence_chars = std::stoi(v); }
+        else if (arg == "--seed")           { if (!parse_int  ("--seed",           params.seed))           return false; }
+        else if (arg == "--threads")        { if (!parse_int  ("--threads",        params.n_threads))      return false; }
+        else if (arg == "--n-predict")      { if (!parse_int  ("--n-predict",      params.n_predict))      return false; }
+        else if (arg == "--context")        { if (!parse_int  ("--context",        params.n_ctx))          return false; }
+        else if (arg == "--n-gpu-layers")   { if (!parse_int  ("--n-gpu-layers",   params.n_gpu_layers))   return false; }
+        else if (arg == "--top-k")          { if (!parse_int  ("--top-k",          params.top_k))          return false; }
+        else if (arg == "--top-p")          { if (!parse_float("--top-p",          params.top_p))          return false; }
+        else if (arg == "--temp")           { if (!parse_float("--temp",           params.temp))           return false; }
+        else if (arg == "--repeat-penalty") { if (!parse_float("--repeat-penalty", params.repeat_penalty)) return false; }
+        else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
-        else if (arg == "--crossfade-ms")   { auto v = next("--crossfade-ms");   if (!v) return false; params.crossfade_ms = std::stoi(v); }
-        else if (arg == "--stream-chunk-tokens") { auto v = next("--stream-chunk-tokens"); if (!v) return false; params.stream_chunk_tokens = std::stoi(v); }
-        else if (arg == "--stream-first-chunk-tokens") { auto v = next("--stream-first-chunk-tokens"); if (!v) return false; params.stream_first_chunk_tokens = std::stoi(v); }
-        else if (arg == "--stream-cfm-steps") { auto v = next("--stream-cfm-steps"); if (!v) return false; params.stream_cfm_steps = std::stoi(v); }
+        else if (arg == "--crossfade-ms")   { if (!parse_int("--crossfade-ms",   params.crossfade_ms))   return false; }
+        else if (arg == "--stream-chunk-tokens")       { if (!parse_int("--stream-chunk-tokens",       params.stream_chunk_tokens))       return false; }
+        else if (arg == "--stream-first-chunk-tokens") { if (!parse_int("--stream-first-chunk-tokens", params.stream_first_chunk_tokens)) return false; }
+        else if (arg == "--stream-cfm-steps")          { if (!parse_int("--stream-cfm-steps",          params.stream_cfm_steps))          return false; }
         else if (arg == "--input-file")       { auto v = next("--input-file");       if (!v) return false; params.input_file = v; }
-        else if (arg == "--input-poll-ms")    { auto v = next("--input-poll-ms");    if (!v) return false; params.input_poll_ms = std::stoi(v); }
-        else if (arg == "--input-flush-ms")   { auto v = next("--input-flush-ms");   if (!v) return false; params.input_flush_ms = std::stoi(v); }
+        else if (arg == "--input-poll-ms")    { if (!parse_int("--input-poll-ms",  params.input_poll_ms))  return false; }
+        else if (arg == "--input-flush-ms")   { if (!parse_int("--input-flush-ms", params.input_flush_ms)) return false; }
         else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); std::exit(0); }
