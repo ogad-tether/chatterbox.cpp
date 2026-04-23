@@ -367,7 +367,17 @@ static bool compute_embedding_native(const std::string & wav_path,
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
 
-    if (!campplus_embed(fbank, T, w, backend, out_emb)) return false;
+    // Force the scalar C++ CAMPPlus path for now.  The ggml-graph variant
+    // (campplus_embed_ggml) produces an antipodal embedding vs the
+    // scalar/Python reference on real voice inputs (cos_sim ~ -0.19 vs
+    // Python, while the scalar path matches at ~0.9999).  The bug is in
+    // the graph construction and isn't exercised by test-campplus because
+    // that harness passes backend=nullptr too.  CAMPPlus only runs once
+    // per voice-bake, ~500 ms on CPU, so the ggml speed-up isn't critical
+    // for user-visible latency — we pay a small one-time cost in exchange
+    // for a correct speaker embedding.
+    (void)backend;
+    if (!campplus_embed(fbank, T, w, /*backend=*/nullptr, out_emb)) return false;
     if (verbose) fprintf(stderr, "voice: embedding shape=(%zu,) via CAMPPlus (%d fbank frames)\n",
             out_emb.size(), T);
     return true;
