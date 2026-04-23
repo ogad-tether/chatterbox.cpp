@@ -428,6 +428,7 @@ static bool compute_speech_tokens_native(const std::string & wav_path,
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/select.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -728,8 +729,11 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          tail -f semantics: each complete sentence (ending in\n");
     fprintf(stderr, "                          . ! ? or newline) is tokenised and synthesised the\n");
     fprintf(stderr, "                          moment it arrives; audio streams chunk-by-chunk to\n");
-    fprintf(stderr, "                          stdout as raw s16le @ 24 kHz mono.  Runs until SIGINT\n");
-    fprintf(stderr, "                          or until --input-eof-marker is seen.  Requires\n");
+    fprintf(stderr, "                          stdout as raw s16le @ 24 kHz mono.  Use '-' to read\n");
+    fprintf(stderr, "                          from stdin instead of a file; on a TTY this gives an\n");
+    fprintf(stderr, "                          interactive prompt where each Enter-terminated line\n");
+    fprintf(stderr, "                          is spoken immediately (Ctrl-D exits).  Runs until\n");
+    fprintf(stderr, "                          SIGINT or stdin EOF / --input-eof-marker.  Requires\n");
     fprintf(stderr, "                          --s3gen-gguf, --stream-chunk-tokens > 0, --out -.\n");
     fprintf(stderr, "                          Exclusive with --text / --tokens-file.\n");
     fprintf(stderr, "  --input-poll-ms N       Polling interval when the input file has no new\n");
@@ -1809,13 +1813,27 @@ int main(int argc, char ** argv) {
             // bytes and we called clearerr().  read() always asks the
             // kernel for the current state, which is what `tail -f`
             // semantics require.
-            int in_fd = open(params.input_file.c_str(), O_RDONLY);
-            if (in_fd < 0) {
-                fprintf(stderr, "error: cannot open --input-file '%s': %s\n",
-                        params.input_file.c_str(), std::strerror(errno));
-                free_t3();
-                return 1;
+            //
+            // Special case: `--input-file -` means "read from stdin", so the
+            // user can run a single process, type (or pipe) text into the
+            // terminal, and hear it spoken back.  We intentionally do not
+            // open() "/dev/stdin" here because that gets a fresh fd whose
+            // initial offset is 0 on some systems, which re-reads prior
+            // bytes of the terminal session on TTYs.
+            int in_fd;
+            const bool input_from_stdin = (params.input_file == "-");
+            if (input_from_stdin) {
+                in_fd = STDIN_FILENO;
+            } else {
+                in_fd = open(params.input_file.c_str(), O_RDONLY);
+                if (in_fd < 0) {
+                    fprintf(stderr, "error: cannot open --input-file '%s': %s\n",
+                            params.input_file.c_str(), std::strerror(errno));
+                    free_t3();
+                    return 1;
+                }
             }
+            const bool stdin_is_tty = input_from_stdin && isatty(STDIN_FILENO) != 0;
 
             // S3Gen opts: same setup as the regular streaming branch below.
             s3gen_synthesize_opts opts;
@@ -1884,12 +1902,22 @@ int main(int argc, char ** argv) {
             if (params.input_flush_ms > 0) {
                 live_banner_suffix = ", idle-flush=" + std::to_string(params.input_flush_ms) + "ms";
             }
+            const char * stop_hint =
+                stdin_is_tty
+                    ? "type a sentence + Enter (Ctrl-D to exit)"
+                    : (params.input_eof_marker.empty()
+                          ? "Ctrl-C to stop"
+                          : "stops at eof-marker or Ctrl-C");
+            const char * src_label =
+                input_from_stdin ? "<stdin>" : params.input_file.c_str();
             fprintf(stderr, "\n=== live input: %s (%s%s) ===\n",
-                    params.input_file.c_str(),
-                    params.input_eof_marker.empty()
-                        ? "Ctrl-C to stop"
-                        : "stops at eof-marker or Ctrl-C",
-                    live_banner_suffix.c_str());
+                    src_label, stop_hint, live_banner_suffix.c_str());
+            if (stdin_is_tty) {
+                // Prompt lives on stderr so it doesn't collide with the
+                // raw-PCM stream on stdout.
+                fprintf(stderr, "> ");
+                fflush(stderr);
+            }
 
             auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
 
@@ -2067,12 +2095,38 @@ int main(int argc, char ** argv) {
             };
 
             // --- Main tail -f loop ---
-            int loop_rc = 0;
+            int  loop_rc     = 0;
+            bool stdin_eof   = false;  // only meaningful when reading from stdin
             auto last_data_at = std::chrono::steady_clock::now();
+            // Re-prints the interactive prompt once per "ready for input"
+            // state (after start-up, and after each synthesised sentence
+            // when nothing is queued).
+            auto reprompt = [&]() {
+                if (stdin_is_tty && !stdin_eof && pending.empty() && !live_stop.load()) {
+                    fprintf(stderr, "> ");
+                    fflush(stderr);
+                }
+            };
             while (!live_stop.load()) {
+                // For TTY stdin, read() blocks until the user types a line.
+                // Use select() with the poll timeout so SIGINT (which sets
+                // live_stop) is noticed promptly and the user doesn't need
+                // to also press Enter to exit.
+                if (stdin_is_tty) {
+                    fd_set rf; FD_ZERO(&rf); FD_SET(in_fd, &rf);
+                    struct timeval tv;
+                    tv.tv_sec  = 0;
+                    tv.tv_usec = std::max(1, params.input_poll_ms) * 1000;
+                    int sv = select(in_fd + 1, &rf, nullptr, nullptr, &tv);
+                    if (sv <= 0) {
+                        if (live_stop.load()) break;
+                        continue;
+                    }
+                }
                 ssize_t r;
                 do {
                     r = read(in_fd, read_buf.data(), read_buf.size());
+                    if (r < 0 && errno == EINTR && live_stop.load()) break;
                 } while (r < 0 && errno == EINTR);
                 const size_t n = (r > 0) ? (size_t)r : 0;
                 if (n > 0) {
@@ -2085,24 +2139,28 @@ int main(int argc, char ** argv) {
                             saw_eof_marker = true;
                         }
                     }
+                } else if (r == 0 && input_from_stdin) {
+                    // EOF on stdin: the user pressed Ctrl-D (TTY) or the
+                    // upstream pipe was closed.  Drain the buffer one
+                    // last time and exit.  For regular files r == 0 just
+                    // means "no new bytes appended yet", so we only
+                    // treat it as terminal when reading from stdin.
+                    stdin_eof = true;
                 }
-                // r == 0 means "no new bytes right now" — the writer may
-                // append more later.  Do NOT close the fd; we'll sleep
-                // below and try again.  read() reliably returns the new
-                // bytes as soon as they are appended, without the stdio
-                // readahead-buffer gotcha that plagued the fread() version.
 
                 // Drain every complete sentence currently in the buffer.
+                bool synthesised_any = false;
                 std::string sentence;
                 while (pop_sentence(sentence, /*force_final=*/false)) {
                     loop_rc = synth_sentence(sentence);
                     sentence.clear();
+                    synthesised_any = true;
                     last_data_at = std::chrono::steady_clock::now();
                     if (loop_rc != 0 || live_stop.load()) break;
                 }
                 if (loop_rc != 0) break;
 
-                if (saw_eof_marker) {
+                if (saw_eof_marker || stdin_eof) {
                     // Final flush: synthesise any non-terminated tail.
                     std::string tail;
                     if (pop_sentence(tail, /*force_final=*/true)) {
@@ -2123,10 +2181,15 @@ int main(int argc, char ** argv) {
                         std::string tail;
                         if (pop_sentence(tail, /*force_final=*/true)) {
                             loop_rc = synth_sentence(tail);
+                            synthesised_any = true;
                             last_data_at = std::chrono::steady_clock::now();
                             if (loop_rc != 0) break;
                         }
                     }
+                }
+
+                if (synthesised_any) {
+                    reprompt();
                 }
 
                 if (n == 0) {
@@ -2142,8 +2205,15 @@ int main(int argc, char ** argv) {
                     (void)synth_sentence(tail);
                 }
             }
+            // On TTY stdin, leave the shell cursor on a fresh line so the
+            // post-run summary doesn't overwrite the last "> ".
+            if (stdin_is_tty) {
+                fprintf(stderr, "\n");
+            }
 
-            close(in_fd);
+            if (!input_from_stdin) {
+                close(in_fd);
+            }
             const double total_ms = 1e-3 * ggml_time_us() - live_t0_ms;
             fprintf(stderr,
                     "\n=== live input done: %zu sentences, "
