@@ -2302,11 +2302,26 @@ int main(int argc, char ** argv) {
                 }
             }
             if (params.stream_chunk_tokens <= 0 && !multi_seg) {
-                // Single-shot: let s3gen_synthesize_to_wav write the wav
-                // directly and print its own "Wrote ..." line.
+                // Single-shot.  Two output modes:
+                //   --out PATH  → s3gen_synthesize_to_wav writes the wav and
+                //                 prints its own "Wrote ..." line.
+                //   --out -     → capture PCM in-memory and emit raw s16le to
+                //                 stdout (so it can be piped into `play` /
+                //                 `ffplay` without streaming mode).
                 ensure_t3(0);
-                int rc = s3gen_synthesize_to_wav(seg_generated[0], opts);
-                if (rc != 0) return rc;
+                if (params.out_wav == "-") {
+                    std::vector<float> pcm;
+                    s3gen_synthesize_opts so = opts;
+                    so.out_wav_path = "";
+                    so.pcm_out      = &pcm;
+                    int rc = s3gen_synthesize_to_wav(seg_generated[0], so);
+                    if (rc != 0) return rc;
+                    stream_emit_pcm_stdout(pcm);
+                    fprintf(stderr, "Streamed to stdout (raw s16le @ 24 kHz mono)\n");
+                } else {
+                    int rc = s3gen_synthesize_to_wav(seg_generated[0], opts);
+                    if (rc != 0) return rc;
+                }
             } else if (params.stream_chunk_tokens <= 0) {
                 // Auto-split multi-segment batch mode: render each segment
                 // into in-memory PCM, concatenate with a raised-cosine
@@ -2332,8 +2347,13 @@ int main(int argc, char ** argv) {
                         "\n=== auto-split: %zu segments, %.0f ms for %.0f ms audio (RTF=%.2f) ===\n",
                         N_SEG, seg_total_ms, audio_ms,
                         audio_ms > 0.0 ? seg_total_ms / audio_ms : 0.0);
-                stream_write_wav(params.out_wav, full_pcm, sr);
-                fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
+                if (params.out_wav == "-") {
+                    stream_emit_pcm_stdout(full_pcm);
+                    fprintf(stderr, "Streamed to stdout (raw s16le @ 24 kHz mono)\n");
+                } else {
+                    stream_write_wav(params.out_wav, full_pcm, sr);
+                    fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
+                }
             } else {
                 // Streaming synthesis.  Runs the chunked S3Gen+HiFT loop on
                 // each T3 segment.  Within a segment, `hift_cache_source`
