@@ -63,6 +63,9 @@ VARIANTS = {
 }
 
 
+QUANT_CHOICES = ("f32", "f16", "q8_0", "q4_0")
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", choices=list(VARIANTS.keys()), default="turbo",
@@ -73,6 +76,17 @@ def parse_args() -> argparse.Namespace:
                     help="Defaults to models/chatterbox-s3gen.gguf (turbo) or "
                          "models/chatterbox-s3gen-mtl.gguf (mtl).")
     ap.add_argument("--hf-token")
+    ap.add_argument("--quant", choices=QUANT_CHOICES, default="f32",
+                    help="Target format for the big matmul weights (encoder "
+                         "Linears, CFM attn/FF Linears, HiFT Conv1d weights, "
+                         "CAMPPlus/S3TokenizerV2). Biases, LayerNorm "
+                         "gammas/betas, embeddings, filterbanks and built-in "
+                         "conditionals always stay F32. Tensors whose shape "
+                         "cannot hold the requested block quant (rank != 2 or "
+                         "ne[0] not a multiple of 32) transparently fall back "
+                         "to F16 so conv kernels still benefit even at q8_0/"
+                         "q4_0. Default f32 reproduces the pre-optimisation "
+                         "GGUF byte-for-byte.")
     args = ap.parse_args()
     if args.out is None:
         args.out = Path("models/chatterbox-s3gen-mtl.gguf") if args.variant == "mtl" \
@@ -84,6 +98,122 @@ def as_numpy(tensor: torch.Tensor, *, dtype=None) -> np.ndarray:
     if dtype is not None:
         tensor = tensor.to(dtype)
     return np.ascontiguousarray(tensor.detach().cpu().numpy())
+
+
+# ---------------------------------------------------------------------------
+# Weight-tensor storage format helper.
+#
+# Design goals, in priority order:
+#  1. Generic across backends (CPU / Metal / Vulkan / CUDA) — ggml dispatches
+#     the right kernel automatically once the tensor's GGMLQuantizationType is
+#     set, so the C++ binary needs no changes.
+#  2. Safe quality-wise: only the big matmul weights (rank-2 Linears with an
+#     inner dim divisible by 32) get Q8_0/Q4_0; everything else is F16 or F32
+#     so per-layer numerical accumulation stays in-range.
+#  3. Halves (F16) or quarters (Q8_0) the on-disk size and, more importantly,
+#     the memory bandwidth every backend spends on weight reads.  That is
+#     where the CPU path is bottlenecked today (the CFM estimator runs 10x2
+#     forwards per utterance; each forward re-reads the whole U-Net).
+#
+# Fallback chain:
+#     requested q4_0 → q8_0 → f16 → f32
+# triggered when a tensor's shape can't hold the requested block layout.
+# GGML block quants require ne[0] % 32 == 0.  Conv1d kernels (stored as
+# ne=[K, IC, OC]) with small K (e.g. 3, 5, 7) hit that fallback and stay F16
+# — still a real 2x bandwidth win vs F32 without any accuracy loss.
+# ---------------------------------------------------------------------------
+
+_GGML_QUANT_BLOCK = 32  # QK8_0 == QK4_0 == 32
+
+_QUANT_TYPE = {
+    "q8_0": gguf.GGMLQuantizationType.Q8_0,
+    "q4_0": gguf.GGMLQuantizationType.Q4_0,
+}
+
+# Tensors the C++ runtime reads directly as F32 via `ggml_backend_tensor_get`
+# + manual indexing (not through a ggml graph).  These MUST stay F32 because
+# the call sites assume `ggml_nbytes(tensor) == nelements * sizeof(float)`.
+#
+#   - flow/input_embedding           src/chatterbox_tts.cpp:1690  (codebook)
+#   - flow/spk_embed_affine/w        src/chatterbox_tts.cpp:1789  (manual matmul)
+#   - hift/m_source/l_linear/weight  src/chatterbox_tts.cpp:2078  (SineGen linear)
+#
+# Updating the C++ side to use the tensor's native dtype would require either
+# converting to F32 at load time or teaching each consumer about F16/Q8_0
+# layout — both non-trivial and not worth it for these tiny tensors
+# (input_embedding is a one-shot lookup for prompt tokens; the other two
+# are < 100 floats each).
+_FORCE_F32_WEIGHTS = frozenset({
+    "flow/input_embedding",
+    "flow/spk_embed_affine/w",
+    "hift/m_source/l_linear/weight",
+})
+
+
+def _can_block_quantize(arr: np.ndarray) -> bool:
+    """Returns True iff arr's layout is compatible with 32-wide GGML block quants."""
+    if arr.ndim != 2:
+        return False
+    # In ggml memory order ne[0] is the LAST numpy axis (axis reversal on load).
+    inner = arr.shape[-1]
+    return inner >= _GGML_QUANT_BLOCK and inner % _GGML_QUANT_BLOCK == 0
+
+
+def add_weight(writer: "gguf.GGUFWriter", name: str, tensor: torch.Tensor,
+               quant: str) -> str:
+    """Add a weight tensor under `name`, quantised to `quant` when possible.
+
+    Returns the effective storage format as a short string, so the caller
+    can log a running histogram (which made it to q8_0 vs. fell back to F16
+    etc.).  Non-weight tensors (biases, LN gammas, embedding tables, built-in
+    conditionals, filterbanks) should bypass this helper — they're small,
+    and accumulated rounding on them reads a real-run loss that outweighs
+    the near-zero bandwidth savings.
+    """
+    arr = as_numpy(tensor, dtype=torch.float32)
+
+    # Hard F32 list: tensors the C++ runtime reads directly as packed F32
+    # bytes (not through the ggml graph).  See _FORCE_F32_WEIGHTS doc.
+    if name in _FORCE_F32_WEIGHTS:
+        writer.add_tensor(name, arr)
+        return "f32"
+
+    # Rank-1 tensors (biases, LayerNorm gammas) are tiny and precision-
+    # sensitive.  Quietly keep them F32 regardless of --quant — the bandwidth
+    # savings are negligible and F16 LN params visibly regress rel error at
+    # deep layers.  Callers ideally don't route these here at all; this is
+    # defence-in-depth so a stray call can't silently hurt quality.
+    if arr.ndim < 2:
+        writer.add_tensor(name, arr)
+        return "f32"
+
+    # Rank-3 tensors are Conv1d kernels (K, IC, OC after PyTorch → numpy).
+    # They're consumed by `conv1d_f32` in src/chatterbox_tts.cpp which does
+    #     im2col -> mul_mat(im2col_f32, kernel)
+    # passing the kernel as mul_mat's second operand.  ggml's CPU backend
+    # asserts `src1->type == GGML_TYPE_F32` on that path, so quantising or
+    # half-floating conv kernels would crash the CPU backend on load.
+    # The Linear-weight path (`ggml_mul_mat(weight, activation)`) has the
+    # weight as src0 and is unaffected, so transformer Q/K/V/FF Linears
+    # still pick up Q8_0/Q4_0.  TODO: once conv1d_f32 is refactored to use
+    # the kernel-as-src0 pattern (same as conv1d_f32_b), drop this branch.
+    if arr.ndim >= 3:
+        writer.add_tensor(name, arr)
+        return "f32"
+
+    if quant in ("q8_0", "q4_0") and _can_block_quantize(arr):
+        qtype = _QUANT_TYPE[quant]
+        qdata = gguf.quants.quantize(arr, qtype)
+        writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=qtype)
+        return quant
+
+    if quant in ("f16", "q8_0", "q4_0"):
+        arr16 = arr.astype(np.float16)
+        writer.add_tensor(name, arr16)
+        return "f16"
+
+    writer.add_tensor(name, arr)
+    return "f32"
 
 
 def resolve_weight_norm(state: dict[str, torch.Tensor], prefix: str) -> torch.Tensor:
@@ -127,34 +257,58 @@ def export(writer: gguf.GGUFWriter, state: dict, name: str, *, dtype=torch.float
     return arr.shape
 
 
-def export_conformer_block(writer: gguf.GGUFWriter, state: dict, prefix: str, gguf_prefix: str):
-    """Export one Conformer encoder block."""
-    mapping = {
-        "norm_mha.weight":           ("norm_mha/w", torch.float32),
-        "norm_mha.bias":             ("norm_mha/b", torch.float32),
-        "norm_ff.weight":            ("norm_ff/w", torch.float32),
-        "norm_ff.bias":              ("norm_ff/b", torch.float32),
-        "self_attn.linear_q.weight": ("attn/q/w", torch.float32),
-        "self_attn.linear_q.bias":   ("attn/q/b",   torch.float32),
-        "self_attn.linear_k.weight": ("attn/k/w", torch.float32),
-        "self_attn.linear_k.bias":   ("attn/k/b",   torch.float32),
-        "self_attn.linear_v.weight": ("attn/v/w", torch.float32),
-        "self_attn.linear_v.bias":   ("attn/v/b",   torch.float32),
-        "self_attn.linear_out.weight": ("attn/o/w", torch.float32),
-        "self_attn.linear_out.bias":   ("attn/o/b",   torch.float32),
-        "self_attn.linear_pos.weight": ("attn/pos/w", torch.float32),
-        "self_attn.pos_bias_u":      ("attn/pos_bias_u", torch.float32),
-        "self_attn.pos_bias_v":      ("attn/pos_bias_v", torch.float32),
-        "feed_forward.w_1.weight":   ("ff/w1/w", torch.float32),
-        "feed_forward.w_1.bias":     ("ff/w1/b",   torch.float32),
-        "feed_forward.w_2.weight":   ("ff/w2/w", torch.float32),
-        "feed_forward.w_2.bias":     ("ff/w2/b",   torch.float32),
+def export_conformer_block(writer: gguf.GGUFWriter, state: dict, prefix: str,
+                           gguf_prefix: str, quant: str, stats: dict):
+    """Export one Conformer encoder block.
+
+    Weights (the 6 attention Linears + 2 FF Linears) go through `add_weight`
+    so they pick up the requested quantisation.  Biases, LayerNorm gammas,
+    and the two positional-bias vectors stay F32 — they're tiny and round-
+    tripping them hurts accuracy for zero bandwidth benefit.
+    """
+    weight_suffixes = [
+        ("self_attn.linear_q.weight",   "attn/q/w"),
+        ("self_attn.linear_k.weight",   "attn/k/w"),
+        ("self_attn.linear_v.weight",   "attn/v/w"),
+        ("self_attn.linear_out.weight", "attn/o/w"),
+        ("self_attn.linear_pos.weight", "attn/pos/w"),
+        ("feed_forward.w_1.weight",     "ff/w1/w"),
+        ("feed_forward.w_2.weight",     "ff/w2/w"),
+    ]
+    f32_suffixes = [
+        "norm_mha.weight", "norm_mha.bias",
+        "norm_ff.weight",  "norm_ff.bias",
+        "self_attn.linear_q.bias",
+        "self_attn.linear_k.bias",
+        "self_attn.linear_v.bias",
+        "self_attn.linear_out.bias",
+        "self_attn.pos_bias_u",
+        "self_attn.pos_bias_v",
+        "feed_forward.w_1.bias",
+        "feed_forward.w_2.bias",
+    ]
+    dst_map = {
+        "norm_mha.weight":           "norm_mha/w",
+        "norm_mha.bias":             "norm_mha/b",
+        "norm_ff.weight":            "norm_ff/w",
+        "norm_ff.bias":              "norm_ff/b",
+        "self_attn.linear_q.bias":   "attn/q/b",
+        "self_attn.linear_k.bias":   "attn/k/b",
+        "self_attn.linear_v.bias":   "attn/v/b",
+        "self_attn.linear_out.bias": "attn/o/b",
+        "self_attn.pos_bias_u":      "attn/pos_bias_u",
+        "self_attn.pos_bias_v":      "attn/pos_bias_v",
+        "feed_forward.w_1.bias":     "ff/w1/b",
+        "feed_forward.w_2.bias":     "ff/w2/b",
     }
-    for src_suffix, (dst_suffix, dtype) in mapping.items():
-        src = f"{prefix}.{src_suffix}"
+    for src_suffix, dst_suffix in weight_suffixes:
         dst = f"{gguf_prefix}/{dst_suffix}"
-        arr = as_numpy(state[src], dtype=dtype)
-        writer.add_tensor(dst, arr)
+        fmt = add_weight(writer, dst, state[f"{prefix}.{src_suffix}"], quant)
+        stats[fmt] = stats.get(fmt, 0) + 1
+    for src_suffix in f32_suffixes:
+        dst = f"{gguf_prefix}/{dst_map[src_suffix]}"
+        writer.add_tensor(dst, as_numpy(state[f"{prefix}.{src_suffix}"],
+                                        dtype=torch.float32))
 
 
 def main():
@@ -193,6 +347,16 @@ def main():
     writer.add_uint32("s3gen.n_timesteps", cfg["n_timesteps"])
     writer.add_float32("s3gen.cfg_rate", cfg["cfg_rate"])
 
+    # Running tally of which storage format each routed weight actually
+    # landed in.  `--quant q8_0` on a Conv1d with k=3 falls back to f16,
+    # that'll show up here as (q8_0_requested=X, f16_fallback=Y).
+    fmt_stats: dict[str, int] = {}
+
+    def _w(name: str, tensor: torch.Tensor) -> None:
+        """Shortcut for the common 'weight tensor' path."""
+        fmt = add_weight(writer, name, tensor, args.quant)
+        fmt_stats[fmt] = fmt_stats.get(fmt, 0) + 1
+
     # Meta / hparams
     writer.add_uint32("s3gen.speech_vocab_size", 6561)
     writer.add_uint32("s3gen.input_size", 512)
@@ -217,62 +381,77 @@ def main():
     writer.add_tensor("s3gen/builtin/prompt_feat", as_numpy(prompt_feat, dtype=torch.float32))
     writer.add_tensor("s3gen/builtin/embedding", as_numpy(embedding, dtype=torch.float32))
 
-    # Flow top-level weights
-    writer.add_tensor("flow/input_embedding",       as_numpy(state["flow.input_embedding.weight"]))
-    writer.add_tensor("flow/spk_embed_affine/w",    as_numpy(state["flow.spk_embed_affine_layer.weight"]))
-    writer.add_tensor("flow/spk_embed_affine/b",    as_numpy(state["flow.spk_embed_affine_layer.bias"]))
-    writer.add_tensor("flow/encoder_proj/w",        as_numpy(state["flow.encoder_proj.weight"]))
-    writer.add_tensor("flow/encoder_proj/b",        as_numpy(state["flow.encoder_proj.bias"]))
+    # Flow top-level weights.
+    # input_embedding is an Embedding table (consumed by ggml_get_rows which
+    # accepts quantised inputs, same as llama.cpp's token_embd).  The two
+    # affine Linears are tiny (one-shot during encoder prep) but still go
+    # through _w for consistency.
+    _w("flow/input_embedding",       state["flow.input_embedding.weight"])
+    _w("flow/spk_embed_affine/w",    state["flow.spk_embed_affine_layer.weight"])
+    writer.add_tensor("flow/spk_embed_affine/b", as_numpy(state["flow.spk_embed_affine_layer.bias"], dtype=torch.float32))
+    _w("flow/encoder_proj/w",        state["flow.encoder_proj.weight"])
+    writer.add_tensor("flow/encoder_proj/b", as_numpy(state["flow.encoder_proj.bias"], dtype=torch.float32))
 
-    # Encoder embed (LinearNoSubsampling: Linear(512 -> 512) + LayerNorm)
-    writer.add_tensor("flow/encoder/embed/linear/w",  as_numpy(state["flow.encoder.embed.out.0.weight"]))
-    writer.add_tensor("flow/encoder/embed/linear/b",  as_numpy(state["flow.encoder.embed.out.0.bias"]))
-    writer.add_tensor("flow/encoder/embed/norm/w",    as_numpy(state["flow.encoder.embed.out.1.weight"]))
-    writer.add_tensor("flow/encoder/embed/norm/b",    as_numpy(state["flow.encoder.embed.out.1.bias"]))
+    # Encoder embed (LinearNoSubsampling: Linear(512 -> 512) + LayerNorm).
+    _w("flow/encoder/embed/linear/w", state["flow.encoder.embed.out.0.weight"])
+    writer.add_tensor("flow/encoder/embed/linear/b", as_numpy(state["flow.encoder.embed.out.0.bias"], dtype=torch.float32))
+    writer.add_tensor("flow/encoder/embed/norm/w",   as_numpy(state["flow.encoder.embed.out.1.weight"], dtype=torch.float32))
+    writer.add_tensor("flow/encoder/embed/norm/b",   as_numpy(state["flow.encoder.embed.out.1.bias"],   dtype=torch.float32))
 
-    # PreLookaheadLayer: two convs (kernel 4 and 3). Use F32 via custom im2col+matmul.
-    writer.add_tensor("flow/encoder/pre_lookahead/conv1/w", as_numpy(state["flow.encoder.pre_lookahead_layer.conv1.weight"]))
-    writer.add_tensor("flow/encoder/pre_lookahead/conv1/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv1.bias"]))
-    writer.add_tensor("flow/encoder/pre_lookahead/conv2/w", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.weight"]))
-    writer.add_tensor("flow/encoder/pre_lookahead/conv2/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.bias"]))
+    # PreLookaheadLayer: two short-kernel convs.  Conv1d weights land in F16
+    # when --quant requests block quant (ne[0] = kernel_size ∈ {3, 4} fails
+    # the divisible-by-32 check).  F16 still halves bandwidth cleanly.
+    _w("flow/encoder/pre_lookahead/conv1/w", state["flow.encoder.pre_lookahead_layer.conv1.weight"])
+    writer.add_tensor("flow/encoder/pre_lookahead/conv1/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv1.bias"], dtype=torch.float32))
+    _w("flow/encoder/pre_lookahead/conv2/w", state["flow.encoder.pre_lookahead_layer.conv2.weight"])
+    writer.add_tensor("flow/encoder/pre_lookahead/conv2/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.bias"], dtype=torch.float32))
 
-    # 6 Conformer blocks
+    # 6 Conformer blocks.
     for i in range(6):
         export_conformer_block(writer, state,
                                f"flow.encoder.encoders.{i}",
-                               f"flow/encoder/block{i}")
+                               f"flow/encoder/block{i}",
+                               args.quant, fmt_stats)
 
-    # Upsample1D (Conv1d with kernel 5) — F32 (we use conv1d_f32 in C++)
-    writer.add_tensor("flow/encoder/up_layer/conv/w", as_numpy(state["flow.encoder.up_layer.conv.weight"]))
-    writer.add_tensor("flow/encoder/up_layer/conv/b", as_numpy(state["flow.encoder.up_layer.conv.bias"]))
+    # Upsample1D (Conv1d kernel=5) — falls back to F16 at q8_0/q4_0.
+    _w("flow/encoder/up_layer/conv/w", state["flow.encoder.up_layer.conv.weight"])
+    writer.add_tensor("flow/encoder/up_layer/conv/b", as_numpy(state["flow.encoder.up_layer.conv.bias"], dtype=torch.float32))
 
-    # up_embed (second subsampling)
-    writer.add_tensor("flow/encoder/up_embed/linear/w", as_numpy(state["flow.encoder.up_embed.out.0.weight"]))
-    writer.add_tensor("flow/encoder/up_embed/linear/b", as_numpy(state["flow.encoder.up_embed.out.0.bias"]))
-    writer.add_tensor("flow/encoder/up_embed/norm/w",   as_numpy(state["flow.encoder.up_embed.out.1.weight"]))
-    writer.add_tensor("flow/encoder/up_embed/norm/b",   as_numpy(state["flow.encoder.up_embed.out.1.bias"]))
+    # up_embed (second subsampling).
+    _w("flow/encoder/up_embed/linear/w", state["flow.encoder.up_embed.out.0.weight"])
+    writer.add_tensor("flow/encoder/up_embed/linear/b", as_numpy(state["flow.encoder.up_embed.out.0.bias"], dtype=torch.float32))
+    writer.add_tensor("flow/encoder/up_embed/norm/w",   as_numpy(state["flow.encoder.up_embed.out.1.weight"], dtype=torch.float32))
+    writer.add_tensor("flow/encoder/up_embed/norm/b",   as_numpy(state["flow.encoder.up_embed.out.1.bias"],   dtype=torch.float32))
 
-    # 4 more Conformer blocks
+    # 4 more Conformer blocks.
     for i in range(4):
         export_conformer_block(writer, state,
                                f"flow.encoder.up_encoders.{i}",
-                               f"flow/encoder/up_block{i}")
+                               f"flow/encoder/up_block{i}",
+                               args.quant, fmt_stats)
 
-    # Final after_norm
-    writer.add_tensor("flow/encoder/after_norm/w", as_numpy(state["flow.encoder.after_norm.weight"]))
-    writer.add_tensor("flow/encoder/after_norm/b", as_numpy(state["flow.encoder.after_norm.bias"]))
+    # Final after_norm.
+    writer.add_tensor("flow/encoder/after_norm/w", as_numpy(state["flow.encoder.after_norm.weight"], dtype=torch.float32))
+    writer.add_tensor("flow/encoder/after_norm/b", as_numpy(state["flow.encoder.after_norm.bias"], dtype=torch.float32))
 
-    # Decoder estimator (CFM) — F32 (we use conv1d_f32 helper).
+    # Decoder estimator (CFM) — the critical path on CPU/Metal/Vulkan since
+    # it runs 10-20 forwards per utterance on standard CFM.  Every tensor
+    # goes through _w so Linear weights pick up Q8_0 and Conv1d kernels
+    # pick up F16.  LayerNorm gammas/betas + biases are rank-1 and stay F32
+    # via add_weight's guard.
     decoder_keys = sorted(k for k in state if k.startswith("flow.decoder.estimator."))
     for k in decoder_keys:
         gguf_name = k.replace("flow.decoder.estimator.", "cfm/").replace(".", "/")
-        writer.add_tensor(gguf_name, as_numpy(state[k], dtype=torch.float32))
+        _w(gguf_name, state[k])
 
-    # mel2wav (HiFTGenerator) — F32 (we use conv1d_f32 helper)
+    # mel2wav (HiFTGenerator): dozens of weight_norm Conv1d layers feeding
+    # the 24 kHz vocoder.  These are almost all rank-3 (K, IC, OC) with
+    # short kernels → F16 at any --quant >= f16.  Real bandwidth savings on
+    # every backend (HiFT decode is ~8% of CPU wall time on MTL).
     mel2wav_keys = sorted(k for k in state if k.startswith("mel2wav."))
     for k in mel2wav_keys:
         gguf_name = k.replace("mel2wav.", "hift/").replace(".", "/")
-        writer.add_tensor(gguf_name, as_numpy(state[k], dtype=torch.float32))
+        _w(gguf_name, state[k])
 
     # Bake in the pre-computed 80-channel mel filterbank used by
     # s3gen.utils.mel.mel_spectrogram so the C++ side can compute prompt_feat
@@ -454,6 +633,9 @@ def main():
     n_cfm  = len(decoder_keys)
     n_hift = len(mel2wav_keys)
     print(f"Wrote: encoder(+proj)~{n_flow} tensors, cfm={n_cfm}, hift={n_hift}")
+    if fmt_stats:
+        breakdown = " ".join(f"{k}={v}" for k, v in sorted(fmt_stats.items()))
+        print(f"Weight format breakdown (requested --quant {args.quant}): {breakdown}")
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()

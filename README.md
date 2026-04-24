@@ -25,19 +25,26 @@ reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
 | CPU (Mac Studio M3 Ultra, NEON)      | 7 568 ms  | 1.05   | 0.96×        | 2.3× faster     |
 | Reference (ONNX Runtime, CPU Q4)     | 6.4–17 s  | 1.2–3.2 | 0.3–0.85×   | —               |
 
-**Multilingual** (F16 weights on both sides, same `jfk.wav` reference, same
-prompt, seed 42, M4 CPU 4 threads / M4 Metal):
+**Multilingual** (same Spanish prompt, seed 42, M4 Mac, built-in voice;
+ONNX reference uses `jfk.wav` via the [multilingual-bench][bench] script):
 
-| Runtime                              | Wall       | `RTF`  | vs ONNX Runtime |
-|--------------------------------------|-----------:|-------:|----------------:|
-| ggml Metal (batched CFM)             |  4.1 s     | 1.61   | —               |
-| ggml CPU 4t (two-call CFM)           | 10.2 s     | 4.24   | **4.4× faster** |
-| Reference (ONNX Runtime, F16, CPU 4t)| 51.4 s     | 18.8   | —               |
+| Backend                              | Wall      | `RTF` | vs real-time | vs ONNX Runtime |
+|--------------------------------------|----------:|------:|-------------:|----------------:|
+| **Metal (M4, Q4_0)**                 |  **3.0 s**| 1.37  | 0.73×        | **10.6× faster**¹ |
+| Metal (M4, F16)                      |   4.0 s   | 1.65  | 0.61×        | **14.2× faster**¹ |
+| CPU (M4, 4t NEON, Q4_0)              |   6.0 s   | 2.69  | 0.37×        | **5.4× faster**¹  |
+| CPU (M4, 4t NEON, F16)               |   7.8 s   | 3.24  | 0.31×        | **7.3× faster**¹  |
+| Reference (ONNX Runtime, CPU 4t, q4) |  31.7 s   |14.55  | 0.07×        | —                |
+| Reference (ONNX Runtime, CPU 4t, fp16)|53.3 s   |23.50  | 0.04×        | —                |
 
-ONNX Runtime's multilingual export currently ships without CFG weights, so
-its 18.8 RTF is already running half the compute; a correctly-wired CFG
-ONNX build would roughly double that.  Details and reproduction script in
-[`PROGRESS.md §3.17`](PROGRESS.md) and
+¹ ONNX Runtime's multilingual ONNX export ships **without** the
+`text_emb_weight.bin` tensor and logs `CFG disabled` at load, so it's
+running half the compute of the ggml pipeline (1 T3 forward per token
+instead of 2 — no classifier-free guidance, no CFG-combined CFM). If
+the ONNX CFG path were wired up, its RTF would roughly double and the
+gap vs ggml would widen to ~10–14× (CPU) / ~20–28× (Metal). ggml runs
+the full CFG pipeline in every row above. Reproduction + per-stage
+breakdown in [`PROGRESS.md §3.17–3.18`](PROGRESS.md) and
 [`qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js`][bench].
 
 [bench]: https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js
@@ -185,6 +192,16 @@ python scripts/convert-s3gen-to-gguf.py    --out models/chatterbox-s3gen.gguf
 # --- Multilingual (23 languages) ---
 python scripts/convert-t3-mtl-to-gguf.py            --out models/chatterbox-t3-mtl.gguf
 python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3gen-mtl.gguf
+
+# --- Multilingual, quantised (recommended for speed) ---
+# Matches the RTF numbers in the benchmark table above.  Both converters
+# accept --quant {f32,f16,q8_0,q4_0}; the flag controls the large matmul
+# weights only, biases/LayerNorm/embedding tables always stay F32 for
+# precision.
+python scripts/convert-t3-mtl-to-gguf.py --quant q4_0 \
+       --out models/chatterbox-t3-mtl-q4_0.gguf
+python scripts/convert-s3gen-to-gguf.py  --variant mtl --quant q4_0 \
+       --out models/chatterbox-s3gen-mtl-q4_0.gguf
 ```
 
 The Turbo converter pulls `ResembleAI/chatterbox-turbo` (~1.5 GB), the MTL
@@ -194,6 +211,14 @@ directly into the T3 GGUF** as `tokenizer.ggml.*` metadata; for MTL we
 embed the full HuggingFace `tokenizers.json` blob (plus a Korean-Jamo /
 NFKD Unicode table for offline preprocessing), so in both cases you don't
 need to keep the source tokenizer files around on disk.
+
+The quantisation flag on `convert-s3gen-to-gguf.py` is new as of §3.18 —
+it's pure data-format work, so the binary needs no changes and every
+backend (CPU, Metal, Vulkan, CUDA) picks up the faster matmul kernels
+transparently.  Safety rules inside the converter force biases, LN
+gammas/betas, and conv kernels (rank-3) to stay F32 regardless of
+`--quant`; see `PROGRESS.md §3.18` for the full storage-format table
+and fallback chain.
 
 You should now have (either pair is usable on its own):
 
@@ -206,13 +231,19 @@ models/
                                + built-in voice (everything needed for voice
                                cloning Turbo-side)
 
-  chatterbox-t3-mtl.gguf     (~1.1 GB) — T3 Llama-520M + perceiver resampler
-                               + emotion adv + learned pos embs + embedded
-                               MTL grapheme tokenizer JSON + VoiceEncoder
-                               + built-in voice
-  chatterbox-s3gen-mtl.gguf  (~1.0 GB) — S3Gen encoder/CFM (standard 10-step
-                               + CFG inside, cfg_rate=0.7) + HiFT vocoder
-                               + CAMPPlus + S3TokenizerV2 + built-in voice
+  chatterbox-t3-mtl.gguf          (~1.1 GB) — T3 Llama-520M + perceiver resampler
+                                    + emotion adv + learned pos embs + embedded
+                                    MTL grapheme tokenizer JSON + VoiceEncoder
+                                    + built-in voice
+  chatterbox-s3gen-mtl.gguf       (~1.0 GB) — S3Gen encoder/CFM (standard 10-step
+                                    + CFG inside, cfg_rate=0.7) + HiFT vocoder
+                                    + CAMPPlus + S3TokenizerV2 + built-in voice
+
+  # Optional quantised multilingual variants — numerically very close to F16 but
+  # ~1.5-2x faster on every backend (CPU/Metal/Vulkan/CUDA) due to lower weight
+  # memory bandwidth.  Recommended for production use; see benchmark table above.
+  chatterbox-t3-mtl-q4_0.gguf     (~344 MB) — Q4_0 T3 Llama-520M
+  chatterbox-s3gen-mtl-q4_0.gguf  (~685 MB) — Q4_0 MTL S3Gen
 ```
 
 For numerical validation against PyTorch (optional, step 4), also run:

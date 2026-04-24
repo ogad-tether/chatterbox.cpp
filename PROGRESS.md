@@ -1119,6 +1119,150 @@ Optimisations still on the table, ordered by expected CPU impact:
    Hindi phonemizer).  Easiest to ship as optional Python pre-processing
    that emits already-tokenised IDs.
 
+### 3.18  CPU/GPU optimisation pass #1 — S3Gen weight quantisation
+
+Items #1 and #2 from the §3.17 backlog shipped together.  The lever is
+entirely in `scripts/convert-s3gen-to-gguf.py`: a new `--quant
+{f32,f16,q8_0,q4_0}` flag routes every big matmul weight through a
+single `add_weight()` helper that picks the storage format per-tensor
+based on shape, with a safe fallback chain.  Zero C++ changes, zero
+runtime API changes — `ggml_mul_mat` dispatches the right quantised
+kernel automatically once the tensor's `ggml_type` is set, so every
+backend (CPU/NEON, CPU/AVX, Metal, Vulkan, CUDA) picks up the win for
+free.
+
+**Rules inside `add_weight()`** (documented inline; all defensive so a
+stray caller can't silently degrade quality):
+
+- Rank < 2 tensor → always F32.  Biases and LayerNorm gammas/betas; the
+  bandwidth savings are negligible and F16 LN params visibly regress rel
+  error at deeper layers.
+- Rank == 3 tensor → always F32.  These are Conv1d kernels (ne=[K, IC,
+  OC] in ggml order).  `src/chatterbox_tts.cpp`'s `conv1d_f32` helper
+  passes the kernel as mul_mat's *second* operand, and ggml-cpu asserts
+  `src1->type == GGML_TYPE_F32` on that path.  Quantising conv kernels
+  would crash the CPU backend on load.  TODO in the code: once
+  `conv1d_f32` is refactored to use the same kernel-as-src0 pattern as
+  `conv1d_f32_b`, drop this branch.
+- Explicit skip list `_FORCE_F32_WEIGHTS` → always F32.  Three tensors
+  the C++ side reads directly via `ggml_backend_tensor_get` with F32
+  byte layout assumed (`flow/input_embedding`, `flow/spk_embed_affine/w`,
+  `hift/m_source/l_linear/weight`).  Auto-detection would need C++
+  cooperation; explicit is simpler for a "compress what's safe" PR.
+- Rank 2, ne[0] % 32 == 0, `--quant` ∈ {q8_0, q4_0} → block quantise.
+  Every transformer Q/K/V/out/FF Linear in the Conformer encoder + CFM
+  + S3TokenizerV2 lands here.  Inner dim 512, 1024, 2048 all align.
+- Rank 2, ne[0] % 32 != 0 (e.g. 9, 192-with-bias-quirks) OR `--quant` ==
+  f16 → F16 fallback.  Halves bandwidth without block alignment.
+- Rank 2, `--quant` == f32 → F32.  Default, reproduces pre-optimisation
+  GGUFs byte-for-byte.
+
+**Format histogram** printed at the end of every conversion
+(`Weight format breakdown (requested --quant q4_0): f32=808 q4_0=426`)
+so it's immediately visible whether tensors landed where expected.
+
+**GGUF size** (MTL S3Gen):
+
+| --quant | File size | vs F32 |
+|---------|----------:|-------:|
+| f32     | 1.0 GB    | —     |
+| f16     |   820 MB  | -18%   |
+| q8_0    |   732 MB  | -27%   |
+| q4_0    |   685 MB  | -32%   |
+
+Size savings are modest because CAMPPlus (450 tensors), S3TokenizerV2
+(103 tensors), and all rank-3 conv kernels still live at F32 — they're
+either off the hot path (CAMPPlus / S3TokV2 run once per voice-cloning
+setup) or blocked on the conv1d arg-order refactor above.  The
+important savings are in the right place: the 426 quantised tensors
+are exactly the CFM + Conformer + T3 transformer Linears that the 10×
+CFG-paired estimator pass re-reads on every step.
+
+**CPU per-stage breakdown (M4, 4 threads, Spanish prompt)**
+
+Confirming the quantisation lands on the CFM U-Net as intended:
+
+| Stage (20 CFM forwards) | F32 S3Gen | F16 S3Gen | Q4_0 S3Gen |
+|-------------------------|----------:|----------:|-----------:|
+| CFM total               | 6 078 ms  | 4 400 ms  | 3 900 ms   |
+| HiFT decode             |   696 ms  |   660 ms  |   640 ms   |
+| encoder                 |   242 ms  |   210 ms  |   200 ms   |
+| S3Gen total (BENCH)     | 7 113 ms  | 5 453 ms  | 4 861 ms   |
+
+(HiFT gains less because all its conv kernels stay F32 for the
+conv1d-arg-order reason above.  CFM gains the full expected fraction
+because its transformer blocks and `mlp` projections were the bulk of
+the bandwidth.)
+
+**End-to-end multilingual table (M4, same Spanish prompt as §3.17,
+seed 42, 4 CPU threads, built-in voice on ggml, `jfk.wav` voice on
+ONNX via the `chatterbox-multilingual-bench.js` harness):**
+
+| Runtime                                | T3 infer         | S3Gen infer | Audio | Total wall | RTF   |
+|----------------------------------------|-----------------:|------------:|------:|-----------:|------:|
+| ggml Metal, Q4_0 T3 + Q4_0 S3Gen       |   907 ms / 52 t  |  2 100 ms   |2.20 s |  3 005 ms  | 1.37  |
+| ggml Metal, F16  T3 + F16  S3Gen       | 1 825 ms / 57 t  |  2 135 ms   |2.40 s |  3 960 ms  | 1.65  |
+| ggml CPU 4t, Q4_0 T3 + Q4_0 S3Gen      | 1 168 ms / 53 t  |  4 861 ms   |2.24 s |  6 029 ms  | 2.69  |
+| ggml CPU 4t, F16  T3 + F16  S3Gen      | 2 315 ms / 57 t  |  5 453 ms   |2.40 s |  7 768 ms  | 3.24  |
+| ggml CPU 4t, F16  T3 + **F32** S3Gen (§3.17) | 2 423 ms / 57 t | 7 113 ms | 2.40 s | 9 536 ms | 3.97 |
+| ONNX Runtime CPU 4t, q4   (avg of 2)   |      —           |      —      |2.19 s | 31 702 ms  |14.55  |
+| ONNX Runtime CPU 4t, fp16 (avg of 2)   |      —           |      —      |2.27 s | 53 342 ms  |23.50  |
+
+Key deltas vs the §3.17 CPU baseline at the same 4-thread CPU target:
+
+- `F16 S3Gen`  quant alone: -19% wall (-1.77 s).
+- `Q4_0 S3Gen` quant + Q4_0 T3: -37% wall (-3.51 s).  RTF drops from
+  3.97 to 2.69.
+
+vs the ONNX reference (same prompt, same threads, CFG disabled on the
+ONNX side so it's doing half the compute):
+
+- CPU F16 is **7.3× faster per second of audio** (RTF 3.24 vs 23.50).
+- CPU Q4_0 is **5.4× faster per second of audio** (RTF 2.69 vs 14.55).
+- Metal F16 is **14.2× faster per second of audio** (RTF 1.65 vs 23.50).
+- Metal Q4_0 is **10.6× faster per second of audio** (RTF 1.37 vs 14.55).
+
+With CFG enabled on ONNX (the apples-to-apples comparison), those
+ratios would roughly double.  ONNX q4 notably improved from our
+§3.17-era measurement (RTF 18.17 → 14.55) after a recent
+`qvac-lib-infer-onnx-tts` prebuilds update; ONNX fp16 stayed within
+noise (20.91 → 23.50).
+
+**Quality check.** The output wavs for each config are available at
+`/tmp/mtl_{cpu,mtl}_{f16,q4_0}.wav` after the bench run; all four
+utterances are intelligible Spanish in the built-in voice.  Token
+counts vary slightly between quant levels (57 → 53 → 52) because the
+per-token sampling reads logits that differ by ~0.1% after matmul
+rounding, and the multinomial sampler diverges on marginal picks —
+this is the same effect noted for Turbo Q4_0 in §3.10 and does not
+affect overall fluency.  Use `--seed` + `--temp 0 --top-k 1` for
+deterministic byte-exact repro at a cost of some audio variety.
+
+**Generic across every backend.**  The conversion path is pure data-
+format work: no CPU-specific ifdefs, no Apple/Intel/ARM branches, no
+new ggml ops.  F16/Q8_0/Q4_0 tensor reads are accelerated by NEON
+dot-product instructions on Apple Silicon + Android arm64, by AVX2 /
+AVX-512 VNNI on Intel/AMD, by Metal/Vulkan/CUDA compute shaders on
+their respective GPUs.  Mobile deployments (Android + iOS) get the
+same win as desktop.
+
+**What's next for MTL (updated §3.17 backlog).**
+
+1. ~~Q8_0/Q4_0 T3 for MTL~~ — **shipped** (this §3.18 row).
+2. ~~Quantised CFM estimator weights~~ — **shipped** (this §3.18 row).
+3. **Runtime `--cfm-steps N` for MTL**.  Still on the table; trivial
+   plumbing, probably 25–30% more CPU wall time savings at `N=7`.
+4. **Fix `conv1d_f32` arg order** so rank-3 Conv1d kernels can also
+   go F16/Q8_0/Q4_0.  Unlocks quantising HiFT's weight_norm stack
+   (~10% additional CPU wall-time reduction on MTL, larger share on
+   Turbo).  Single-function refactor — mirror the `conv1d_f32_b`
+   pattern (kernel as mul_mat src0 + `cont(permute)` at the end).
+5. **Heterogeneous-core aware thread default**.  `--threads 10` on M4
+   hits efficiency cores and regresses ~10% vs `--threads 8`.
+   Platform-agnostic detection (`hwloc` or direct sysctl on Apple, a
+   mask on Linux perf cores).  Follow-up PR.
+6. **ja/he/ru/zh/hi language support** — unchanged from §3.17.
+
 ---
 
 ## Verification approach
