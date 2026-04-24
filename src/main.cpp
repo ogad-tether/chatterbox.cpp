@@ -2429,6 +2429,7 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                 generated.push_back(current);
 
                 bool stopped_by_stop_token = false;
+                bool stopped_by_repetition  = false;
                 for (int i = 0; i < params.n_predict; ++i) {
                     if (current == model.hparams.stop_speech_token) { stopped_by_stop_token = true; break; }
                     if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
@@ -2445,10 +2446,36 @@ int qvac_tts_cli_main(int argc, char ** argv) {
                         ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng)
                         : sample_next_token(logits, generated, params, rng);
                     generated.push_back(current);
+
+                    // Port of the token_repetition check in the Python
+                    // AlignmentStreamAnalyzer.  MTL T3 sometimes emits a
+                    // plausible end-of-speech silence cadence mid-utterance
+                    // and then hallucinates more low-energy content before
+                    // eventually stopping — e.g. PT inputs where ~4 s of
+                    // real speech get followed by ~7 s of droning noise.
+                    // Three consecutive identical tokens cleanly signal
+                    // this cadence without firing on normal speech (which
+                    // has no duplicates) or on natural endings (which
+                    // emit at most 2 in a row).  Gated to MTL because the
+                    // turbo codebook has a different cadence signature.
+                    if (is_mtl && generated.size() >= 3) {
+                        size_t n = generated.size();
+                        if (generated[n - 1] == generated[n - 2] &&
+                            generated[n - 2] == generated[n - 3]) {
+                            stopped_by_repetition = true;
+                            break;
+                        }
+                    }
                 }
 
                 if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
                     generated.pop_back();
+
+                if (stopped_by_repetition && params.verbose) {
+                    fprintf(stderr, "  [t3 segment %zu/%zu] stopped on 3x repeated token (%d) "
+                                    "at %zu tokens; MTL end-of-speech cadence\n",
+                            si + 1, N_SEG, generated.empty() ? -1 : generated.back(), generated.size());
+                }
 
                 if (generated.size() > best_generated.size()) best_generated = generated;
 
