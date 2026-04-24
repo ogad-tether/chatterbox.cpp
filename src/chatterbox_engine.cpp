@@ -18,6 +18,8 @@
 
 namespace tts_cpp::chatterbox {
 
+using namespace detail;
+
 namespace {
 
 int resolve_thread_count(int requested) {
@@ -277,10 +279,20 @@ struct Engine::Impl {
                 s3gen_prompt_feat_rows = rows;
             }
             if (s3gen_embedding.empty()) {
-                (void) compute_embedding_native(
-                    opts.reference_audio, opts.s3gen_gguf_path,
-                    s3gen_embedding,
-                    /*backend=*/ model.backend, opts.verbose);
+                if (!compute_embedding_native(
+                        opts.reference_audio, opts.s3gen_gguf_path,
+                        s3gen_embedding,
+                        /*backend=*/ model.backend, opts.verbose)) {
+                    // CAMPPlus tensors predate Phase 2d-a in this GGUF.
+                    // `compute_embedding_native` already logged the concrete
+                    // error to stderr; callers that want a hard failure can
+                    // re-run after re-exporting the S3Gen GGUF with a
+                    // current scripts/convert-s3gen-to-gguf.py.
+                    fprintf(stderr,
+                            "Engine: voice-cloning embedding unavailable; "
+                            "falling back to built-in speaker embedding for %s\n",
+                            opts.reference_audio.c_str());
+                }
             }
             if (s3gen_prompt_token.empty() && !prompt_token_from_ref.empty()) {
                 s3gen_prompt_token = std::move(prompt_token_from_ref);

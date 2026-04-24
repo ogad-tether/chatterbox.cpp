@@ -9,8 +9,11 @@
 // install rules) — it's part of the implementation, not the public
 // surface.  Public consumers should use <tts-cpp/chatterbox/engine.h>.
 //
-// Names stay in the global namespace to keep main.cpp's diff minimal
-// during the extraction (main.cpp had them as static globals/functions).
+// Everything lives in `tts_cpp::chatterbox::detail` so the library's
+// compiled object files do not export generic names like
+// `load_model_gguf` / `eval_prompt` / `g_log_verbose` into the global
+// linker namespace where they would collide with sibling ML libraries
+// (llama.cpp, whisper.cpp, stable-diffusion.cpp).
 
 #include <cstdint>
 #include <map>
@@ -21,6 +24,8 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+
+namespace tts_cpp::chatterbox::detail {
 
 constexpr int CHBX_MAX_NODES = 8192;
 
@@ -171,3 +176,5 @@ bool compute_speech_tokens_native(
     bool                   verbose);
 
 bool validate_reference_audio(const std::string & path);
+
+} // namespace tts_cpp::chatterbox::detail

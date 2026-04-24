@@ -34,6 +34,7 @@ find_package(OpenMP)
 
 set(TTS_CPP_LIB_SOURCES
     src/main.cpp
+    src/chatterbox_cli.cpp
     src/gpt2_bpe.cpp
     src/chatterbox_tts.cpp
     src/chatterbox_engine.cpp
@@ -56,6 +57,7 @@ if (TTS_CPP_BUILD_LIBRARY)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
     )
+    target_compile_features(tts-cpp PUBLIC cxx_std_17)
     target_link_libraries(tts-cpp PUBLIC ggml)
 
     if (OpenMP_CXX_FOUND)
@@ -85,7 +87,16 @@ if (TTS_CPP_BUILD_EXECUTABLES)
 
     add_executable(tts-cpp-cli src/cli_main.cpp)
     target_link_libraries(tts-cpp-cli PRIVATE tts-cpp)
-    set_target_properties(tts-cpp-cli PROPERTIES OUTPUT_NAME tts-cpp)
+    set_target_properties(tts-cpp-cli PROPERTIES OUTPUT_NAME chatterbox)
+
+    if (NOT WIN32)
+        add_custom_command(TARGET tts-cpp-cli POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                "$<TARGET_FILE_NAME:tts-cpp-cli>"
+                "$<TARGET_FILE_DIR:tts-cpp-cli>/tts-cpp"
+            VERBATIM
+        )
+    endif()
 
     add_executable(mel2wav src/mel2wav.cpp)
     target_link_libraries(mel2wav PRIVATE ggml)
@@ -167,18 +178,58 @@ if (TTS_CPP_BUILD_TESTS)
 endif()
 
 if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
-    install(TARGETS tts-cpp
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
-    install(DIRECTORY include/tts-cpp
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-        FILES_MATCHING PATTERN "*.h"
-    )
-    install(FILES
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tts-cppConfig.cmake
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tts-cppConfigVersion.cmake
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
-    )
+    if (TTS_CPP_USE_SYSTEM_GGML)
+        # Full install(EXPORT) flow.  Only reachable when `ggml` is an
+        # imported target from `find_package(ggml CONFIG REQUIRED)` — the
+        # standalone `add_subdirectory(ggml)` path would fail
+        # install(EXPORT) because its ggml target isn't in an export set.
+        include(CMakePackageConfigHelpers)
+
+        install(TARGETS tts-cpp
+            EXPORT tts-cppTargets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        )
+        install(DIRECTORY include/tts-cpp
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            FILES_MATCHING PATTERN "*.h"
+        )
+        install(EXPORT tts-cppTargets
+            FILE tts-cppTargets.cmake
+            NAMESPACE tts-cpp::
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+        )
+        configure_package_config_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tts-cppConfig.cmake.in
+            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfig.cmake
+            INSTALL_DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+        )
+        write_basic_package_version_file(
+            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfigVersion.cmake
+            VERSION ${PROJECT_VERSION}
+            COMPATIBILITY SameMinorVersion
+        )
+        install(FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfig.cmake
+            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfigVersion.cmake
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+        )
+    else()
+        # Standalone build: install the archive + headers, but skip the
+        # Config.cmake / Targets.cmake export set since the in-tree
+        # `ggml` target can't be exported without also exporting its
+        # whole subdirectory.  Downstream library-first consumers build
+        # with TTS_CPP_USE_SYSTEM_GGML=ON and get the full Config.cmake.
+        install(TARGETS tts-cpp
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+        install(DIRECTORY include/tts-cpp
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            FILES_MATCHING PATTERN "*.h"
+        )
+    endif()
 endif()
