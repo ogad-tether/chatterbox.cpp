@@ -1262,7 +1262,7 @@ static std::vector<int32_t> read_tokens_file(const std::string & path) {
 // s3gen GGUF) and writes a 24 kHz wav.
 // ============================================================================
 
-#include "s3gen_pipeline.h"
+#include "tts-cpp/chatterbox/s3gen_pipeline.h"
 
 int s3gen_synthesize_to_wav(
     const std::vector<int32_t> & speech_tokens,
@@ -1281,7 +1281,15 @@ int s3gen_synthesize_to_wav(
     // it can be disabled with `--verbose` unset.  Errors and machine-parseable
     // BENCH: lines stay unconditional below.
     auto vlog = [&](const char * fmt, auto... args) {
-        if (verbose) fprintf(stderr, fmt, args...);
+        if (!verbose) return;
+        // `fmt` is always a string literal at call sites but the compiler
+        // can't prove that through the variadic lambda.  Android NDK's
+        // default `-Werror=format-security` (together with `_FORTIFY_SOURCE=2`)
+        // then refuses to build unless we silence the warning locally.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+        fprintf(stderr, fmt, args...);
+#pragma GCC diagnostic pop
     };
 
     int n_threads = opts.n_threads;
@@ -1358,7 +1366,7 @@ int s3gen_synthesize_to_wav(
     // that: the lookahead will come from real speech tokens in the next
     // chunk, and we'll trim the 6 mel frames corresponding to the pre-
     // lookahead window right after CFM.
-    const int32_t S3GEN_SIL = 4299;
+    const int32_t S3GEN_SIL = tts_cpp::chatterbox::kS3GenSilenceToken;
     const int32_t VOCAB_SIZE = 6561;
     std::vector<int32_t> padded;
     for (int32_t t : speech_tokens) {
@@ -1851,4 +1859,8 @@ int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
         fprintf(stderr, "s3gen_preload: %s\n", e.what());
         return 1;
     }
+}
+
+void s3gen_unload() {
+    s3gen_model_cache_release();
 }

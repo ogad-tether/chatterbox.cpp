@@ -2028,3 +2028,79 @@ B2 (server mode) and C1 (custom Conformer attn op) are worth doing once a
 concrete deployment is pressuring for them; the CPU numbers are already
 well past real-time for CLI use, and the GPU numbers are at
 multi-x real-time with zero extra work.
+
+---
+
+## ggml extracted into a standalone vcpkg port (April 2026)
+
+Mirrors the shape `stable-diffusion.cpp` uses with its
+`SD_USE_SYSTEM_GGML` switch.  The standalone Chatterbox dev workflow
+(everything described above) is intentionally untouched.
+
+### What landed here (chatterbox.cpp side)
+
+- A single 13/-2-line additive edit to the top of [`CMakeLists.txt`](CMakeLists.txt):
+
+  ```cmake
+  option(TTS_CPP_USE_SYSTEM_GGML "tts-cpp: use system-installed GGML library" OFF)
+
+  if (NOT TARGET ggml)
+      if (TTS_CPP_USE_SYSTEM_GGML)
+          find_package(ggml CONFIG REQUIRED)
+          if (NOT ggml_FOUND)
+              message(FATAL_ERROR "System-installed GGML library not found.")
+          endif()
+          add_library(ggml ALIAS ggml::ggml)
+      else()
+          add_subdirectory(ggml)
+      endif()
+  endif()
+  ```
+
+  - Default `OFF` -> `add_subdirectory(ggml)`: pre-existing standalone
+    flow, byte-identical to before.
+  - `ON` (set by the `tts-cpp` vcpkg port at configure time): pulls
+    `ggml::ggml` from a separately-installed ggml package, ignores
+    the local `ggml/` tree.
+- `ggml/` and `patches/` directories are kept on the branch as-is.
+  `scripts/setup-ggml.sh` and `patches/ggml-metal-chatterbox-ops.patch`
+  remain the canonical reference for re-applying the Metal patch
+  against future ggml syncs.
+
+### What landed elsewhere (out-of-tree, but documented here for context)
+
+- An external `ggml` overlay port was published off ggml `master`
+  (same commit `stable-diffusion-cpp` builds against) with the same
+  Metal patch we ship under
+  [`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch)
+  applied as real source commits.  The patch file itself is retained
+  alongside the overlay as the source-of-truth artefact for
+  re-application against future ggml syncs.
+- A vcpkg registry now publishes:
+  - `ggml` — REPO/REF bumped to the overlay head carrying the Metal
+    chatterbox ops.  Backward compatible for `stable-diffusion-cpp` /
+    `whisper-cpp` (additive Metal kernels + opt-in fusion gated by
+    function constants).
+  - `tts-cpp` — REF bumped to the chatterbox.cpp commit that
+    introduces `TTS_CPP_USE_SYSTEM_GGML`; passes
+    `-DTTS_CPP_USE_SYSTEM_GGML=ON`; drops every `-DGGML_*` configure
+    option, the Android Vulkan-Headers download block, the
+    `GGML_VULKAN_DISABLE_COOPMAT*` knobs and the NDK glslc
+    detection — all of those now live inside the `ggml` port.
+    Declares an explicit `ggml` dependency with `metal`/`vulkan`
+    feature forwarding (mirrors `stable-diffusion-cpp/vcpkg.json`).
+
+### Validation
+
+- **chatterbox.cpp standalone** (Apple M4, Metal): clean configure +
+  build of every target with default `-DTTS_CPP_USE_SYSTEM_GGML=OFF`;
+  `test-metal-ops` parity-checks all four patched ops
+  (`diag_mask_inf`, `pad_ext` with `lp0..lp3`,
+  `conv_transpose_1d` at the three chatterbox upsample stages and the
+  tiny edge case); CLI smoke synth produces an 86 KB WAV in 3.2 s
+  (T3 642 ms / S3Gen 635 ms / 1.84 s audio, RTF 0.34).
+- **Downstream addon** (darwin-arm64, Metal): cold-cache vcpkg resolve
+  picks up both new ports, the addon links against `ggml::ggml` with
+  no further changes; unit suite 38/38, integration 4/4 (Whisper
+  round-trip 0.0% WER on *"How are you doing today?"*, native chunk
+  streaming emits 8 chunks, sentence streaming RTF 0.5448).
