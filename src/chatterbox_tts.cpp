@@ -37,6 +37,9 @@
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
+#ifdef GGML_USE_OPENCL
+#include "ggml-opencl.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -110,6 +113,26 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
                 fprintf(stderr, "s3gen: using Vulkan backend (device 0: %s)\n", desc);
             }
             return b;
+        }
+    }
+#endif
+#if defined(GGML_USE_OPENCL)
+    if (n_gpu_layers > 0) {
+        ggml_backend_reg_t ocl_reg = ggml_backend_opencl_reg();
+        if (ocl_reg && ggml_backend_reg_dev_count(ocl_reg) > 0) {
+            auto * b = ggml_backend_opencl_init();
+            if (b) {
+                if (verbose) {
+                    fprintf(stderr, "s3gen: using OpenCL backend\n");
+                }
+                return b;
+            }
+        } else if (verbose && ocl_reg) {
+            if (ggml_backend_reg_dev_count(ocl_reg) == 0) {
+                fprintf(stderr, "s3gen: no OpenCL device; using CPU\n");
+            } else {
+                fprintf(stderr, "s3gen: OpenCL init failed; using CPU\n");
+            }
         }
     }
 #endif
