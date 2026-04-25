@@ -97,6 +97,7 @@ struct Engine::Impl {
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) {
             wait_for_preload(s3gen_preload_thread);
+            s3gen_unload();
             free_model();
             throw std::runtime_error("Engine: ggml_gallocr_new failed");
         }
