@@ -16,7 +16,7 @@
 //     EngineOptions opts;
 //     opts.t3_gguf_path    = "models/chatterbox-t3-turbo.gguf";
 //     opts.s3gen_gguf_path = "models/chatterbox-s3gen.gguf";
-//     opts.n_gpu_layers    = 99;                          // Metal/CUDA/Vulkan
+//     opts.n_gpu_layers    = 99;                          // Metal/CUDA/Vulkan/OpenCL
 //     opts.reference_audio = "voices/alice.wav";          // optional
 //
 //     Engine engine(opts);
@@ -58,7 +58,7 @@ struct EngineOptions {
     //                    every synthesize() call.
     //
     //   voice_dir:       path to a directory of pre-baked .npy tensors
-    //                    (the layout produced by `tts-cpp --save-voice`).
+    //                    (the layout produced by `tts-cli --save-voice`).
     //                    Faster to load than reference_audio.  When both
     //                    are provided, reference_audio takes precedence for
     //                    any tensor missing from voice_dir.
@@ -66,8 +66,8 @@ struct EngineOptions {
     std::string voice_dir;
 
     // Backend selection.  n_gpu_layers > 0 enables the first available
-    // GPU backend (CUDA → Metal → Vulkan in build-order), falling back to
-    // the CPU backend when none is compiled in or initialisation fails.
+    // GPU backend (CUDA → Metal → Vulkan → OpenCL in build order), falling
+    // back to the CPU backend when none is compiled in or initialisation fails.
     // The exact per-layer split is not used today; any positive value
     // moves the whole model to the GPU.
     int n_gpu_layers = 0;

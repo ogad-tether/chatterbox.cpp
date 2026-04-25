@@ -32,7 +32,7 @@ extraction via STFT matmul, legacy Q4/Q5/Q8 quantization, etc.).
        │                                                        ▲
        ▼                                                        │
   ┌────────────────────────────────────────────────────────────────┐
-  │                       chatterbox                               │
+  │                        tts-cli                                 │
   │                                                                │
   │   T3 (GPT-2 Medium)  ──►  S3Gen encoder  ──►  CFM (meanflow)   │
   │   text → speech toks      speech toks → h      h → mel         │
@@ -103,7 +103,7 @@ This produces the main binary plus a set of per-stage validation harnesses:
 
 | Binary | What it does |
 |--------|--------------|
-| `build/chatterbox`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Also handles voice cloning via `--reference-audio`. |
+| `build/tts-cli`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Also handles voice cloning via `--reference-audio`. |
 | `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
 | `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
 | `build/test-resample`         | Round-trip SNR of the C++ Kaiser-windowed sinc resampler |
@@ -115,7 +115,7 @@ This produces the main binary plus a set of per-stage validation harnesses:
 | `build/test-s3tokenizer`      | S3TokenizerV2 log-mel + speech-token parity |
 | `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
 
-You'll normally only need `build/chatterbox`; the `test-*` binaries are
+You'll normally only need `build/tts-cli`; the `test-*` binaries are
 there for the staged-verification methodology in `PROGRESS.md`.
 
 ### Alternative: consume ggml from vcpkg (`TTS_CPP_USE_SYSTEM_GGML`)
@@ -240,10 +240,10 @@ source dtype to keep numerics clean.  That's why Q4_0 ends up only
 ~15 % smaller than Q8_0 rather than 2× smaller; the bulk not covered
 by block quantization dominates.
 
-Pass the quantized GGUFs to `chatterbox` exactly like the defaults:
+Pass the quantized GGUFs to `tts-cli` exactly like the defaults:
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
   --model      models/t3-q8_0.gguf \
   --s3gen-gguf models/chatterbox-s3gen-q8_0.gguf \
   --text "Hello from the quantized port." \
@@ -261,7 +261,7 @@ The easiest way:
 That's equivalent to running the binary directly:
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
   --model       models/chatterbox-t3-turbo.gguf \
   --s3gen-gguf  models/chatterbox-s3gen.gguf \
   --text        "Hello from native C plus plus." \
@@ -287,7 +287,7 @@ Advanced modes:
   (no Python, no preprocessing step):
 
   ```bash
-  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
                      --s3gen-gguf models/chatterbox-s3gen.gguf \
                      --reference-audio me.wav \
                      --text "Hello in my voice." \
@@ -344,7 +344,7 @@ Advanced modes:
 
   ```bash
   # Bake the profile (no --text needed; just preprocesses + saves).
-  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
                      --s3gen-gguf models/chatterbox-s3gen.gguf \
                      --reference-audio me.wav \
                      --save-voice voices/me/
@@ -353,7 +353,7 @@ Advanced modes:
 
   # Reuse (≈ 17× faster; VoiceEncoder / CAMPPlus / S3TokenizerV2
   # / mel extraction are all skipped).
-  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
                      --s3gen-gguf models/chatterbox-s3gen.gguf \
                      --ref-dir voices/me/ \
                      --text "Anything you want." \
@@ -382,9 +382,9 @@ sentence terminators (or `\n` in `--input-by-line` mode), and pipes
 raw PCM (s16le, 24 kHz, mono) to stdout chunk-by-chunk.
 
 ```bash
-# Two-process demo: background writer appends sentences, chatterbox
+# Two-process demo: background writer appends sentences, tts-cli
 # tail-follows, sox plays in real time.
-./build/chatterbox \
+./build/tts-cli \
     --model       models/t3-q8_0.gguf \
     --s3gen-gguf  models/chatterbox-s3gen-q8_0.gguf \
     --ref-dir     voices/alice \
@@ -405,7 +405,7 @@ stdin.  On a terminal you get a `> ` prompt; each Enter-terminated
 line is spoken immediately, Ctrl-D exits:
 
 ```bash
-./build/chatterbox \
+./build/tts-cli \
     --model       models/t3-q8_0.gguf \
     --s3gen-gguf  models/chatterbox-s3gen-q8_0.gguf \
     --ref-dir     voices/alice \
@@ -513,7 +513,7 @@ remaining end-to-end gap comes from.
 
 ```bash
 # Build chatterbox.cpp, then:
-./build/chatterbox \
+./build/tts-cli \
     --model       models/chatterbox-t3-turbo.gguf \
     --s3gen-gguf  models/chatterbox-s3gen.gguf \
     --reference-audio test/reference-audio/jfk.wav \
@@ -565,7 +565,7 @@ Any non-zero `--stream-chunk-tokens N` turns streaming on.
 ```bash
 brew install sox      # one-time, for the `play` command
 
-./build/chatterbox \
+./build/tts-cli \
     --model      models/chatterbox-t3-turbo.gguf \
     --s3gen-gguf models/chatterbox-s3gen.gguf \
     --text       "Hello from streaming Chatterbox." \
@@ -587,7 +587,7 @@ default.
 You can also drop the `--out -` to get a regular wav:
 
 ```bash
-./build/chatterbox … --stream-chunk-tokens 50 --out out.wav
+./build/tts-cli … --stream-chunk-tokens 50 --out out.wav
 afplay out.wav
 ```
 
@@ -651,7 +651,7 @@ For T3 bit-exact validation against the Python reference:
 python scripts/reference-t3-turbo.py \
   --text "Hello from ggml." \
   --out-dir artifacts \
-  --cpp-bin ./build/chatterbox \
+  --cpp-bin ./build/tts-cli \
   --cpp-model models/chatterbox-t3-turbo.gguf
 ```
 
@@ -663,8 +663,9 @@ chatterbox.cpp/
                                    by scripts/setup-ggml.sh, or skipped entirely
                                    when building with -DTTS_CPP_USE_SYSTEM_GGML=ON)
   src/
-    main.cpp                     CLI + T3 runtime            (chatterbox)
-    chatterbox_tts.cpp           S3Gen + HiFT pipeline       (linked into chatterbox)
+    main.cpp                     T3 runtime + shared helpers  (libtts-cpp)
+    chatterbox_cli.cpp           CLI entry (`tts-cli` binary)
+    chatterbox_tts.cpp           S3Gen + HiFT pipeline        (libtts-cpp)
     s3gen_pipeline.h             public API for the S3Gen+HiFT back half
     mel2wav.cpp                  HiFT-only demo              (mel2wav)
     gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer

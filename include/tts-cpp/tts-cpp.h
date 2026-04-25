@@ -15,7 +15,7 @@
 //      public API will land as the code is split out of src/main.cpp.
 //      Until then, callers building against the library can invoke
 //      `tts_cpp_cli_main(argc, argv)` with the same flags accepted by the
-//      `tts-cpp` executable.
+//      `tts-cli` executable.
 //
 //   2. Lower-level per-engine APIs, e.g. the Chatterbox S3Gen + HiFT
 //      back-half in <tts-cpp/chatterbox/s3gen_pipeline.h>.

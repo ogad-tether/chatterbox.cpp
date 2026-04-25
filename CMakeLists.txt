@@ -13,7 +13,7 @@ else()
 endif()
 
 option(TTS_CPP_BUILD_LIBRARY     "tts-cpp: build the static tts-cpp library"                 ON)
-option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build the tts-cpp CLI + mel2wav demo"             ${TTS_CPP_STANDALONE_DEFAULT})
+option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build the tts-cli executable + mel2wav demo"     ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
 option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use system-installed GGML library"                OFF)
@@ -73,6 +73,9 @@ if (TTS_CPP_BUILD_LIBRARY)
     if (GGML_VULKAN)
         target_compile_definitions(tts-cpp PRIVATE GGML_USE_VULKAN)
     endif()
+    if (GGML_OPENCL)
+        target_compile_definitions(tts-cpp PRIVATE GGML_USE_OPENCL)
+    endif()
 
     set_target_properties(tts-cpp PROPERTIES
         POSITION_INDEPENDENT_CODE ON
@@ -85,18 +88,8 @@ if (TTS_CPP_BUILD_EXECUTABLES)
         message(FATAL_ERROR "TTS_CPP_BUILD_EXECUTABLES requires TTS_CPP_BUILD_LIBRARY=ON")
     endif()
 
-    add_executable(tts-cpp-cli src/cli_main.cpp)
-    target_link_libraries(tts-cpp-cli PRIVATE tts-cpp)
-    set_target_properties(tts-cpp-cli PROPERTIES OUTPUT_NAME chatterbox)
-
-    if (NOT WIN32)
-        add_custom_command(TARGET tts-cpp-cli POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E create_symlink
-                "$<TARGET_FILE_NAME:tts-cpp-cli>"
-                "$<TARGET_FILE_DIR:tts-cpp-cli>/tts-cpp"
-            VERBATIM
-        )
-    endif()
+    add_executable(tts-cli src/cli_main.cpp)
+    target_link_libraries(tts-cli PRIVATE tts-cpp)
 
     add_executable(mel2wav src/mel2wav.cpp)
     target_link_libraries(mel2wav PRIVATE ggml)
