@@ -331,6 +331,10 @@ struct cli_params {
     float   top_p          = 0.95f;
     float   temp           = 0.8f;
     float   repeat_penalty = 1.2f;
+    // Optional: override CFM Euler step count for batch synthesis.  Defaults
+    // to 2 (matches Python's meanflow); setting 1 lowers latency with a small
+    // quality trade-off.
+    int32_t cfm_steps      = 0;
 
     // Streaming synthesis (PROGRESS.md B1).  When > 0, speech tokens from
     // T3 are fed to S3Gen+HiFT in chunks of this size, with `cache_source`
@@ -440,6 +444,9 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --top-p P               (default: 0.95)\n");
     fprintf(stderr, "  --temp T                (default: 0.8)\n");
     fprintf(stderr, "  --repeat-penalty R      (default: 1.2)\n");
+    fprintf(stderr, "  --cfm-steps N           CFM Euler step count for batch synthesis.\n");
+    fprintf(stderr, "                          Python uses 2; 1 is faster but slightly noisier.\n");
+    fprintf(stderr, "                          (default: 0 = 2)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --stream-chunk-tokens N Synthesize the wav in streaming chunks of N speech\n");
     fprintf(stderr, "                          tokens each (~1 s audio per 25-token chunk).  With\n");
@@ -544,6 +551,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--top-p")          { if (!parse_float("--top-p",          params.top_p))          return false; }
         else if (arg == "--temp")           { if (!parse_float("--temp",           params.temp))           return false; }
         else if (arg == "--repeat-penalty") { if (!parse_float("--repeat-penalty", params.repeat_penalty)) return false; }
+        else if (arg == "--cfm-steps")      { if (!parse_int  ("--cfm-steps",      params.cfm_steps))      return false; }
         else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
         else if (arg == "--crossfade-ms")   { if (!parse_int("--crossfade-ms",   params.crossfade_ms))   return false; }
@@ -780,6 +788,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            opts.cfm_steps       = params.cfm_steps;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1040,6 +1049,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            opts.cfm_steps       = params.cfm_steps;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1345,7 +1355,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     std::vector<float> tail_out;
                     copts.hift_source_tail_out     = &tail_out;
                     copts.source_tail_samples      = 480;
-                    copts.cfm_steps                = params.stream_cfm_steps;
+                    copts.cfm_steps                = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
 
                     int rc = s3gen_synthesize_to_wav(toks, copts);
                     if (rc != 0) return rc;
@@ -1721,6 +1731,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            opts.cfm_steps       = params.cfm_steps;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1918,7 +1929,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         std::vector<float> tail_out;
                         copts.hift_source_tail_out      = &tail_out;
                         copts.source_tail_samples       = 480;
-                        copts.cfm_steps                 = params.stream_cfm_steps;
+                        copts.cfm_steps                 = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
 
                         ++global_chunk_idx;
                         if (params.verbose) {
