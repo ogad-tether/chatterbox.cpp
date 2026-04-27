@@ -213,7 +213,7 @@ python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3
 
 # --- Multilingual, quantised (recommended for speed) ---
 # Matches the RTF numbers in the benchmark table above.  --quant accepts
-# {f32,f16,q8_0,q5_0,q4_0} on convert-s3gen-to-gguf.py (default f32) and
+# {f32,f16,q8_0,q5_0,q4_0} on convert-s3gen-to-gguf.py (default f16) and
 # {f16,q8_0,q5_0,q4_0} on convert-t3-mtl-to-gguf.py (default f16, since
 # the T3 storage baseline is already F16).  The flag controls the large
 # matmul weights only — biases, LayerNorm gammas/betas, embedding tables,

@@ -2,6 +2,17 @@
 """Generate NFKD + lowercase + canonical-combining-class tables for
 src/mtl_unicode_tables.inc.
 
+NFKD = Normalization Form KD (Compatibility Decomposition): the Unicode
+normalization that splits each character into its compatibility-equivalent
+sequence of base letter + combining marks, then orders the marks by
+canonical combining class.  For example "ñ" (U+00F1) decomposes to
+"n" (U+006E) + "˜" (U+0303), and the ligature "ﬁ" (U+FB01) decomposes to
+"f" (U+0066) + "i" (U+0069).  The MTL grapheme tokenizer uses NFKD so
+accented or precomposed characters in the input always tokenize to the
+same underlying letter sequence the model was trained on, regardless of
+how the source text encoded them.  See Unicode Annex #15 for the full
+definition.
+
 Run once and commit the output. Covers tier-1 language characters:
 Latin-1 Supplement, Latin Extended A/B/Additional, IPA Extensions,
 Spacing Modifier Letters, Combining Diacritics, Greek, Greek Extended,

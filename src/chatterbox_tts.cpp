@@ -962,9 +962,8 @@ static std::vector<float> cfm_estimator_forward(
     }
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
-    if (!build_graph) goto compute_only;  // skip graph build, just update inputs and recompute
 
-    {
+    if (build_graph) {
 
     ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(x_in, "x_in"); ggml_set_input(x_in);
     ggml_tensor * mu_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(mu_in, "mu_in"); ggml_set_input(mu_in);
@@ -1033,7 +1032,6 @@ static std::vector<float> cfm_estimator_forward(
     // dispatch elsewhere in the pipeline (e.g. during T3→S3Gen transition)
     // so it overlaps with other host work, which is a bigger refactor.
 
-compute_only:
     ggml_gallocr_alloc_graph(cache.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x.data(), 0, x.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mu_in"), mu.data(), 0, mu.size()*sizeof(float));
@@ -1088,9 +1086,8 @@ static void cfm_estimator_forward_b2(
     }
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
-    if (!build_graph) goto compute_only_b2;
 
-    {
+    if (build_graph) {
 
     ggml_tensor * x_in    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(x_in, "x_in");       ggml_set_input(x_in);
     ggml_tensor * mu_in   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(mu_in, "mu_in");     ggml_set_input(mu_in);
@@ -1148,7 +1145,6 @@ static void cfm_estimator_forward_b2(
     ggml_gallocr_reserve(cache.allocr, gf);
     }
 
-compute_only_b2:
     ggml_gallocr_alloc_graph(cache.allocr, gf);
 
     // Stage inputs: cond slice [0, T*MEL), uncond slice [T*MEL, 2*T*MEL).

@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--quant",
         choices=QUANT_CHOICES,
-        default="f32",
+        default="f16",
         help=(
             "Target format for the big matmul weights (encoder Linears, "
             "CFM attn/FF Linears, HiFT Conv1d weights, CAMPPlus/S3TokenizerV2). "
@@ -113,8 +113,8 @@ def parse_args() -> argparse.Namespace:
             "benefit even at q8_0/q5_0/q4_0. q8_0/q5_0/q4_0 follow the same "
             "deny-list as scripts/requantize-gguf.py (no quant on "
             "flow/input_embedding, campplus, s3tokv2, builtins, mel "
-            "filterbanks, norms/biases). Default f32 reproduces the "
-            "pre-optimisation GGUF byte-for-byte."
+            "filterbanks, norms/biases). Default f16 stores all float "
+            "weights as F32 in GGUF (the pre-multilingual baseline)."
         ),
     )
     args = ap.parse_args()
@@ -560,16 +560,6 @@ def main():
         print(f"  --quant {args.quant}: {qstats['n_quant']} tensors block-quantized "
               f"(policy matches scripts/requantize-gguf.py; embeddings, voice encoders, "
               f"norms/biases, and filterbanks kept at full precision)")
-    elif args.quant == "f32":
-        # Note: this default changed during the multilingual merge (the
-        # pre-merge main converter defaulted to --quant f16).  Surface the
-        # change so users running the converter without --quant in CI / build
-        # pipelines notice the size jump and can opt back in to a smaller
-        # GGUF if they want.
-        print(f"  --quant f32 is the default.  Pass --quant q4_0 (or run "
-              f"scripts/requantize-gguf.py {args.out} <out>.gguf q4_0) to get a "
-              f"~3x smaller, ~2x faster GGUF on bandwidth-bound backends.",
-              file=sys.stderr)
 
 
 if __name__ == "__main__":
