@@ -54,7 +54,9 @@ breakdown, or [`PROGRESS.md`](PROGRESS.md) for the full chronological
 development journal — every numerical-parity stage and optimization pass
 (T3 Flash Attention, KV-cache layout rework, Metal kernel patches,
 CAMPPlus + VoiceEncoder + S3TokenizerV2 ported to ggml graphs, mel
-extraction via STFT matmul, legacy Q4/Q5/Q8 quantization, etc.).
+extraction via STFT matmul, T3 Q4/Q5/Q8 quantization, the multilingual
+Llama-520M port + CFG dual-cache (§3.19), and the shared S3Gen weight-
+quantisation pass that ships in this repo (§3.20)).
 
 ---
 
@@ -65,17 +67,28 @@ extraction via STFT matmul, legacy Q4/Q5/Q8 quantization, etc.).
        │                                                        ▲
        ▼                                                        │
   ┌────────────────────────────────────────────────────────────────┐
-  │                        tts-cli                                 │
+  │                       tts-cli (libtts-cpp)                     │
   │                                                                │
-  │   T3 (GPT-2 Medium)  ──►  S3Gen encoder  ──►  CFM (meanflow)   │
-  │   text → speech toks      speech toks → h      h → mel         │
+  │      T3      ──►   S3Gen encoder   ──►        CFM              │
+  │  text → toks       toks → h                   h → mel          │
   │                                                                │
-  │                          HiFT vocoder  ──►  24 kHz wav         │
+  │                         HiFT vocoder  ──►  24 kHz wav          │
   └────────────────────────────────────────────────────────────────┘
        ▲                                              ▲
-   BPE tokenizer                               reference voice
+   text tokenizer                              reference voice
    (embedded in T3 GGUF metadata)              (embedded in S3Gen GGUF)
 ```
+
+`tts-cli` (and the back-compat `chatterbox` binary, same code) handles
+**both** Chatterbox variants — the runtime auto-detects the variant
+from `chatterbox.variant` GGUF metadata and dispatches:
+
+| Stage         | Turbo                                      | Multilingual                                        |
+|---------------|--------------------------------------------|-----------------------------------------------------|
+| Tokenizer     | GPT-2 byte-level BPE (English)             | HuggingFace `tokenizers.json` (23 langs, NFKD pre)  |
+| T3 backbone   | GPT-2 Medium, 24 layers, single forward    | Llama-520M, 30 layers, CFG cond+uncond per token    |
+| CFM solver    | Meanflow, 2 Euler steps                    | Standard, 10 Euler steps with `cfg_rate=0.7`        |
+| HiFT vocoder  | shared (same checkpoint format)            | shared (same checkpoint format)                     |
 
 One binary, one invocation, end to end — `scripts/synthesize.sh` is a
 thin convenience wrapper that fills in the two GGUF paths.
@@ -135,11 +148,13 @@ Linux/Windows with a Vulkan loader, `-DGGML_OPENCL=ON` for OpenCL
 runtime to actually use the GPU. See `patches/README.md` for what the
 patches do and why.
 
-This produces the main binary plus a set of per-stage validation harnesses:
+This produces the end-to-end binary, a back-compat alias of the same
+code, and a set of per-stage validation harnesses:
 
 | Binary | What it does |
 |--------|--------------|
-| `build/tts-cli`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Also handles voice cloning via `--reference-audio`. |
+| `build/tts-cli`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Handles voice cloning via `--reference-audio`, autodetects Turbo vs Multilingual from the T3 GGUF. |
+| `build/chatterbox`         | Identical second binary kept for backward compatibility with pre-rename scripts; same source as `tts-cli`. |
 | `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
 | `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
 | `build/test-resample`         | Round-trip SNR of the C++ Kaiser-windowed sinc resampler |
@@ -149,6 +164,10 @@ This produces the main binary plus a set of per-stage validation harnesses:
 | `build/test-campplus`         | CAMPPlus 192-d embedding parity |
 | `build/test-voice-embedding`  | wav → fbank → CAMPPlus end-to-end parity |
 | `build/test-s3tokenizer`      | S3TokenizerV2 log-mel + speech-token parity |
+| `build/test-streaming`        | Per-chunk CFM + HiFT parity for the streaming pipeline (B1) |
+| `build/test-mtl-tokenizer`    | Multilingual grapheme tokenizer parity vs the HF reference |
+| `build/test-t3-mtl`           | End-to-end MTL T3 (Llama-520M) forward-pass parity |
+| `build/test-t3-mtl-stages`    | Staged MTL T3 parity (cond/text/inputs/layers/head) |
 | `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
 
 You'll normally only need `build/tts-cli`; the `test-*` binaries are
@@ -194,9 +213,10 @@ python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3
 
 # --- Multilingual, quantised (recommended for speed) ---
 # Matches the RTF numbers in the benchmark table above.  Both converters
-# accept --quant {f32,f16,q8_0,q4_0}; the flag controls the large matmul
-# weights only, biases/LayerNorm/embedding tables always stay F32 for
-# precision.
+# accept --quant {f32,f16,q8_0,q5_0,q4_0}; the flag controls the large
+# matmul weights only — biases, LayerNorm gammas/betas, and embedding
+# tables always stay full precision (see the deny-list in
+# scripts/requantize-gguf.py for the exact policy).
 python scripts/convert-t3-mtl-to-gguf.py --quant q4_0 \
        --out models/chatterbox-t3-mtl-q4_0.gguf
 python scripts/convert-s3gen-to-gguf.py  --variant mtl --quant q4_0 \
@@ -214,10 +234,13 @@ need to keep the source tokenizer files around on disk.
 The quantisation flag on `convert-s3gen-to-gguf.py` is new as of §3.20 —
 it's pure data-format work, so the binary needs no changes and every
 backend (CPU, Metal, Vulkan, CUDA) picks up the faster matmul kernels
-transparently.  Safety rules inside the converter force biases, LN
-gammas/betas, and conv kernels (rank-3) to stay F32 regardless of
-`--quant`; see `PROGRESS.md §3.20` for the full storage-format table
-and fallback chain.
+transparently.  The per-tensor decision lives in `should_quantize()`
+inside `scripts/requantize-gguf.py` (single source of truth shared
+with the offline rewriter): biases, norm scales, embedding tables,
+spectral filterbanks, voice-cloning preprocessors (CAMPPlus,
+VoiceEncoder, S3TokenizerV2) and any tensor whose reduction dim isn't
+block-aligned all stay at full precision.  See `PROGRESS.md §3.20` for
+the full deny-list and resulting size / speed numbers.
 
 You should now have (either pair is usable on its own):
 
@@ -255,11 +278,13 @@ python scripts/dump-s3gen-reference.py \
 
 ### Optional: quantize the models (smaller + faster)
 
-Both GGUFs can be quantized to `Q8_0` (near-lossless) or `Q4_0`
-(different CFM sample but same subjective quality, smaller).
-`llama-quantize` doesn't recognize the `chatterbox` / `chatterbox-s3gen`
-custom architectures, so we ship a small standalone rewriter that
-works on either model:
+Both GGUFs can be quantized to `Q8_0` (near-lossless), `Q5_0`, or
+`Q4_0` (different CFM sample but same subjective quality, smaller).
+The same machinery works on the multilingual GGUFs too — the
+benchmark numbers at the top of this README use the q4_0 variants
+shown there.  `llama-quantize` doesn't recognize the `chatterbox` /
+`chatterbox-s3gen` custom architectures, so we ship a small standalone
+rewriter that works on any of the four GGUFs:
 
 ```bash
 # T3
@@ -803,20 +828,31 @@ chatterbox.cpp/
   ggml/                          pristine ggml clone (not tracked; populated
                                    by scripts/setup-ggml.sh, or skipped entirely
                                    when building with -DTTS_CPP_USE_SYSTEM_GGML=ON)
+  include/tts-cpp/               installed public headers (Engine API)
+    tts-cpp.h                    library entry; declares tts_cpp_cli_main()
+    chatterbox/engine.h          Engine + EngineOptions (text → wav)
+    chatterbox/s3gen_pipeline.h  low-level S3Gen + HiFT pipeline entries
   src/
-    main.cpp                     T3 runtime + shared helpers  (libtts-cpp)
-    chatterbox_cli.cpp           CLI entry (`tts-cli` binary)
+    main.cpp                     T3 turbo runtime + shared helpers (libtts-cpp)
+    t3_mtl.{h,cpp}               T3 multilingual (Llama-520M) runtime + stage builders
+    chatterbox_t3_internal.h     internal T3 declarations shared by main/engine/CLI
+    chatterbox_engine.cpp        public Engine API impl (libtts-cpp)
+    chatterbox_cli.cpp           CLI entry (`tts-cli` + `chatterbox` binaries)
+    cli_main.cpp                 thin int-main forwarder; calls tts_cpp_cli_main()
     chatterbox_tts.cpp           S3Gen + HiFT pipeline        (libtts-cpp)
-    s3gen_pipeline.h             public API for the S3Gen+HiFT back half
     mel2wav.cpp                  HiFT-only demo              (mel2wav)
-    gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer
+    gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer (Turbo)
+    mtl_tokenizer.{h,cpp}        multilingual grapheme tokenizer
+                                   (HF tokenizers.json + NFKD lowercasing)
+    mtl_unicode_tables.inc       embedded NFKD + Korean Jamo lookup tables
 
     voice_features.{h,cpp}       WAV I/O, sinc resampler, LUFS meter,
                                    24 kHz & 16 kHz log-mel extraction,
                                    Kaldi-style 80-ch fbank
+    mel_extract_stft.cpp         STFT-based mel extraction shared by C++ pipelines
     voice_encoder.{h,cpp}        3-layer LSTM → 256-d speaker_emb
                                    (matches Resemble VoiceEncoder)
-    campplus.{h,cpp}              FunASR x-vector port (FCM + 3× CAMDense
+    campplus.{h,cpp}             FunASR x-vector port (FCM + 3× CAMDense
                                    TDNN) → 192-d embedding
     s3tokenizer.{h,cpp}          6-layer FSMN-attn transformer + FSQ →
                                    25-Hz speech tokens
@@ -824,15 +860,26 @@ chatterbox.cpp/
     npy.h                        minimal .npy load / save + compare
 
     test_*.cpp                   per-stage numerical-parity harnesses
+                                   (S3Gen / HiFT / streaming / MTL T3 /
+                                    MTL tokenizer / voice features / Metal ops)
   scripts/
-    synthesize.sh                text → wav wrapper
-    convert-t3-turbo-to-gguf.py  T3 weights + tokenizer + VE + builtin
-                                   voice → T3 GGUF
+    setup-ggml.sh                clones the pinned ggml commit + applies patches
+    synthesize.sh                text → wav wrapper around tts-cli
+    convert-t3-turbo-to-gguf.py  Turbo T3 weights + GPT-2 BPE + VE + builtin
+                                   voice → T3 GGUF (--quant)
+    convert-t3-mtl-to-gguf.py    MTL T3 (Llama-520M) + perceiver + emotion-adv
+                                   + tokenizers.json + builtin voice → T3 GGUF (--quant)
     convert-s3gen-to-gguf.py     S3Gen encoder + CFM + HiFT + CAMPPlus +
-                                   S3TokenizerV2 + mel filterbanks →
-                                   S3Gen GGUF
+                                   S3TokenizerV2 + mel filterbanks → S3Gen GGUF
+                                   (--variant {turbo,mtl}, --quant)
+    requantize-gguf.py           in-place block-quantise of an existing
+                                   T3/S3Gen GGUF (canonical deny-list lives here)
+    extract-voice.py             one-shot voice-clone prep (silencedetect +
+                                   codec-aware EQ + optional `--save-voice` bake)
+    gen-nfkd-table.py            generates src/mtl_unicode_tables.inc
     dump-*-reference.py          PyTorch → .npy intermediates for the
-                                   per-stage harnesses
+                                   per-stage harnesses (S3Gen, CAMPPlus,
+                                   S3TokenizerV2, streaming, MTL T3)
     reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
   patches/
