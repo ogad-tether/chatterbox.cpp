@@ -61,6 +61,8 @@ chatterbox.cpp/
     ggml-metal-chatterbox-ops.patch   Metal op fixes: diag_mask_inf, pad_ext,
                                       faster conv_transpose_1d (applied to ggml/
                                       during setup; see patches/README.md)
+    ggml-opencl-chatterbox-ops.patch  OpenCL/Adreno fixes: missing HiFT/S3Gen
+                                      ops + conv_transpose_1d speedup
     README.md                         why each patch exists + how to drop it
   src/
     main.cpp                      T3 runtime + shared helpers (libtts-cpp; tts-cli links this)
@@ -2104,3 +2106,87 @@ Mirrors the shape `stable-diffusion.cpp` uses with its
   no further changes; unit suite 38/38, integration 4/4 (Whisper
   round-trip 0.0% WER on *"How are you doing today?"*, native chunk
   streaming emits 8 chunks, sentence streaming RTF 0.5448).
+
+---
+
+## OpenCL / Adreno bring-up (April 2026)
+
+Target: **Termux on Snapdragon / Adreno 830** using `GGML_OPENCL=ON`, with
+`LD_LIBRARY_PATH` including `/data/data/com.termux/files/home/lib` so the
+OpenCL loader and ggml DSOs resolve.
+
+### What was missing
+
+The first OpenCL smoke runs only offloaded T3; S3Gen/HiFT still had to stay
+on CPU because ggml-opencl rejected missing ops during graph execution.  The
+sequence of blockers observed on-device was:
+
+1. `CONV_TRANSPOSE_1D` in HiFT.
+2. `SIN` / `COS` in HiFT's oscillator / phase path.
+3. `LEAKY_RELU` in the S3Gen encoder.
+4. `UNARY(ELU)` and `ABS` in the f0 predictor.
+
+### What landed
+
+- Added `GGML_USE_OPENCL` wiring to the C++ side (`init_backend` for T3 and
+  `s3gen_init_backend` for S3Gen/HiFT), so `--n-gpu-layers > 0` actually
+  attempts `ggml_backend_opencl_init()` before CPU fallback.
+- Added `patches/ggml-opencl-chatterbox-ops.patch` and updated
+  `scripts/setup-ggml.sh` so a fresh `ggml/` checkout is reset to the pinned
+  commit and receives **both** the Metal and OpenCL patches.
+- Extended ggml-opencl with the missing ops:
+  - `GGML_OP_CONV_TRANSPOSE_1D` (`f32` and `f16` kernel / `f32` input paths).
+  - `GGML_OP_SIN`, `GGML_OP_COS`.
+  - `GGML_OP_LEAKY_RELU`.
+  - `GGML_UNARY_OP_ABS`, `GGML_UNARY_OP_ELU` (`f32` paths used by f0).
+- Optimized the first `CONV_TRANSPOSE_1D` OpenCL kernel: instead of scanning
+  every input position and discarding almost all of them, each output sample
+  now computes the exact input index range that can contribute.
+- Exposed `--cfm-steps N` for normal batch synthesis (previously only the
+  streaming path had `--stream-cfm-steps`).  Default remains 2 for Python-like
+  meanflow quality; `--cfm-steps 1` is the lower-latency mode.
+
+### Validation
+
+Remote build:
+
+```bash
+cd /data/data/com.termux/files/home/qvac-chatterbox.cpp
+git pull --ff-only
+./scripts/setup-ggml.sh
+cmake -S . -B build-opencl -DCMAKE_BUILD_TYPE=Release -DGGML_OPENCL=ON
+cmake --build build-opencl -j$(nproc) --target tts-cli
+```
+
+Runtime command:
+
+```bash
+export LD_LIBRARY_PATH="/data/data/com.termux/files/home/lib:${LD_LIBRARY_PATH:-}"
+./build-opencl/tts-cli \
+  --model /data/data/com.termux/files/home/chatterbox.cpp/models/chatterbox-t3-turbo.gguf \
+  --s3gen-gguf /data/data/com.termux/files/home/chatterbox.cpp/models/chatterbox-s3gen.gguf \
+  --text "Hello" --n-gpu-layers 99 --verbose --out test-gpu.wav
+```
+
+OpenCL now runs end-to-end and writes a WAV:
+
+```text
+init_backend: using OpenCL backend
+[encoder]      ~167 ms
+[cfm_total]    ~921 ms   (2-step default)
+[f0_predictor] ~6 ms
+[hift_decode]  ~217-222 ms after conv_transpose_1d range tightening
+S3GEN_INFER_MS ~1396-1450 for 800 ms audio (RTF ~1.74-1.81)
+T3_INFER_MS    ~772-846
+```
+
+Full generated-audio RTF on the short "Hello" smoke test:
+
+| Mode | T3 infer | S3Gen+HiFT infer | Audio | Full RTF |
+|------|---------:|-----------------:|------:|---------:|
+| default 2-step CFM | ~772 ms | ~1396 ms | 800 ms | ~2.71 |
+| `--cfm-steps 1` | ~772 ms | ~887 ms | 800 ms | ~2.07 |
+
+The 1-step mode is deliberately opt-in because it trades some meanflow
+quality for latency; it is useful for interactive/mobile experiments where
+CFM dominates the wall clock.
