@@ -838,10 +838,10 @@ index 00000000..5b38fd57
 +}
 diff --git a/src/ggml-opencl/kernels/conv_transpose_1d_f16_f32.cl b/src/ggml-opencl/kernels/conv_transpose_1d_f16_f32.cl
 new file mode 100644
-index 00000000..376871f6
+index 00000000..1bf11ea0
 --- /dev/null
 +++ b/src/ggml-opencl/kernels/conv_transpose_1d_f16_f32.cl
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,57 @@
 +// CONV_TRANSPOSE_1D — f16 kernel / f32 input / f32 out
 +
 +#pragma OPENCL EXTENSION cl_khr_fp16 : enable
@@ -875,12 +875,19 @@ index 00000000..376871f6
 +    const uint i1  = t1 % Cout;
 +    const uint ib  = t1 / Cout;
 +
++    const int ox_i = (int) ox;
++    const int K_i  = (int) K;
++    const int L_i  = (int) L;
++
++    // Only input positions with 0 <= ox - s0*i10 < K contribute.
++    int i10_min = (ox_i - K_i + s0) / s0; // ceil((ox - K + 1) / s0)
++    int i10_max = ox_i / s0;              // floor(ox / s0)
++    i10_min = max(i10_min, 0);
++    i10_max = min(i10_max, L_i - 1);
++
 +    float acc = 0.0f;
-+    for (uint i10 = 0; i10 < L; i10++) {
++    for (int i10 = i10_min; i10 <= i10_max; i10++) {
 +        const int i00 = (int) ox - s0 * (int) i10;
-+        if (i00 < 0 || (uint) i00 >= K) {
-+            continue;
-+        }
 +        const uint ka0 = (uint) i00 * k_nb0 + i1 * k_nb01;
 +        const uint ba0 = (uint) i10 * in_nb0 + ib * in_nb2;
 +        for (uint ic = 0; ic < Cin; ic++) {
@@ -894,10 +901,10 @@ index 00000000..376871f6
 +}
 diff --git a/src/ggml-opencl/kernels/conv_transpose_1d_f32.cl b/src/ggml-opencl/kernels/conv_transpose_1d_f32.cl
 new file mode 100644
-index 00000000..cba207cb
+index 00000000..e7d8abeb
 --- /dev/null
 +++ b/src/ggml-opencl/kernels/conv_transpose_1d_f32.cl
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,56 @@
 +// CONV_TRANSPOSE_1D — f32 / f32 / f32
 +// src0: [K, Cout, Cin], src1: [L, Cin, ...], dst: [KL, Cout, ...]
 +
@@ -930,12 +937,19 @@ index 00000000..cba207cb
 +    const uint i1  = t1 % Cout;
 +    const uint ib  = t1 / Cout;
 +
++    const int ox_i = (int) ox;
++    const int K_i  = (int) K;
++    const int L_i  = (int) L;
++
++    // Only input positions with 0 <= ox - s0*i10 < K contribute.
++    int i10_min = (ox_i - K_i + s0) / s0; // ceil((ox - K + 1) / s0)
++    int i10_max = ox_i / s0;              // floor(ox / s0)
++    i10_min = max(i10_min, 0);
++    i10_max = min(i10_max, L_i - 1);
++
 +    float acc = 0.0f;
-+    for (uint i10 = 0; i10 < L; i10++) {
++    for (int i10 = i10_min; i10 <= i10_max; i10++) {
 +        const int i00 = (int) ox - s0 * (int) i10;
-+        if (i00 < 0 || (uint) i00 >= K) {
-+            continue;
-+        }
 +        const uint ka0 = (uint) i00 * k_nb0 + i1 * k_nb01;
 +        const uint ba0 = (uint) i10 * in_nb0 + ib * in_nb2;
 +        for (uint ic = 0; ic < Cin; ic++) {
