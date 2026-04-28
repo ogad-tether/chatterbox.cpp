@@ -2207,6 +2207,7 @@ T3 `Q4_0` + S3Gen `Q4_0`, short `"Hello"` smoke test (800 ms audio),
 | Q4_0 GEMM tile BN=32 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BN=64 to BN=32 for the hot `256 x 540` CFM output shape. | Regression: CFM Q4_0 GEMM grew from ~138 ms to ~181 ms. Reverted to the original 64x64 tile. |
 | Q4_0 GEMM tile BK=64 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BK=32 to BK=64 while keeping BM=64/BN=64. | Regression: CFM Q4_0 GEMM again grew to ~180 ms and `cfm_total` ~436 ms. Revert to BK=32. |
 | Q4_0 GEMM tile BM=32 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BM=64 to BM=32 while keeping BN=64/BK=32. | Regression: CFM Q4_0 GEMM grew to ~213 ms and `cfm_total` ~445 ms. Revert to BM=64. |
+| Q4_0 GEMM thread tile TN=4 | Changed per-thread output from TM=4/TN=8 to TM=4/TN=4, keeping BM=64/BN=64/BK=32. | Mild regression: CFM Q4_0 GEMM rose to ~147 ms and `cfm_total` ~411 ms. Revert to TN=8. |
 
 Current measured bottlenecks after the useful attention change:
 
