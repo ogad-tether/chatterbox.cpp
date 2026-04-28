@@ -172,6 +172,28 @@ struct chatterbox_model {
     std::vector<gpt2_layer>  layers;
     std::vector<llama_layer> layers_mtl;
 
+    // KV cache.
+    //
+    // Turbo (GPT-2 Medium) variant: memory_k / memory_v are sized
+    // `head_dim * n_kv_head * n_ctx * n_layer` (single batch).
+    //
+    // Multilingual (Llama-520M) variant: memory_k / memory_v hold the
+    // CFG cond+uncond pair packed into a single backing buffer, size
+    // `2 * head_dim * n_kv_head * n_ctx * n_layer` (B=2). The two halves
+    // are interleaved per-layer so each Llama block reads from one
+    // contiguous 2*kv_layer_elems region: layout per layer is
+    //   [cond:  head_dim, n_ctx, n_kv_head] [uncond: head_dim, n_ctx, n_kv_head]
+    // Layer-offset stride is therefore `2 * kv_layer_elems * sizeof(F)`.
+    // Picking the cond half is `b_offset_elems = 0`; uncond is
+    // `b_offset_elems = kv_layer_elems` (one batch's worth, applied as a
+    // per-layer offset). The B=2 batched step+prompt graphs pack both
+    // batches into the same view via ne[3]=2 + per-batch stride.
+    //
+    // The unified buffer means the existing two-call (B=1) cond/uncond
+    // CPU path keeps using memory_k/memory_v unchanged; it just selects
+    // the right half via `b_offset_elems`. memory_k_uncond / memory_v_uncond
+    // are no longer separate allocations; kept here as nullable view aliases
+    // for legacy call-sites that haven't been migrated.
     ggml_tensor * memory_k = nullptr;
     ggml_tensor * memory_v = nullptr;
 

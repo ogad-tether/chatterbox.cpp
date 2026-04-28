@@ -181,13 +181,24 @@ ggml_tensor * build_perceiver(ggml_context * ctx,
 // One Llama transformer block.  Writes K/V into the selected KV cache
 // tensors at positions [n_past, n_past + N).
 //
-// inpL:       (n_embd, N)
-// memory_k/v: 1D F32 buffers of size (head_dim * n_kv_head * n_ctx * n_layer)
+// inpL:       (n_embd, N)            for B=1
+//             (n_embd, N, 2)         for B=2 (cond + uncond packed as ne[2])
+// memory_k/v: 1D F32 buffer holding the **cond+uncond pair** for MTL:
+//             size = 2 * head_dim * n_kv_head * n_ctx * n_layer.
+//             Per-layer slab is `2 * kv_layer_elems`; cond at offset 0
+//             within the slab, uncond at offset kv_layer_elems.
+//
+// b_offset_elems selects which half is touched in the B=1 path:
+//             0            → cond pass writes/reads the cond slab
+//             kv_layer_elems → uncond pass writes/reads the uncond slab
+// In the B=2 path b_offset_elems is ignored: ne[3]=2 spans both halves
+// and per-batch stride is `kv_layer_elems * sizeof(float)`.
 ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
                                 const chatterbox_model & m,
                                 int il,
                                 ggml_tensor * inpL,
-                                int n_past, int N,
+                                int n_past, int N, int B,
+                                size_t b_offset_elems,
                                 ggml_tensor * memory_k,
                                 ggml_tensor * memory_v,
                                 ggml_tensor * pos_ids,
@@ -200,26 +211,44 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
     const int n_ctx = hp.n_ctx;
     const int64_t L = n_past + N;
 
-    const size_t kv_head_stride  = (size_t) HD * n_ctx * sizeof(float);
-    const size_t kv_pos_stride   = (size_t) HD * sizeof(float);
-    const size_t kv_layer_elems  = (size_t) HD * n_ctx * NKV;
-    const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
+    // KV strides are sized off the cache dtype (F32 historically; F16
+    // since Phase 2 to halve KV bandwidth) so the same builder works for
+    // either precision without re-deriving offsets per-call.
+    const size_t kv_ts = ggml_type_size(memory_k->type);
+    const size_t kv_head_stride   = (size_t) HD * n_ctx * kv_ts;
+    const size_t kv_pos_stride    = (size_t) HD * kv_ts;
+    const size_t kv_layer_elems   = (size_t) HD * n_ctx * NKV;       // one batch slab
+    const size_t kv_batch_stride  = kv_layer_elems * kv_ts;          // step from cond to uncond
+    const size_t kv_layer_stride  = (size_t) 2 * kv_batch_stride;    // per-layer slab is 2x
+    const size_t layer_off = (size_t) il * kv_layer_stride
+                           + b_offset_elems * kv_ts;
 
     // Pre-attention RMSNorm (no bias).
     ggml_tensor * cur = ggml_rms_norm(ctx, inpL, hp.eps);
     cur = ggml_mul(ctx, cur, l.ln_attn_g);
 
-    ggml_tensor * Qlin = ggml_mul_mat(ctx, l.wq, cur);  // (n_embd, N)
+    ggml_tensor * Qlin = ggml_mul_mat(ctx, l.wq, cur);  // (n_embd, N) or (n_embd, N, B)
     ggml_tensor * Klin = ggml_mul_mat(ctx, l.wk, cur);
     ggml_tensor * Vlin = ggml_mul_mat(ctx, l.wv, cur);
 
-    // Reshape to (HD, n_head, N). ggml_rope_ext requires ne[2] == len(pos_ids),
-    // so sequence must be on ne[2] at the rope call.
-    ggml_tensor * Q = ggml_reshape_3d(ctx, Qlin, HD, NH,  N);  // (HD, NH,  N)
-    ggml_tensor * K = ggml_reshape_3d(ctx, Klin, HD, NKV, N);  // (HD, NKV, N)
-    ggml_tensor * V = ggml_reshape_3d(ctx, Vlin, HD, NKV, N);  // (HD, NKV, N)
+    // Reshape to (HD, n_head, N) [B=1] or (HD, n_head, N, B) [B=2].
+    // ggml_rope_ext requires ne[2] == len(pos_ids), so sequence stays on
+    // ne[2] at the rope call; the optional batch dim sits at ne[3].
+    ggml_tensor * Q;
+    ggml_tensor * K;
+    ggml_tensor * V;
+    if (B == 1) {
+        Q = ggml_reshape_3d(ctx, Qlin, HD, NH,  N);
+        K = ggml_reshape_3d(ctx, Klin, HD, NKV, N);
+        V = ggml_reshape_3d(ctx, Vlin, HD, NKV, N);
+    } else {
+        Q = ggml_reshape_4d(ctx, Qlin, HD, NH,  N, B);
+        K = ggml_reshape_4d(ctx, Klin, HD, NKV, N, B);
+        V = ggml_reshape_4d(ctx, Vlin, HD, NKV, N, B);
+    }
 
     // RoPE on Q and K (NEOX-style half-split convention used by Llama).
+    // ggml_rope_ext broadcasts cleanly over an optional batch dim at ne[3].
     const int rope_mode = GGML_ROPE_TYPE_NEOX;
     Q = ggml_rope_ext(ctx, Q, pos_ids, m.rope_freq_factors,
                       HD, rope_mode, hp.rope_orig_max_pos,
@@ -228,43 +257,72 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
                       HD, rope_mode, hp.rope_orig_max_pos,
                       hp.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
-    // Flash attention (Turbo-style) expects (HD, N, NH).  Permute from
-    // (HD, NH, N) -> (HD, N, NH) and then the KV cache keeps the same
-    // [HD, n_ctx, n_head] layout used in src/main.cpp, so flash_attn can
-    // read a contiguous slice without another permute at read time.
-    Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));  // (HD, N,  NH)
-    K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));  // (HD, N,  NKV)
-    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));  // (HD, N,  NKV)
+    // Flash attention expects (HD, N, NH[, B]).  Permute (0, 2, 1, 3) lifts
+    // N to ne[1] so the KV cache keeps a [HD, n_ctx, n_kv_head] inner-3D
+    // layout that flash_attn can read contiguously per (head, batch).
+    Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
+    K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
 
     // Write K/V into the cache at [n_past : n_past+N) for this layer.
     {
-        ggml_tensor * k_dst = ggml_view_3d(ctx, memory_k,
-            HD, N, NKV,
-            kv_pos_stride, kv_head_stride,
-            layer_off + (size_t) n_past * kv_pos_stride);
-        ggml_tensor * v_dst = ggml_view_3d(ctx, memory_v,
-            HD, N, NKV,
-            kv_pos_stride, kv_head_stride,
-            layer_off + (size_t) n_past * kv_pos_stride);
+        ggml_tensor * k_dst;
+        ggml_tensor * v_dst;
+        if (B == 1) {
+            k_dst = ggml_view_3d(ctx, memory_k,
+                HD, N, NKV,
+                kv_pos_stride, kv_head_stride,
+                layer_off + (size_t) n_past * kv_pos_stride);
+            v_dst = ggml_view_3d(ctx, memory_v,
+                HD, N, NKV,
+                kv_pos_stride, kv_head_stride,
+                layer_off + (size_t) n_past * kv_pos_stride);
+        } else {
+            k_dst = ggml_view_4d(ctx, memory_k,
+                HD, N, NKV, B,
+                kv_pos_stride, kv_head_stride, kv_batch_stride,
+                layer_off + (size_t) n_past * kv_pos_stride);
+            v_dst = ggml_view_4d(ctx, memory_v,
+                HD, N, NKV, B,
+                kv_pos_stride, kv_head_stride, kv_batch_stride,
+                layer_off + (size_t) n_past * kv_pos_stride);
+        }
         ggml_build_forward_expand(gf, ggml_cpy(ctx, K, k_dst));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, V, v_dst));
     }
 
     // Attention: read the full [0, L) slice from the cache.
-    ggml_tensor * Kfull = ggml_view_3d(ctx, memory_k,
-        HD, L, NKV,
-        kv_pos_stride, kv_head_stride,
-        layer_off);
-    ggml_tensor * Vfull = ggml_view_3d(ctx, memory_v,
-        HD, L, NKV,
-        kv_pos_stride, kv_head_stride,
-        layer_off);
+    ggml_tensor * Kfull;
+    ggml_tensor * Vfull;
+    if (B == 1) {
+        Kfull = ggml_view_3d(ctx, memory_k,
+            HD, L, NKV,
+            kv_pos_stride, kv_head_stride,
+            layer_off);
+        Vfull = ggml_view_3d(ctx, memory_v,
+            HD, L, NKV,
+            kv_pos_stride, kv_head_stride,
+            layer_off);
+    } else {
+        Kfull = ggml_view_4d(ctx, memory_k,
+            HD, L, NKV, B,
+            kv_pos_stride, kv_head_stride, kv_batch_stride,
+            layer_off);
+        Vfull = ggml_view_4d(ctx, memory_v,
+            HD, L, NKV, B,
+            kv_pos_stride, kv_head_stride, kv_batch_stride,
+            layer_off);
+    }
 
     const float scale = 1.0f / std::sqrt((float) HD);
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, Kfull, Vfull, kq_mask,
                                              scale, 0.0f, 0.0f);
-    // attn: (HD, NH, N, 1) -> (n_embd, N)
-    cur = ggml_reshape_2d(ctx, attn, hp.n_embd, N);
+    // attn ne=[HD, NH, N, B].  Reshape back to (n_embd, N[, B]).
+    if (B == 1) {
+        cur = ggml_reshape_2d(ctx, attn, hp.n_embd, N);
+    } else {
+        cur = ggml_reshape_3d(ctx, attn, hp.n_embd, N, B);
+    }
 
     // O-proj + residual.
     cur = ggml_mul_mat(ctx, l.wo, cur);
@@ -390,12 +448,16 @@ ggml_cgraph * build_prompt_graph_mtl(const chatterbox_model & model,
     inp = ggml_concat(ctx, inp, speech_emb_out, /*dim=*/1);
     inp = ggml_concat(ctx, inp, speech_emb_out, /*dim=*/1);
 
-    // 5. Run 30 Llama layers.
-    ggml_tensor * mem_k = is_uncond ? model.memory_k_uncond : model.memory_k;
-    ggml_tensor * mem_v = is_uncond ? model.memory_v_uncond : model.memory_v;
+    // 5. Run 30 Llama layers.  Cond/uncond share one memory_k/memory_v
+    // buffer (size 2 * kv_layer_elems per layer); pick the right half via
+    // b_offset_elems.
+    const size_t kv_layer_elems = (size_t) hp.head_dim * hp.n_kv_head * hp.n_ctx;
+    const size_t b_off = is_uncond ? kv_layer_elems : 0;
     ggml_tensor * cur = inp;
     for (int il = 0; il < hp.n_layer; ++il) {
-        cur = build_llama_block(ctx, gf, model, il, cur, /*n_past=*/0, N, mem_k, mem_v,
+        cur = build_llama_block(ctx, gf, model, il, cur, /*n_past=*/0, N,
+                                /*B=*/1, b_off,
+                                model.memory_k, model.memory_v,
                                 pos_ids, kq_mask);
     }
 
@@ -407,6 +469,157 @@ ggml_cgraph * build_prompt_graph_mtl(const chatterbox_model & model,
                                       (size_t)(N - 1) * cur->nb[1]);
     ggml_tensor * logits = ggml_mul_mat(ctx, model.speech_head, last);  // (n_speech_vocab, 1)
     ggml_set_name(logits, "logits");  ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    ggml_free(ctx);
+    return gf;
+}
+
+// B=2 prompt graph: pack cond + uncond into a single forward over the
+// batch dim (ne[2]).  cond_emb (spkr+perceiver+emotion) is identical
+// between the two passes, so we just duplicate it; the text-token
+// embedding differs (uncond zeroes the token part but keeps the learned
+// positional embedding).  Output: (n_speech_vocab, 1, 2) with cond at
+// b=0 and uncond at b=1.  Mirrors the use_b2 pattern from
+// src/chatterbox_tts.cpp:1994 (S3Gen CFM CFG).
+ggml_cgraph * build_prompt_graph_mtl_b2(const chatterbox_model & model,
+                                        int n_text_tokens) {
+    const auto & hp = model.hparams;
+    const int len_cond = 1 + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0);
+    const int N = len_cond + n_text_tokens + 2;
+
+    static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
+                             ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
+    thread_local std::vector<uint8_t> buf(buf_size);
+    ggml_init_params p = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
+
+    ggml_tensor * text_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_text_tokens);
+    ggml_set_name(text_tokens, "text_tokens");  ggml_set_input(text_tokens);
+
+    ggml_tensor * speech_bos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(speech_bos, "speech_bos");  ggml_set_input(speech_bos);
+
+    ggml_tensor * pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+    ggml_set_name(pos_ids, "pos_ids");  ggml_set_input(pos_ids);
+
+    ggml_tensor * text_pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_text_tokens);
+    ggml_set_name(text_pos_ids, "text_pos_ids");  ggml_set_input(text_pos_ids);
+
+    ggml_tensor * speech_pos0 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(speech_pos0, "speech_pos0");  ggml_set_input(speech_pos0);
+
+    ggml_tensor * exaggeration = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+    ggml_set_name(exaggeration, "exaggeration");  ggml_set_input(exaggeration);
+
+    ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, N, N);
+    ggml_set_name(kq_mask, "kq_mask");  ggml_set_input(kq_mask);
+
+    // Cond fragment (n_embd, 34) — shared between cond + uncond passes.
+    ggml_tensor * cond_emb = build_cond_emb(ctx, model, exaggeration);
+
+    // Text embedding diverges between the two passes:
+    //   cond:   speech_emb[tokens] + text_pos_emb[0..T)
+    //   uncond: text_pos_emb[0..T) only (text-token contribution zeroed)
+    ggml_tensor * text_pos_emb_seq = ggml_get_rows(ctx, model.text_pos_emb, text_pos_ids);
+    ggml_tensor * text_tok_emb     = ggml_get_rows(ctx, model.text_emb, text_tokens);
+    ggml_tensor * text_cond   = ggml_add(ctx, text_tok_emb, text_pos_emb_seq);
+    ggml_tensor * text_uncond = text_pos_emb_seq;
+
+    // Speech BOS embeddings (shared between passes).
+    ggml_tensor * speech_tok_emb    = ggml_get_rows(ctx, model.speech_emb, speech_bos);
+    ggml_tensor * speech_pos_emb_0  = ggml_get_rows(ctx, model.speech_pos_emb, speech_pos0);
+    ggml_tensor * speech_emb_out    = ggml_add(ctx, speech_tok_emb, speech_pos_emb_0);
+
+    // Per-batch input assembly (matches the B=1 prompt graph's order):
+    //   [cond_emb | text_emb_X | speech_emb | speech_emb] → (n_embd, N)
+    auto assemble_one = [&](ggml_tensor * text) {
+        ggml_tensor * inp = ggml_concat(ctx, cond_emb, text, /*dim=*/1);
+        inp = ggml_concat(ctx, inp, speech_emb_out, /*dim=*/1);
+        inp = ggml_concat(ctx, inp, speech_emb_out, /*dim=*/1);
+        return inp;
+    };
+    ggml_tensor * inp_cond   = assemble_one(text_cond);
+    ggml_tensor * inp_uncond = assemble_one(text_uncond);
+
+    // Stack along the batch dim: (n_embd, N, 1) + (n_embd, N, 1) → (n_embd, N, 2).
+    ggml_tensor * inp_b2 = ggml_concat(ctx,
+        ggml_reshape_3d(ctx, inp_cond,   hp.n_embd, N, 1),
+        ggml_reshape_3d(ctx, inp_uncond, hp.n_embd, N, 1),
+        /*dim=*/2);
+
+    ggml_tensor * cur = inp_b2;
+    for (int il = 0; il < hp.n_layer; ++il) {
+        cur = build_llama_block(ctx, gf, model, il, cur, /*n_past=*/0, N,
+                                /*B=*/2, /*b_offset_elems=*/0,
+                                model.memory_k, model.memory_v,
+                                pos_ids, kq_mask);
+    }
+
+    // Final norm + head.  cur ne=[n_embd, N, 2]; take last position only,
+    // resulting in (n_embd, 1, 2), then mat_mul with speech_head (which
+    // broadcasts over batch) to (n_speech_vocab, 1, 2).
+    cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), model.norm_g);
+    ggml_tensor * last = ggml_view_3d(ctx, cur,
+        hp.n_embd, 1, 2,
+        cur->nb[1], cur->nb[2],
+        (size_t)(N - 1) * cur->nb[1]);
+    last = ggml_cont(ctx, last);  // mat_mul wants contiguous src1 over batches
+    ggml_tensor * logits = ggml_mul_mat(ctx, model.speech_head, last);
+    ggml_set_name(logits, "logits");  ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    ggml_free(ctx);
+    return gf;
+}
+
+// B=2 step graph: same input speech token + position fed into both cond
+// and uncond passes (the sampler combined the previous logits and chose a
+// single token).  The two batches diverge only via the KV cache, which
+// already differs from the B=2 prompt graph that wrote them.
+ggml_cgraph * build_step_graph_mtl_b2(const chatterbox_model & model,
+                                      int n_past) {
+    const auto & hp = model.hparams;
+
+    static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
+                             ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
+    thread_local std::vector<uint8_t> buf(buf_size);
+    ggml_init_params p = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
+
+    ggml_tensor * speech_token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(speech_token, "speech_token"); ggml_set_input(speech_token);
+
+    ggml_tensor * speech_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(speech_pos, "speech_pos"); ggml_set_input(speech_pos);
+
+    ggml_tensor * pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(pos_ids, "pos_ids"); ggml_set_input(pos_ids);
+
+    // inp_b1 = speech_emb[tok] + speech_pos_emb[pos]  → (n_embd, 1).
+    // Both batches see the same input embedding; broadcast to (n_embd, 1, 2)
+    // via ggml_concat.  The materialization cost is ~4 KB per token and
+    // amortises across 30 Llama layers.
+    ggml_tensor * inp_b1 = ggml_add(ctx,
+        ggml_get_rows(ctx, model.speech_emb,     speech_token),
+        ggml_get_rows(ctx, model.speech_pos_emb, speech_pos));
+    ggml_tensor * inp_b1_3d = ggml_reshape_3d(ctx, inp_b1, hp.n_embd, 1, 1);
+    ggml_tensor * inp = ggml_concat(ctx, inp_b1_3d, inp_b1_3d, /*dim=*/2);
+
+    ggml_tensor * cur = inp;
+    for (int il = 0; il < hp.n_layer; ++il) {
+        cur = build_llama_block(ctx, gf, model, il, cur, n_past, /*N=*/1,
+                                /*B=*/2, /*b_offset_elems=*/0,
+                                model.memory_k, model.memory_v,
+                                pos_ids, /*kq_mask=*/nullptr);
+    }
+    cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), model.norm_g);
+
+    // cur ne=[n_embd, 1, 2] → speech_head @ cur → (n_speech_vocab, 1, 2)
+    ggml_tensor * logits = ggml_mul_mat(ctx, model.speech_head, cur);
+    ggml_set_name(logits, "logits"); ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
 
     ggml_free(ctx);
@@ -438,12 +651,14 @@ ggml_cgraph * build_step_graph_mtl(const chatterbox_model & model,
         ggml_get_rows(ctx, model.speech_emb, speech_token),
         ggml_get_rows(ctx, model.speech_pos_emb, speech_pos));
 
-    ggml_tensor * mem_k = is_uncond ? model.memory_k_uncond : model.memory_k;
-    ggml_tensor * mem_v = is_uncond ? model.memory_v_uncond : model.memory_v;
+    const size_t kv_layer_elems = (size_t) hp.head_dim * hp.n_kv_head * hp.n_ctx;
+    const size_t b_off = is_uncond ? kv_layer_elems : 0;
 
     ggml_tensor * cur = inp;
     for (int il = 0; il < hp.n_layer; ++il) {
-        cur = build_llama_block(ctx, gf, model, il, cur, n_past, /*N=*/1, mem_k, mem_v,
+        cur = build_llama_block(ctx, gf, model, il, cur, n_past, /*N=*/1,
+                                /*B=*/1, b_off,
+                                model.memory_k, model.memory_v,
                                 pos_ids, /*kq_mask=*/nullptr);
     }
     cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), model.norm_g);
@@ -533,6 +748,118 @@ bool run_prompt_pass(const chatterbox_model & model,
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(ggml_nelements(logits));
     ggml_backend_tensor_get(logits, logits_out.data(), 0, ggml_nbytes(logits));
+    return true;
+}
+
+// Run the prompt graph as a single batch=2 forward (cond on b=0, uncond
+// on b=1).  Output logits shape: (n_speech_vocab, 1, 2); we read the
+// cond half into logits_cond and the uncond half into logits_uncond.
+bool run_prompt_pass_b2(const chatterbox_model & model,
+                        ggml_gallocr_t allocr,
+                        int n_threads,
+                        const std::vector<int32_t> & text_tokens,
+                        float exaggeration,
+                        std::vector<float> & logits_cond_out,
+                        std::vector<float> & logits_uncond_out,
+                        int & prompt_len_out) {
+    const auto & hp = model.hparams;
+    const int len_cond = 1 + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0);
+    const int N = len_cond + (int) text_tokens.size() + 2;
+    prompt_len_out = N;
+
+    ggml_cgraph * gf = build_prompt_graph_mtl_b2(model, (int) text_tokens.size());
+    if (!ggml_gallocr_reserve(allocr, gf)) {
+        fprintf(stderr, "run_prompt_pass_b2: gallocr_reserve failed\n");
+        return false;
+    }
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "run_prompt_pass_b2: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
+        return false;
+    }
+
+    auto set_in = [&](const char * name, const void * data, size_t bytes) {
+        ggml_tensor * t = ggml_graph_get_tensor(gf, name);
+        if (t) ggml_backend_tensor_set(t, data, 0, bytes);
+    };
+    set_in("text_tokens", text_tokens.data(), text_tokens.size() * sizeof(int32_t));
+    int32_t bos = hp.start_speech_token;
+    set_in("speech_bos", &bos, sizeof(bos));
+
+    std::vector<int32_t> pos(N);
+    for (int i = 0; i < N; ++i) pos[i] = i;
+    set_in("pos_ids", pos.data(), pos.size() * sizeof(int32_t));
+
+    std::vector<int32_t> text_pos(text_tokens.size());
+    for (size_t i = 0; i < text_tokens.size(); ++i) text_pos[i] = (int32_t) i;
+    set_in("text_pos_ids", text_pos.data(), text_pos.size() * sizeof(int32_t));
+
+    int32_t sp0 = 0;
+    set_in("speech_pos0", &sp0, sizeof(sp0));
+
+    const int cond_prompt_len = hp.cond_prompt_len;
+    std::vector<int32_t> cond_pos(cond_prompt_len);
+    for (int i = 0; i < cond_prompt_len; ++i) cond_pos[i] = i;
+    set_in("cond_prompt_pos_ids", cond_pos.data(), cond_pos.size() * sizeof(int32_t));
+
+    float exag = exaggeration;
+    set_in("exaggeration", &exag, sizeof(exag));
+
+    std::vector<ggml_fp16_t> mask;
+    fill_causal_mask_f16(mask, N);
+    set_in("kq_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t));
+
+    if (ggml_backend_is_cpu(model.backend)) {
+        ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+    }
+    ggml_backend_graph_compute(model.backend, gf);
+
+    ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
+    // logits ne=[n_speech_vocab, 1, 2], contiguous.  Cond at b=0, uncond at b=1.
+    const size_t per_batch_bytes = (size_t) hp.n_speech_vocab * sizeof(float);
+    logits_cond_out.resize(hp.n_speech_vocab);
+    logits_uncond_out.resize(hp.n_speech_vocab);
+    ggml_backend_tensor_get(logits, logits_cond_out.data(),   0,                per_batch_bytes);
+    ggml_backend_tensor_get(logits, logits_uncond_out.data(), per_batch_bytes, per_batch_bytes);
+    return true;
+}
+
+// B=2 step pass: one forward producing both cond + uncond logits.
+bool run_step_pass_b2(const chatterbox_model & model,
+                      ggml_gallocr_t allocr,
+                      int n_threads,
+                      int n_past,
+                      int32_t token,
+                      std::vector<float> & logits_cond_out,
+                      std::vector<float> & logits_uncond_out) {
+    const auto & hp = model.hparams;
+
+    ggml_cgraph * gf = build_step_graph_mtl_b2(model, n_past);
+    if (!ggml_gallocr_reserve(allocr, gf)) {
+        fprintf(stderr, "run_step_pass_b2: gallocr_reserve failed\n");
+        return false;
+    }
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "run_step_pass_b2: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
+        return false;
+    }
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
+    int32_t sp = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_pos"), &sp, 0, sizeof(sp));
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos_ids"), &pos, 0, sizeof(pos));
+
+    if (ggml_backend_is_cpu(model.backend)) {
+        ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+    }
+    ggml_backend_graph_compute(model.backend, gf);
+
+    ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
+    const size_t per_batch_bytes = (size_t) hp.n_speech_vocab * sizeof(float);
+    logits_cond_out.resize(hp.n_speech_vocab);
+    logits_uncond_out.resize(hp.n_speech_vocab);
+    ggml_backend_tensor_get(logits, logits_cond_out.data(),   0,                per_batch_bytes);
+    ggml_backend_tensor_get(logits, logits_uncond_out.data(), per_batch_bytes, per_batch_bytes);
     return true;
 }
 
@@ -688,14 +1015,15 @@ ggml_cgraph * build_stage_layers_graph(const chatterbox_model & m, int N,
         ggml_set_name(kq_mask, "kq_mask"); ggml_set_input(kq_mask);
     }
 
-    ggml_tensor * mem_k = is_uncond ? m.memory_k_uncond : m.memory_k;
-    ggml_tensor * mem_v = is_uncond ? m.memory_v_uncond : m.memory_v;
+    const size_t kv_layer_elems = (size_t) hp.head_dim * hp.n_kv_head * hp.n_ctx;
+    const size_t b_off = is_uncond ? kv_layer_elems : 0;
 
     ggml_tensor * cur = inp;
     const int actual_layers = std::min(n_layers, hp.n_layer);
     for (int il = 0; il < actual_layers; ++il) {
         cur = build_llama_block(ctx, gf, m, il, cur, /*n_past=*/0, N,
-                                mem_k, mem_v, pos_ids, kq_mask);
+                                /*B=*/1, b_off,
+                                m.memory_k, m.memory_v, pos_ids, kq_mask);
     }
     ggml_set_name(cur, "layers_out");
     ggml_set_output(cur);
@@ -878,13 +1206,34 @@ bool load_model_gguf_mtl(const std::string & path,
             l.mlp_down = require_tensor(model, (lp + "/mlp/down/w").c_str());
         }
 
+        // Single unified KV buffer holding the cond+uncond pair.
+        // Layout per layer: 2x kv_layer_elems contiguous floats, with the
+        // cond half at offset 0 and the uncond half at offset kv_layer_elems.
+        // The B=1 single-pass code addresses the right half via the
+        // `b_offset_elems` parameter to build_llama_block; the B=2 batched
+        // path views ne[3]=2 over the same memory with batch_stride=
+        // kv_layer_elems * sizeof(float).
         ggml_init_params kv_params = { ggml_tensor_overhead() * 4, nullptr, true };
         model.ctx_kv = ggml_init(kv_params);
-        const int64_t kv_elements = (int64_t) hp.head_dim * hp.n_kv_head * hp.n_ctx * hp.n_layer;
-        model.memory_k        = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements);
-        model.memory_v        = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements);
-        model.memory_k_uncond = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements);
-        model.memory_v_uncond = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements);
+        const int64_t kv_elements_b2 =
+            (int64_t) 2 * hp.head_dim * hp.n_kv_head * hp.n_ctx * hp.n_layer;
+        // KV dtype is kept at F32 here.  Phase-2 of §3.21 tried F16 KV —
+        // build_llama_block already routes ggml_type_size(memory_k->type)
+        // into the strides, ggml_flash_attn_ext consumes F16 K/V
+        // directly, and the per-step ggml_cpy converts F32→F16 for
+        // free — but on M3 Ultra it was a wash (Q4_0 502 → 507 ms,
+        // F16 within noise) and produced byte-exact audio, suggesting
+        // ggml-metal's flash-attn was already running its matmul at
+        // F16 internally regardless of storage dtype.  We keep F32
+        // storage to match the §3.19 numerics envelope.  Memory-bound
+        // backends (e.g. M4 with 10 GPU cores) may still benefit; flip
+        // this to GGML_TYPE_F16 to try that.
+        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements_b2);
+        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements_b2);
+        // Legacy aliases for any caller that hasn't been migrated yet
+        // (none on the MTL hot path; kept nullable on purpose).
+        model.memory_k_uncond = nullptr;
+        model.memory_v_uncond = nullptr;
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
         if (!model.buffer_kv) {
             throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
@@ -934,7 +1283,7 @@ bool load_model_gguf_mtl(const std::string & path,
                     hp.n_ctx, hp.n_embd, hp.n_layer, hp.n_head, hp.n_kv_head,
                     hp.head_dim, hp.intermediate_size,
                     hp.n_text_vocab, hp.n_speech_vocab, hp.cond_prompt_len);
-            fprintf(stderr, "load_model_gguf_mtl: weights=%.2f MB  KV=%.2f MB (2x for CFG) "
+            fprintf(stderr, "load_model_gguf_mtl: weights=%.2f MB  KV=%.2f MB (cond+uncond unified) "
                             "tokenizer_json=%zu bytes  languages=%zu\n",
                     ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
                     ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0),
@@ -959,6 +1308,19 @@ bool eval_prompt_mtl(const chatterbox_model & model,
                      std::vector<float> & logits_cond_out,
                      std::vector<float> & logits_uncond_out,
                      int & prompt_len) {
+    // Metal: dispatch the cond+uncond pair through a single B=2 graph so
+    // the 30 Llama-block weight reads + Metal kernel dispatches are
+    // amortised over both batches.  CPU keeps the two-call path (each
+    // op processes B=2 in a tight loop, so batching just doubles the
+    // per-op work without saving ops; mirrors §3.20's S3Gen B=2 finding
+    // that on CPU the two-call path stayed the winner).
+    const bool use_b2 = !ggml_backend_is_cpu(model.backend);
+    if (use_b2) {
+        return run_prompt_pass_b2(model, allocr, n_threads, text_tokens,
+                                  exaggeration, logits_cond_out,
+                                  logits_uncond_out, prompt_len);
+    }
+
     int plen_c = 0, plen_u = 0;
     if (!run_prompt_pass(model, allocr, n_threads, text_tokens, exaggeration,
                          /*is_uncond=*/false, logits_cond_out, plen_c)) return false;
@@ -996,6 +1358,12 @@ bool eval_step_mtl(const chatterbox_model & model,
                         "stopping generation to avoid out-of-range speech_pos_emb lookup\n",
                 n_past, model.hparams.max_speech_tokens);
         return false;
+    }
+    // Metal: cond+uncond batched into a single forward.  See eval_prompt_mtl.
+    const bool use_b2 = !ggml_backend_is_cpu(model.backend);
+    if (use_b2) {
+        return run_step_pass_b2(model, allocr, n_threads, n_past, token,
+                                logits_cond_out, logits_uncond_out);
     }
     if (!run_step_pass(model, allocr, n_threads, n_past, token, /*uncond=*/false,
                        logits_cond_out)) return false;
