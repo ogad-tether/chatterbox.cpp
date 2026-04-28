@@ -827,10 +827,30 @@ static ggml_tensor * cfm_causal_k3_b(ggml_context * ctx, ggml_tensor * x,
 
 // Compute the time embedding for a single scalar t (or r).
 // Returns (TIME_EMB_DIM=1024,) after sinusoidal + 2-layer MLP.
+//
+// Cached: the graph topology (inputs, weights, output shape) is constant
+// across all 10 CFM steps. Previously each call rebuilt the graph,
+// reserved a fresh gallocr, computed, and freed — burning ~1 ms of
+// dispatch + allocator overhead per step on Metal. Per call (multilingual,
+// 10 CFM steps) that's ~10 ms; for meanflow with `compute_time_mixed`
+// it's slightly more. The cache is keyed on the backend pointer so a
+// fresh model_ctx in another thread doesn't share scaffolding.
+struct time_mlp_cache {
+    ggml_backend_t  backend = nullptr;
+    std::vector<uint8_t> buf;
+    ggml_context *  ctx    = nullptr;
+    ggml_cgraph *   gf     = nullptr;
+    ggml_gallocr_t  allocr = nullptr;
+    ggml_tensor *   x_in   = nullptr;
+    ggml_tensor *   y_out  = nullptr;
+    ~time_mlp_cache() {
+        if (allocr) ggml_gallocr_free(allocr);
+        if (ctx)    ggml_free(ctx);
+    }
+};
+
 static std::vector<float> compute_time_mlp(const model_ctx & m, float t_val) {
     const int TDIM = 320;
-    const int HIDDEN = 1280;
-    const int OUT = 1024;
     std::vector<float> t_sin(TDIM);
     float log_factor = std::log(10000.0f) / (float)(TDIM/2 - 1);
     for (int i = 0; i < TDIM/2; ++i) {
@@ -839,36 +859,40 @@ static std::vector<float> compute_time_mlp(const model_ctx & m, float t_val) {
         t_sin[i] = std::sin(arg);
         t_sin[i + TDIM/2] = std::cos(arg);
     }
-    (void)HIDDEN; (void)OUT;
 
-    static size_t buf_size = 4 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
+    thread_local time_mlp_cache cache;
+    if (cache.ctx == nullptr || cache.backend != m.backend) {
+        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+        if (cache.ctx)    { ggml_free(cache.ctx); cache.ctx = nullptr; }
+        cache.buf.assign(4 * 1024 * 1024, 0);
+        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+        cache.ctx = ggml_init(gp);
+        cache.gf  = ggml_new_graph(cache.ctx);
 
-    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TDIM);
-    ggml_set_name(x, "x"); ggml_set_input(x);
-    ggml_tensor * l1w = find_tensor(m, "cfm/time_mlp/linear_1/weight");
-    ggml_tensor * l1b = find_tensor(m, "cfm/time_mlp/linear_1/bias");
-    ggml_tensor * l2w = find_tensor(m, "cfm/time_mlp/linear_2/weight");
-    ggml_tensor * l2b = find_tensor(m, "cfm/time_mlp/linear_2/bias");
-    ggml_tensor * y = ggml_add(ctx, ggml_mul_mat(ctx, l1w, x), l1b);
-    y = ggml_silu(ctx, y);
-    y = ggml_add(ctx, ggml_mul_mat(ctx, l2w, y), l2b);
-    ggml_set_name(y, "out"); ggml_set_output(y);
-    ggml_build_forward_expand(gf, y);
+        cache.x_in = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, TDIM);
+        ggml_set_name(cache.x_in, "x"); ggml_set_input(cache.x_in);
+        ggml_tensor * l1w = find_tensor(m, "cfm/time_mlp/linear_1/weight");
+        ggml_tensor * l1b = find_tensor(m, "cfm/time_mlp/linear_1/bias");
+        ggml_tensor * l2w = find_tensor(m, "cfm/time_mlp/linear_2/weight");
+        ggml_tensor * l2b = find_tensor(m, "cfm/time_mlp/linear_2/bias");
+        ggml_tensor * y = ggml_add(cache.ctx, ggml_mul_mat(cache.ctx, l1w, cache.x_in), l1b);
+        y = ggml_silu(cache.ctx, y);
+        y = ggml_add(cache.ctx, ggml_mul_mat(cache.ctx, l2w, y), l2b);
+        ggml_set_name(y, "out"); ggml_set_output(y);
+        cache.y_out = y;
+        ggml_build_forward_expand(cache.gf, cache.y_out);
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x"), t_sin.data(), 0, t_sin.size()*sizeof(float));
-    compute(m.backend, gf);
+        cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        ggml_gallocr_reserve(cache.allocr, cache.gf);
+        cache.backend = m.backend;
+    }
 
-    std::vector<float> out(ggml_nelements(y));
-    ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+    ggml_backend_tensor_set(cache.x_in, t_sin.data(), 0, t_sin.size() * sizeof(float));
+    compute(m.backend, cache.gf);
+
+    std::vector<float> out(ggml_nelements(cache.y_out));
+    ggml_backend_tensor_get(cache.y_out, out.data(), 0, ggml_nbytes(cache.y_out));
     return out;
 }
 
@@ -1380,8 +1404,13 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     std::vector<int> src_rb_ksizes = {7, 7, 11};
     std::vector<std::vector<int>> src_rb_dils = {{1,3,5},{1,3,5},{1,3,5}};
 
-    static size_t buf_size = 64 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
+    // Thread-local arena: previously this was a fresh `std::vector<uint8_t>
+    // buf(64 MB)` per HiFT call, which forced a 64 MB memset on every
+    // generate (~5–10 ms on M3 Ultra). The buffer is reused across calls;
+    // each ggml_init resets the arena pointer, so we never accumulate stale
+    // tensor metadata between invocations.
+    static const size_t buf_size = 64 * 1024 * 1024;
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params gp = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(gp);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 131072, false);

@@ -705,10 +705,7 @@ bool run_prompt_pass(const chatterbox_model & model,
     prompt_len_out = N;
 
     ggml_cgraph * gf = build_prompt_graph_mtl(model, (int) text_tokens.size(), is_uncond);
-    if (!ggml_gallocr_reserve(allocr, gf)) {
-        fprintf(stderr, "run_prompt_pass: gallocr_reserve failed\n");
-        return false;
-    }
+    // alloc_graph reserves lazily; see run_step_pass_b2 comment.
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_prompt_pass: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
         return false;
@@ -777,10 +774,9 @@ bool run_prompt_pass_b2(const chatterbox_model & model,
     prompt_len_out = N;
 
     ggml_cgraph * gf = build_prompt_graph_mtl_b2(model, (int) text_tokens.size());
-    if (!ggml_gallocr_reserve(allocr, gf)) {
-        fprintf(stderr, "run_prompt_pass_b2: gallocr_reserve failed\n");
-        return false;
-    }
+    // alloc_graph below already reserves lazily via ggml_gallocr_needs_realloc;
+    // see run_step_pass_b2 for the rationale on dropping the explicit
+    // ggml_gallocr_reserve(allocr, gf) call here.
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_prompt_pass_b2: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
         return false;
@@ -843,10 +839,14 @@ bool run_step_pass_b2(const chatterbox_model & model,
     const auto & hp = model.hparams;
 
     ggml_cgraph * gf = build_step_graph_mtl_b2(model, n_past);
-    if (!ggml_gallocr_reserve(allocr, gf)) {
-        fprintf(stderr, "run_step_pass_b2: gallocr_reserve failed\n");
-        return false;
-    }
+    // Skip the explicit ggml_gallocr_reserve(allocr, gf) call here:
+    // alloc_graph below already calls ggml_gallocr_needs_realloc, and
+    // only re-runs the topology analysis when the graph actually grew
+    // (single-buffer single-backend case — the default for chatterbox).
+    // The per-step graph keeps the same node count + per-node tensor
+    // shapes for every n_past >= 1, so after the first call alloc_graph
+    // is a fast O(n_nodes) buffer-reset; the explicit reserve forced an
+    // unnecessary topology re-walk on every one of the 84 step calls.
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_step_pass_b2: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
         return false;
@@ -880,10 +880,7 @@ bool run_step_pass(const chatterbox_model & model,
                    bool is_uncond,
                    std::vector<float> & logits_out) {
     ggml_cgraph * gf = build_step_graph_mtl(model, n_past, is_uncond);
-    if (!ggml_gallocr_reserve(allocr, gf)) {
-        fprintf(stderr, "run_step_pass: gallocr_reserve failed\n");
-        return false;
-    }
+    // alloc_graph reserves lazily; see run_step_pass_b2 comment.
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_step_pass: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
         return false;
