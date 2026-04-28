@@ -357,6 +357,12 @@ struct cli_params {
     // to 2 (matches Python's meanflow); setting 1 halves CFM cost at the
     // price of a bit of extra high-frequency noise.
     int32_t stream_cfm_steps          = 0;
+    // Override CFM Euler step count for non-streaming synthesis.  Defaults
+    // to 0 (= use the GGUF's `n_timesteps`: 10 for Multilingual standard
+    // CFM, 2 for Turbo's meanflow).  Lowering N (e.g. 7-8 on Multilingual)
+    // reduces S3Gen wall-clock proportionally; the §3.21 sweep documents
+    // the audio-cosine knee.  Streaming uses --stream-cfm-steps instead.
+    int32_t cfm_steps                 = 0;
 
     // Auto-split the input text into sentences before running the pipeline.
     // Chatterbox Turbo's T3 degrades badly on autoregressive outputs longer
@@ -469,6 +475,12 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          as --stream-chunk-tokens)\n");
     fprintf(stderr, "  --stream-cfm-steps N    CFM Euler step count per chunk.  Python uses 2 for\n");
     fprintf(stderr, "                          meanflow; 1 halves CFM cost.  (default: 0 = 2)\n");
+    fprintf(stderr, "  --cfm-steps N           Non-streaming CFM Euler step count.  Multilingual's\n");
+    fprintf(stderr, "                          standard CFM ships at 10 steps; lower (e.g. 7-8)\n");
+    fprintf(stderr, "                          trades small audio quality for proportional S3Gen\n");
+    fprintf(stderr, "                          speedup.  Turbo's meanflow defaults to 2 steps.\n");
+    fprintf(stderr, "                          See PROGRESS.md §3.21 for the quality knee sweep.\n");
+    fprintf(stderr, "                          (default: 0 = GGUF's n_timesteps)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --input-file PATH       Stream text from PATH as another process writes to it.\n");
     fprintf(stderr, "                          tail -f semantics: each complete sentence (ending in\n");
@@ -589,6 +601,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--stream-chunk-tokens")       { if (!parse_int("--stream-chunk-tokens",       params.stream_chunk_tokens))       return false; }
         else if (arg == "--stream-first-chunk-tokens") { if (!parse_int("--stream-first-chunk-tokens", params.stream_first_chunk_tokens)) return false; }
         else if (arg == "--stream-cfm-steps")          { if (!parse_int("--stream-cfm-steps",          params.stream_cfm_steps))          return false; }
+        else if (arg == "--cfm-steps")                 { if (!parse_int("--cfm-steps",                 params.cfm_steps))                 return false; }
         else if (arg == "--input-file")       { auto v = next("--input-file");       if (!v) return false; params.input_file = v; }
         else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
         else if (arg == "--input-by-line")    { params.input_by_line = true; }
@@ -819,6 +832,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            opts.cfm_steps       = params.cfm_steps;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1079,6 +1093,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            // Live-input streaming uses --stream-cfm-steps for chunks.
+            // --cfm-steps is a non-streaming knob; ignored here.
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1863,6 +1879,10 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            // Non-streaming CFM Euler step count (0 = GGUF default).
+            // Streaming chunks honour --stream-cfm-steps instead and copy
+            // this opts struct via `copts` further below.
+            opts.cfm_steps       = params.cfm_steps;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
