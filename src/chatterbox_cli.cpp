@@ -335,6 +335,7 @@ struct cli_params {
     // to 2 (matches Python's meanflow); setting 1 lowers latency with a small
     // quality trade-off.
     int32_t cfm_steps      = 0;
+    bool    cfm_f16_kv_attn = false;
 
     // Streaming synthesis (PROGRESS.md B1).  When > 0, speech tokens from
     // T3 are fed to S3Gen+HiFT in chunks of this size, with `cache_source`
@@ -447,6 +448,7 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --cfm-steps N           CFM Euler step count for batch synthesis.\n");
     fprintf(stderr, "                          Python uses 2; 1 is faster but slightly noisier.\n");
     fprintf(stderr, "                          (default: 0 = 2)\n");
+    fprintf(stderr, "  --cfm-f16-kv-attn       Experimental: CFM flash-attn uses F16 K/V.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --stream-chunk-tokens N Synthesize the wav in streaming chunks of N speech\n");
     fprintf(stderr, "                          tokens each (~1 s audio per 25-token chunk).  With\n");
@@ -552,6 +554,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--temp")           { if (!parse_float("--temp",           params.temp))           return false; }
         else if (arg == "--repeat-penalty") { if (!parse_float("--repeat-penalty", params.repeat_penalty)) return false; }
         else if (arg == "--cfm-steps")      { if (!parse_int  ("--cfm-steps",      params.cfm_steps))      return false; }
+        else if (arg == "--cfm-f16-kv-attn") { params.cfm_f16_kv_attn = true; }
         else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
         else if (arg == "--crossfade-ms")   { if (!parse_int("--crossfade-ms",   params.crossfade_ms))   return false; }
@@ -789,6 +792,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
             opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1050,6 +1054,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
             opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1356,6 +1361,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     copts.hift_source_tail_out     = &tail_out;
                     copts.source_tail_samples      = 480;
                     copts.cfm_steps                = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
+                    copts.cfm_f16_kv_attn          = params.cfm_f16_kv_attn;
 
                     int rc = s3gen_synthesize_to_wav(toks, copts);
                     if (rc != 0) return rc;
@@ -1732,6 +1738,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
             opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1930,6 +1937,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         copts.hift_source_tail_out      = &tail_out;
                         copts.source_tail_samples       = 480;
                         copts.cfm_steps                 = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
+                        copts.cfm_f16_kv_attn           = params.cfm_f16_kv_attn;
 
                         ++global_chunk_idx;
                         if (params.verbose) {
