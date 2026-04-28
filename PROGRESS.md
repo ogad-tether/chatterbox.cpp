@@ -2872,3 +2872,88 @@ demand gate above the current RTF 0.30 / 0.32 multilingual numbers.
 | [src/t3_mtl.cpp](src/t3_mtl.cpp) | Drop `ggml_gallocr_reserve` from `run_step_pass`, `run_prompt_pass`, `run_step_pass_b2`, `run_prompt_pass_b2`; `alloc_graph` covers the lazy-reserve case. |
 | [src/chatterbox_tts.cpp](src/chatterbox_tts.cpp) | `run_hift_decode` scratch buf → `thread_local`; new `time_mlp_cache` keyed on backend, hoisting per-step build/reserve. |
 
+### 3.23  T3-MTL fused Q/K/V mat-mul on Metal
+
+The Phase-1 of §3.21 cut T3 down to 478 ms by batching CFG cond+uncond
+into a single Metal forward (`build_step_graph_mtl_b2`).  Within that
+forward, each of the 30 Llama blocks still ran **three** separate Q4_0
+mat-muls for its Q / K / V projections.  Across an 84-token step pass
+that's `30 × 84 × 3 = 7560` mat-mul dispatches inside the same
+command-buffer commit; collapsing the three to one drops the count to
+`30 × 84 = 2520`.
+
+**Implementation.**  `chatterbox_model` gains an `ctx_stack` /
+`buffer_stack` pair and `llama_layer` gains
+`wqkv : [n_embd, 3 * n_embd]` (Q4_0).  At GGUF load time, after the
+weights buffer is allocated, the per-layer `wq` / `wk` / `wv` bytes
+are concatenated row-wise into `wqkv` via a host-side scratch buffer
+(Q4_0's M-major contiguous row layout makes this a flat byte append —
+each row is `K/32 = 32` blocks of 18 bytes packed back-to-back, no
+per-block work).  `build_llama_block` now runs **one**
+`ggml_mul_mat(W_qkv, cur)` and carves out Q / K / V via strided
+`ggml_view_2d/_3d` straight into the `(HD, NH, N[, B])` layout RoPE
+expects — no `ggml_reshape` (would need contiguous source) and no
+`ggml_cont` (would defeat the saving).  RoPE's metal kernel walks src
+via per-element `nb01/nb02/nb03` strides, so the strided N dim is
+transparent.
+
+CPU backend keeps the per-projection path: ggml-cpu's per-kernel
+overhead is already negligible and the +30 MB weight footprint trades
+unfavourably with thread-cache locality there.  Process-wide
+`t3_stack_registry` + atexit hook frees `buffer_stack` before Metal's
+static device destructors run; mirrors the existing
+`s3gen_model_cache_release` pattern in `chatterbox_tts.cpp`.
+
+**Why gate / up isn't stacked.**  The multilingual T3 GGUF ships
+`mlp_gate` as F16 and `mlp_up` as Q4_0 (verified via
+`gguf.GGUFReader('models/chatterbox-t3-mtl-q4_0.gguf')`).  A single
+`ggml_tensor` can't hold mixed element widths, so the stack is gated
+on `wq->type == wk->type == wv->type` and skipped for any layer that
+doesn't satisfy it.  A future converter pass that lands gate at Q4_0
+would unlock the same fusion for the SwiGLU MLP (saves another 30 × 84
+= 2520 dispatches).
+
+**Why CFM transformer Q/K/V isn't stacked.**  Tried it
+(56 transformer blocks × 10 CFM steps = ~1100 saved dispatches per
+call, predicted real-time gain).  CFM regresses by ~15 % on
+`cfm_total` (549 → 632 ms).  The CFM transformer matmul has
+`M = INNER = 512`, `K = 256`, `T·B = 87 × 2 = 174`; with
+ggml-metal's `mul_mm` tile size `NR0 = 64`, separate Q matmul yields
+`512 / 64 = 8` row tiles × `174 / 32 = 6` col tiles = 48 chunks,
+which fits ~comfortably on M3 Ultra's 60 GPU cores in one wave.
+Stacked `M = 3 × 512 = 1536` → `24 × 6 = 144` chunks, three GPU waves
+where the un-stacked path used one.  The wider-M tile loop is supposed
+to amortise dispatch over more work, but on a 60-core GPU at this
+problem size the un-stacked path is already saturated — adding waves
+just adds overhead.  Reverted.  (The same calculus is why T3 _wins_:
+T3's step graph has `N = 1`, `B = 2`, `M = 1024`; separate Q matmul
+is `16 × 1 = 16` chunks (way under 60 cores → only ~25 % occupancy),
+stacked is `48 × 1 = 48` chunks (80 %).  So the lever is exactly
+"how undersaturated is the un-stacked GPU mat-mul".)
+
+#### Bench (M3 Ultra, Metal, ES prompt + jfk.wav voice, seed 42, mean of 5 invocations)
+
+| Variant | T3 §3.22 base | T3 +Phase 15 | Δ T3       | Total §3.22 base | Total +P15 | Δ Total    |
+|---------|--------------:|-------------:|-----------:|-----------------:|-----------:|-----------:|
+| Q4_0    |        474 ms |   **433 ms** | **-8.7%**  |          1192 ms | **1153 ms**| **-3.3%**  |
+| F16     |        522 ms |   **493 ms** | **-5.5%**  |              ~   |          ~ |          ~ |
+
+Cumulative on the §3.21 baseline (pre-§3.21):
+- Q4_0 T3: 872 ms → **433 ms** (**−50 %** since §3.20)
+- Q4_0 RTF: 0.46 → **0.29**
+- F16 T3: 1099 ms → **493 ms** (**−55 %** since §3.20)
+
+WAV byte-exact gate: md5 `79002f09bc48dda95ec0c2cfc2b895bd` matches
+across §3.22 base and post-§3.23 at five separate invocations
+(`--temp 0 --top-k 1`, deterministic).
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [src/chatterbox_t3_internal.h](src/chatterbox_t3_internal.h) | `llama_layer` gains `wqkv`; `chatterbox_model` gains `ctx_stack` + `buffer_stack`. |
+| [src/t3_mtl.cpp](src/t3_mtl.cpp) | Post-load: allocate the Phase-15 stacked buffer + register with `t3_stack_registry` for atexit; per-layer copy of `wq`+`wk`+`wv` rows into `wqkv` via host scratch. `build_llama_block`: when `l.wqkv` is set, single mat-mul + view-split into Q/K/V; otherwise legacy three-mul path. New `t3_stack_unregister()` for `free_t3()` to call on error returns. |
+| [src/t3_mtl.h](src/t3_mtl.h) | Export `t3_stack_unregister()`. |
+| [src/chatterbox_cli.cpp](src/chatterbox_cli.cpp) | `free_t3()` calls `t3_stack_unregister()` then frees `buffer_stack` / `ctx_stack`. |
+
+
