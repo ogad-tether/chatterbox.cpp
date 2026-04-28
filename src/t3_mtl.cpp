@@ -329,11 +329,20 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
     cur = ggml_add(ctx, cur, inpL);
 
     // MLP (SwiGLU) with pre-norm + residual.
+    //
+    // Use ggml_swiglu_split (GGML_GLU_OP_SWIGLU on (gate, up)) so the
+    // separate `silu(gate)` + `gate * up` element-wise ops collapse into
+    // one fused Metal kernel (`kernel_swiglu_f32`).  Saves 30 dispatches
+    // per token (one per layer) on the per-step hot path.  Pre-norm
+    // pattern `mul(rms_norm(x), g)` is already auto-fused by
+    // ggml-metal's `can_fuse(RMS_NORM, MUL)` path
+    // (kernel_rms_norm_mul_f32) — leave it written as the obvious two
+    // ops here so CPU + non-Metal backends get the same shape.
     ggml_tensor * inpFF = cur;
     ggml_tensor * norm2 = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), l.ln_mlp_g);
-    ggml_tensor * gate  = ggml_silu(ctx, ggml_mul_mat(ctx, l.mlp_gate, norm2));
-    ggml_tensor * up    = ggml_mul_mat(ctx, l.mlp_up, norm2);
-    ggml_tensor * mlp   = ggml_mul(ctx, gate, up);
+    ggml_tensor * gate  = ggml_mul_mat(ctx, l.mlp_gate, norm2);
+    ggml_tensor * up    = ggml_mul_mat(ctx, l.mlp_up,   norm2);
+    ggml_tensor * mlp   = ggml_swiglu_split(ctx, gate, up);
     ggml_tensor * down  = ggml_mul_mat(ctx, l.mlp_down, mlp);
     return ggml_add(ctx, inpFF, down);
 }
