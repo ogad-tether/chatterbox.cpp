@@ -22,6 +22,12 @@ float get_f32(const gguf_context * ctx, const char * key) {
     return gguf_get_val_f32(ctx, require_key(ctx, key));
 }
 
+bool get_bool_u32(const gguf_context * ctx, const char * key, bool fallback = false) {
+    int64_t id = gguf_find_key(ctx, key);
+    if (id < 0) return fallback;
+    return gguf_get_val_u32(ctx, id) != 0;
+}
+
 std::string get_string(const gguf_context * ctx, const char * key, const std::string & fallback = {}) {
     int64_t id = gguf_find_key(ctx, key);
     if (id < 0) return fallback;
@@ -71,7 +77,7 @@ bool load_supertonic_gguf(const std::string & path, supertonic_model & model) {
 
     try {
         std::string arch = get_string(gguf_ctx, "supertonic.arch");
-        if (arch != "supertonic2") {
+        if (arch != "supertonic2" && arch != "supertonic") {
             throw std::runtime_error("unexpected supertonic.arch: " + arch);
         }
 
@@ -83,6 +89,8 @@ bool load_supertonic_gguf(const std::string & path, supertonic_model & model) {
         model.hparams.latent_channels = (int) get_u32(gguf_ctx, "supertonic.latent_channels");
         model.hparams.default_steps = (int) get_u32(gguf_ctx, "supertonic.default_steps");
         model.hparams.default_speed = get_f32(gguf_ctx, "supertonic.default_speed");
+        model.hparams.language_wrap = get_bool_u32(gguf_ctx, "supertonic.language_wrap", true);
+        model.hparams.default_voice = get_string(gguf_ctx, "supertonic.default_voice", "F1");
         model.languages = get_string_array(gguf_ctx, "supertonic.languages");
         model.tts_json = get_string(gguf_ctx, "supertonic.tts_json");
 

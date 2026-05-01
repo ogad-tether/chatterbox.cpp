@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=5)
     p.add_argument("--speed", type=float, default=1.05)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--no-language-wrap", action="store_true",
+                   help="Do not wrap text as <lang>... . Use for English-only Supertone/supertonic.")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--providers", default="CPUExecutionProvider",
                    help="Comma-separated ONNX Runtime providers.")
@@ -48,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def preprocess_text(text: str, lang: str) -> str:
+def preprocess_text(text: str, lang: str, language_wrap: bool = True) -> str:
     if lang not in AVAILABLE_LANGS:
         raise ValueError(f"invalid language: {lang}")
 
@@ -107,11 +109,12 @@ def preprocess_text(text: str, lang: str) -> str:
 
     if not re.search(r"[.!?;:,'\"')\]}…。」』】〉》›»]$", text):
         text += "."
-    return f"<{lang}>{text} "
+    return f"<{lang}>{text} " if language_wrap else text
 
 
-def text_to_ids(text: str, lang: str, unicode_indexer: list[int]) -> tuple[np.ndarray, np.ndarray, str]:
-    normalized = preprocess_text(text, lang)
+def text_to_ids(text: str, lang: str, unicode_indexer: list[int],
+                language_wrap: bool = True) -> tuple[np.ndarray, np.ndarray, str]:
+    normalized = preprocess_text(text, lang, language_wrap=language_wrap)
     ids = []
     for ch in normalized:
         cp = ord(ch)
@@ -173,8 +176,14 @@ def main() -> None:
         assets_dir = args.onnx_dir.parent.parent / "assets"
 
     voice_style_path = args.voice_style or (assets_dir / "voice_styles" / "M1.json")
-    unicode_indexer = json.loads((assets_dir / "unicode_indexer.json").read_text())
-    text_ids, text_mask, normalized_text = text_to_ids(args.text, args.lang, unicode_indexer)
+    if not voice_style_path.exists() and (args.onnx_dir.parent / "voice_styles" / "F1.json").exists():
+        voice_style_path = args.onnx_dir.parent / "voice_styles" / "F1.json"
+    unicode_path = assets_dir / "unicode_indexer.json"
+    if not unicode_path.exists() and (args.onnx_dir / "unicode_indexer.json").exists():
+        unicode_path = args.onnx_dir / "unicode_indexer.json"
+    unicode_indexer = json.loads(unicode_path.read_text())
+    text_ids, text_mask, normalized_text = text_to_ids(
+        args.text, args.lang, unicode_indexer, language_wrap=not args.no_language_wrap)
     style_ttl, style_dp = load_voice_style(voice_style_path)
 
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]

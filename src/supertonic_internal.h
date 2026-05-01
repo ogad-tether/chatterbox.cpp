@@ -19,6 +19,8 @@ struct supertonic_hparams {
     int latent_channels = 144;
     int default_steps = 5;
     float default_speed = 1.05f;
+    bool language_wrap = true;
+    std::string default_voice = "F1";
 };
 
 struct supertonic_voice_style {
@@ -49,7 +51,9 @@ void free_supertonic_model(supertonic_model & model);
 ggml_tensor * require_tensor(const supertonic_model & model, const std::string & name);
 ggml_tensor * require_source_tensor(const supertonic_model & model, const std::string & source_name);
 
-std::string supertonic_preprocess_text(const std::string & text, const std::string & language);
+std::string supertonic_preprocess_text(const std::string & text,
+                                       const std::string & language,
+                                       bool language_wrap);
 bool supertonic_text_to_ids(const supertonic_model & model,
                             const std::string & text,
                             const std::string & language,

@@ -7,7 +7,7 @@ namespace tts_cpp::supertonic {
 
 struct EngineOptions {
     std::string model_gguf_path;
-    std::string voice = "M1";
+    std::string voice = "F1";
     std::string language = "en";
     int steps = 5;
     float speed = 1.05f;

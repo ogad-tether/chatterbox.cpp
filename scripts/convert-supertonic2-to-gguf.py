@@ -42,6 +42,15 @@ def parse_args() -> argparse.Namespace:
                    help="Directory containing unicode_indexer.json and voice_styles/. "
                         "Defaults to --onnx-dir if present, otherwise ../../assets relative to --onnx-dir.")
     p.add_argument("--out", type=Path, default=Path("models/supertonic2.gguf"))
+    p.add_argument("--arch", default="supertonic2", choices=("supertonic", "supertonic2"),
+                   help="Model family metadata. Use 'supertonic' for the English-only HF bundle.")
+    p.add_argument("--reference-repo", default=None,
+                   help="HF repo/source metadata. Defaults from --arch.")
+    p.add_argument("--default-voice", default=None,
+                   help="Default voice metadata. Defaults to F1 when present, otherwise first voice.")
+    p.add_argument("--no-language-wrap", action="store_true",
+                   help="Store metadata telling runtimes not to wrap text as <lang>... . "
+                        "Use for the English-only Supertone/supertonic bundle.")
     p.add_argument("--validate", action="store_true",
                    help="Re-open the written GGUF and validate tensor count + metadata.")
     return p.parse_args()
@@ -53,6 +62,20 @@ def resolve_assets_dir(onnx_dir: Path, assets_dir: Path | None) -> Path:
     if (onnx_dir / "unicode_indexer.json").exists():
         return onnx_dir
     return onnx_dir.parent.parent / "assets"
+
+
+def resolve_unicode_indexer(onnx_dir: Path, assets_dir: Path) -> Path:
+    for candidate in (assets_dir / "unicode_indexer.json", onnx_dir / "unicode_indexer.json"):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"unicode_indexer.json not found under {assets_dir} or {onnx_dir}")
+
+
+def resolve_voice_styles_dir(onnx_dir: Path, assets_dir: Path) -> Path:
+    for candidate in (assets_dir / "voice_styles", onnx_dir / "voice_styles", onnx_dir.parent / "voice_styles"):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"voice_styles/ not found under {assets_dir}, {onnx_dir}, or {onnx_dir.parent}")
 
 
 def as_contiguous(arr: np.ndarray) -> np.ndarray:
@@ -122,17 +145,19 @@ def add_json_metadata(writer: "gguf.GGUFWriter", prefix: str, data: dict) -> Non
 def main() -> int:
     args = parse_args()
     assets_dir = resolve_assets_dir(args.onnx_dir, args.assets_dir)
+    unicode_path = resolve_unicode_indexer(args.onnx_dir, assets_dir)
+    voice_styles_dir = resolve_voice_styles_dir(args.onnx_dir, assets_dir)
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     cfg = json.loads((args.onnx_dir / "tts.json").read_text())
-    unicode_indexer = np.asarray(json.loads((assets_dir / "unicode_indexer.json").read_text()),
-                                 dtype=np.int32)
+    unicode_indexer = np.asarray(json.loads(unicode_path.read_text()), dtype=np.int32)
 
-    writer = gguf.GGUFWriter(str(args.out), "supertonic2")
-    writer.add_name("Supertonic 2")
-    writer.add_description("Supertonic 2 ONNX weights/assets converted for a model-specific ggml runtime.")
-    writer.add_string("supertonic.arch", "supertonic2")
-    writer.add_string("supertonic.reference_repo", "Supertone/supertonic-2")
+    reference_repo = args.reference_repo or ("Supertone/supertonic" if args.arch == "supertonic" else "Supertone/supertonic-2")
+    writer = gguf.GGUFWriter(str(args.out), args.arch)
+    writer.add_name("Supertonic" if args.arch == "supertonic" else "Supertonic 2")
+    writer.add_description(f"{reference_repo} ONNX weights/assets converted for a model-specific ggml runtime.")
+    writer.add_string("supertonic.arch", args.arch)
+    writer.add_string("supertonic.reference_repo", reference_repo)
     writer.add_string("supertonic.tts_version", str(cfg.get("tts_version", "")))
     writer.add_string("supertonic.split", str(cfg.get("split", "")))
     writer.add_uint32("supertonic.sample_rate", int(cfg["ae"]["sample_rate"]))
@@ -145,13 +170,14 @@ def main() -> int:
     )
     writer.add_uint32("supertonic.default_steps", 5)
     writer.add_float32("supertonic.default_speed", 1.05)
+    writer.add_uint32("supertonic.language_wrap", 0 if args.no_language_wrap else 1)
     writer.add_array("supertonic.languages", ["en", "ko", "es", "pt", "fr"])
     add_json_metadata(writer, "supertonic.tts_json", cfg)
 
     writer.add_tensor("supertonic/unicode_indexer", unicode_indexer)
 
     voice_names: list[str] = []
-    for voice_path in sorted((assets_dir / "voice_styles").glob("*.json")):
+    for voice_path in sorted(voice_styles_dir.glob("*.json")):
         voice_name = voice_path.stem
         voice = json.loads(voice_path.read_text())
         ttl = as_contiguous(np.asarray(voice["style_ttl"]["data"], dtype=np.float32))
@@ -162,6 +188,8 @@ def main() -> int:
                           json.dumps(voice.get("metadata", {}), ensure_ascii=False, separators=(",", ":")))
         voice_names.append(voice_name)
     writer.add_array("supertonic.voice_names", voice_names)
+    default_voice = args.default_voice or ("F1" if "F1" in voice_names else (voice_names[0] if voice_names else ""))
+    writer.add_string("supertonic.default_voice", default_voice)
 
     tensor_names: list[str] = []
     source_names: list[str] = []

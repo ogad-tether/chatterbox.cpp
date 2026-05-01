@@ -169,7 +169,9 @@ bool is_supported_language(const std::string & language) {
 
 } // namespace
 
-std::string supertonic_preprocess_text(const std::string & text, const std::string & language) {
+std::string supertonic_preprocess_text(const std::string & text,
+                                       const std::string & language,
+                                       bool language_wrap) {
     if (!is_supported_language(language)) {
         throw std::runtime_error("invalid Supertonic language: " + language);
     }
@@ -210,7 +212,7 @@ std::string supertonic_preprocess_text(const std::string & text, const std::stri
 
     s = collapse_spaces(s);
     if (!has_terminal_punct(s)) s += ".";
-    return "<" + language + ">" + s + " ";
+    return language_wrap ? "<" + language + ">" + s + " " : s;
 }
 
 bool supertonic_text_to_ids(const supertonic_model & model,
@@ -220,7 +222,7 @@ bool supertonic_text_to_ids(const supertonic_model & model,
                             std::string * normalized_text,
                             std::string * error) {
     try {
-        std::string normalized = supertonic_preprocess_text(text, language);
+        std::string normalized = supertonic_preprocess_text(text, language, model.hparams.language_wrap);
         std::vector<uint32_t> cps = utf8_to_cps(normalized);
         ids.clear();
         ids.reserve(cps.size());

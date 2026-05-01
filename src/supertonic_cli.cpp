@@ -12,7 +12,7 @@ namespace {
 void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s --model supertonic2.gguf --text TEXT --out out.wav\n"
-        "          [--language en] [--voice M1] [--steps 5] [--speed 1.05]\n"
+        "          [--language en] [--voice F1] [--steps 5] [--speed 1.05]\n"
         "          [--seed 42] [--noise-npy /path/to/noise.npy]\n",
         argv0);
 }
