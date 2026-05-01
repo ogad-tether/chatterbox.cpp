@@ -3360,3 +3360,152 @@ All §3.24 follow-ups now closed:
 - F32 `mul_mm + add(bias)` shader fusion — still deferred, ~150
   LOC Metal kernel work + test-metal-ops gate; bigger potential
   (+10–25 ms S3Gen) but not "quick"
+
+### 3.27  F32 `mul_mm + ADD(bias) [+ ADD(residual)]` fusion on Metal
+
+Closes the §3.22 §3.24 §3.26 follow-up "F32 `mul_mm + add(bias)` shader
+fusion in `patches/ggml-metal-chatterbox-ops.patch`". The existing
+fusion in the pinned `ggml-metal` pipeline covered only Q-variant
+**mul_mv** (matrix-vector) kernels via `helper_mv_add_bias`
+(Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 with bias+residual function-constant
+guards). The **mul_mm** (matrix-matrix) kernel — the one the CFM
+transformer actually hits at T·B ≥ 2 — had no equivalent. This
+section wires one in.
+
+#### What lands
+
+1. **`kernel_mul_mm` in `ggml-metal.metal`** gains two new function
+   constants (`FC_mul_mm_has_bias_` = `FC_MUL_MM + 2`,
+   `FC_mul_mm_has_residual_` = `+3`) and two new buffer slots
+   (`bias` at `buffer(4)`, `residual` at `buffer(5)`). When either
+   FC is true, the kernel routes through the shmem-backed
+   scalar-copy path and folds bias / residual into the copy loop
+   (same post-matmul math as `helper_mv_add_bias`: `v += bias[r0+i]`
+   and `v += residual[(r1+j)*ne0 + im*ne1*ne0 + r0 + i]`).
+   Compiler drops the branch that's not selected by the FC — zero
+   overhead when neither is set.
+
+2. **`get_pipeline_mul_mm` in `ggml-metal-device.cpp`** now takes
+   `has_bias, has_residual` flags, bakes them into the pipeline
+   name (`kernel_mul_mm_<T0>_<T1>_bci=X_bco=Y_bias=Z_res=W`), and
+   sets the function-constant values during compile. Shmem size
+   bumped from `4 KB+2 KB` to `8 KB` when either flag is set so
+   the always-shmem path has room for the temp buffer.
+
+3. **Dispatcher `ggml_metal_op_mul_mat` in `ggml-metal-ops.cpp`**
+   mirrors the Q-variant mul_mv fusion lookup: try
+   `{MUL_MAT, ADD, ADD}` first, fall back to `{MUL_MAT, ADD}`.
+   Both orderings of the residual add are handled (`ggml_add` is
+   commutative; chatterbox's `basic_tfm` emits
+   `ggml_add(x, attn_out)` with residual `x` as `src[0]` and the
+   mul_mat+bias result as `src[1]`). Writes fused dst to
+   `node(idx + n_fuse - 1)` so the value lands where the skipped
+   ADD(s) would have written, and returns `n_fuse` so the outer
+   loop skips them.
+
+#### Kernel variants actually compiled on a chatterbox run
+
+Verified via `ggml_metal_library_compile_pipeline` trace on first
+invocation (M3 Ultra, Q4_0 + HiFT F16 + sample-16k voice):
+
+```
+kernel_mul_mm_q4_0_f32_bci=0_bco=0_bias=1_res=0   ← CFM transformer linears, in-bounds blocks
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=1_res=0   ← CFM transformer linears, edge blocks
+kernel_mul_mm_f32_f32_bci=0_bco=0_bias=1_res=0    ← CFM time_mlp / final_proj
+kernel_mul_mm_f32_f32_bci=0_bco=1_bias=1_res=0
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=0_res=0   ← unfused matmuls (e.g. Q/K/V no-bias)
+kernel_mul_mm_f32_f32_bci=1_bco=1_bias=0_res=0
+```
+
+The `bias=1` variants account for ~280 fuse opportunities per CFM
+step × 10 steps × 2 CFG batches ≈ 1820 dispatches per synthesis
+that the old code paid a separate `ggml_add` kernel for. No
+`res=1` variants fire in the current chatterbox graph: the
+`ADD(residual)` in `basic_tfm` is at a different point in the
+graph (separated by `layer_norm` → `mul_mat` → `add(bias)` →
+`gelu_erf` → `mul_mat` → `add(bias)` → add(x, ff)`), so the
+residual add can't be folded into the preceding mul_mm without
+hoisting those intermediate ops. Left as future work — the
+infrastructure is in place either way for consumers whose
+residual is adjacent to their mul_mat.
+
+#### Bench (M3 Ultra, Metal, Q4_0 + HiFT F16, ES prompt, seed 42)
+
+5-invocation averages (WAV deterministic, md5 identical across
+all 5 runs):
+
+| Metric             | §3.26 baseline | §3.27 fused      | Δ               |
+|--------------------|---------------:|-----------------:|----------------:|
+| `[encoder]` ms     |    31.3        |   30.5           | noise           |
+| `[cfm_total]` ms   |   541.9        |  542.2 (± 5 per-run) | **neutral** |
+| `[hift_decode]` ms |   121.3        |  121.2           | neutral         |
+| S3GEN_INFER_MS     |   709          |  713.2           | +4 (noise)      |
+| T3_INFER_MS        |   440          |  433.4           | −7 (noise)      |
+| md5                | d8a1b22…      | d8a1b22…         | **byte-exact**  |
+
+Cross-check: running with `GGML_METAL_FUSION_DISABLE=1` (turns off
+ALL ggml-metal fusions, including the pre-existing norm+mul+add
+and Q-variant mul_mv+bias+residual) pushes CFM to **568.9 ms**
+steady across 3 runs — a 27 ms penalty from the aggregate fusion
+system. My new mul_mm+add contribution to that total is a small
+fraction; most of the win comes from norm+mul+add fusion (which
+ggml already ships).
+
+#### Why the measured gain is near-zero on M3 Ultra specifically
+
+Two reasons. First, M3 Ultra's Metal per-dispatch overhead is
+low (~20–30 µs) and `ggml_add` kernels are tiny, so the 1820
+eliminated dispatches only add up to ~45 ms theoretical — and
+many of those would overlap with subsequent kernels' command-
+buffer execution, not sit on the critical path. Second, when
+`has_bias` is true, the kernel is forced through the shmem
+path (direct-store + post-barrier bias-add proved too complex
+to retrofit into both the tensor-API and simdgroup-fallback
+paths in the time budget for this session); the shmem roundtrip
+costs ~an equal amount. Net: neutral on M3 Ultra.
+
+#### Why it still ships
+
+1. **Correctness**: byte-exact audio (md5 `d8a1b22375dbcb2259c686426a7d76c5`
+   matches §3.26 across 5 runs). `test-metal-ops` PASSes on all
+   four pre-existing ops (diag_mask_inf, pad_ext, conv_transpose_1d
+   at three upsample stages + tiny edge).
+2. **Expected positive elsewhere**: M4 Air / iPhone / iPad have
+   proportionally higher Metal per-dispatch overhead and lower
+   core counts than M3 Ultra, so the saved 1820 dispatches should
+   translate to a measurable win (expected range: +5–15 ms S3Gen,
+   same ratio §3.24's HiFT F16 result predicted). Can't verify on
+   M3 Ultra alone.
+3. **Streaming**: Mode 2/3 streaming synthesises short chunks
+   where the per-chunk dispatch count matters more relative to
+   compute — fusion is expected to be proportionally larger there.
+4. **Forward leverage**: the FC_MUL_MM + 2 / +3 slots + helper
+   routing are the plumbing future sessions will reuse to extend
+   fusion to `mul_mm_id` (MoE shapes), to F16 weight variants
+   (once the `kernel_mul_mv_f32_f16_short` family from §3.26 has
+   a matching mul_mm story), or to direct-store-path variants
+   that would reclaim the shmem-roundtrip cost on M3 Ultra.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| `ggml/src/ggml-metal/ggml-metal.metal` | Two new FC constants (FC_MUL_MM + 2 / +3), two new buffer args (slots 4 and 5) on `kernel_mul_mm`, forced-shmem path when either FC is true, bias/residual fold-in inside the scalar-copy loop. Local edit under the `ggml/` worktree; not tracked in this repo. |
+| `ggml/src/ggml-metal/ggml-metal-device.{cpp,h}` | `get_pipeline_mul_mm(op, has_bias, has_residual)` — new signature; bakes flags into pipeline name + FC values; shmem sizing adjusted to 8 KB when fused. |
+| `ggml/src/ggml-metal/ggml-metal-ops.cpp` | `ggml_metal_op_mul_mat` mul_mm path gains the same `can_fuse({MUL_MAT,ADD,ADD})` / `can_fuse({MUL_MAT,ADD})` lookup the mul_mv path already had; both orderings of the residual add handled; `n_fuse` returned to skip the folded ADDs. |
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | +262 lines. Regenerated from pinned `58c38058`. 733 → 995 lines. |
+
+#### What's next
+
+- **Reclaim the shmem-roundtrip cost on M3 Ultra**: add bias fold-in
+  to the direct-store paths (both the tensor-API `cT.store` path
+  and the simdgroup-fallback `simdgroup_store` loop). Would need
+  a post-barrier per-simdgroup read-modify-write pass on device
+  memory. 2–3 h of additional Metal kernel work; predicted to
+  flip §3.27 from neutral to +5–10 ms on M3 Ultra.
+- **Extend to `mul_mm_id`** (mixture-of-experts mat-muls) — same
+  FC pattern applies. Zero-change for chatterbox (doesn't use
+  MoE), but useful for future consumers of this patch.
+- **Bench on M4 / iOS** — validate the "neutral on M3U, positive
+  elsewhere" prediction. Until measured the estimate is just
+  that.

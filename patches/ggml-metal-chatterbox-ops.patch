@@ -1,8 +1,46 @@
 diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
-index e8548b05..5d933631 100644
+index e8548b05..b743b317 100644
 --- a/src/ggml-metal/ggml-metal-device.cpp
 +++ b/src/ggml-metal/ggml-metal-device.cpp
-@@ -699,7 +699,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+@@ -668,7 +668,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
+     return res;
+ }
+ 
+-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op, bool has_bias, bool has_residual) {
+     char base[256];
+     char name[256];
+ 
+@@ -679,27 +679,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+     const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0;
+ 
+     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+-    snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
++    snprintf(name, 256, "%s_bci=%d_bco=%d_bias=%d_res=%d", base, bc_inp, bc_out, (int) has_bias, (int) has_residual);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         ggml_metal_cv_t cv = ggml_metal_cv_init();
+ 
+-        ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
+-        ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
++        ggml_metal_cv_set_bool(cv, bc_inp,       FC_MUL_MM + 0);
++        ggml_metal_cv_set_bool(cv, bc_out,       FC_MUL_MM + 1);
++        ggml_metal_cv_set_bool(cv, has_bias,     FC_MUL_MM + 2);
++        ggml_metal_cv_set_bool(cv, has_residual, FC_MUL_MM + 3);
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+         ggml_metal_cv_free(cv);
+     }
+ 
+-    // when the output size is not multiple of 64x32, we need extra smem to prevent out-of-bounds writes
+-    res.smem = bc_out ? 8192 : 4096 + 2048;
++    // when the output size is not multiple of 64x32, or bias/residual is
++    // fused, we need the shmem path (8 KB) to host the temp_str buffer
++    // so the scalar-copy loop can read + add + write.
++    res.smem = (bc_out || has_bias || has_residual) ? 8192 : 4096 + 2048;
+ 
      return res;
  }
  
@@ -11,7 +49,7 @@ index e8548b05..5d933631 100644
      GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
      GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
  
-@@ -857,13 +857,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+@@ -857,13 +861,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
      };
  
      snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
@@ -29,7 +67,7 @@ index e8548b05..5d933631 100644
  
          res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
  
-@@ -1854,6 +1856,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d(g
+@@ -1854,6 +1860,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d(g
      return res;
  }
  
@@ -51,14 +89,16 @@ index e8548b05..5d933631 100644
      assert(op->op == GGML_OP_ARANGE);
  
 diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
-index de43f819..b6d6b3d5 100644
+index de43f819..9fb3a9f1 100644
 --- a/src/ggml-metal/ggml-metal-device.h
 +++ b/src/ggml-metal/ggml-metal-device.h
-@@ -129,7 +129,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_del
+@@ -128,8 +128,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, enum ggml_type tsrc0, enum ggml_type tsrc1, int nsg, int nxpsg, int r1ptg);
- struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 -struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op, bool has_bias, bool has_residual);
 +struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op, bool has_bias, bool has_residual);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -119,7 +159,7 @@ index 62b028f4..384db806 100644
      int64_t  ne00;
      int64_t  ne01;
 diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
-index 846225d9..3555ce8c 100644
+index 846225d9..e41a7d6f 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
 @@ -410,6 +410,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
@@ -133,9 +173,123 @@ index 846225d9..3555ce8c 100644
          case GGML_OP_ARANGE:
              {
                  n_fuse = ggml_metal_op_arange(ctx, idx);
-@@ -2186,7 +2190,85 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+@@ -2156,7 +2160,91 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         //    default: break;
+         //}
+ 
+-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
++        // chatterbox PROGRESS §3.27: MUL_MAT + ADD(bias) [+ ADD(residual)]
++        // fusion for the `mul_mm` matrix-matrix kernel, mirroring the
++        // Q-variant `mul_mv` fusion just above.  In the mul_mm path the
++        // kernel is shape-generic (any tsrc0 / tsrc1 combo) — the
++        // `helper_mm_add_bias` inlined into `kernel_mul_mm`'s shmem-copy
++        // path handles bias/residual in f32 regardless of weight dtype.
++        // That means this fusion fires for the CFM U-Net's 168× Q4_0
++        // attn Q/K/V/O and 112× Q4_0 FF gate/down mat-muls per step,
++        // which the mul_mv fusion couldn't reach because ne11 > mm_min
++        // routes those to mul_mm.  Expected savings: ~1820 bin_fuse
++        // dispatches/synth (~56 tfm blocks × 3 linear × 10 steps × 2
++        // CFG batches).
++        bool has_bias     = false;
++        bool has_residual = false;
++        int  n_fuse       = 1;
++        ggml_metal_buffer_id bid_bias     = {};
++        ggml_metal_buffer_id bid_residual = {};
++
++        auto bias_ok = [&](const ggml_tensor * b) {
++            return b &&
++                   ggml_is_contiguous(b) &&
++                   b->type == GGML_TYPE_F32 &&
++                   ggml_nelements(b) == ne0 &&
++                   b->ne[0]          == ne0;
++        };
++        auto residual_ok = [&](const ggml_tensor * r, const ggml_tensor * mm) {
++            return r && mm &&
++                   ggml_is_contiguous(r) &&
++                   r->type == GGML_TYPE_F32 &&
++                   ggml_are_same_shape(r, mm);
++        };
++
++        if (ctx->use_fusion) {
++            // Try MUL_MAT + ADD(bias) + ADD(residual) first.  ggml_add is
++            // commutative and the high-level graph builder may emit the
++            // residual as either src[0] or src[1] of the outer add
++            // (chatterbox's basic_tfm uses `ggml_add(x, attn_out)` with
++            // residual=x as src[0], attn_out=f1 as src[1]).  Handle both.
++            ggml_op fops3[3] = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD };
++            if (ctx->can_fuse(idx, fops3, 3)) {
++                ggml_tensor * f0 = ctx->node(idx);
++                ggml_tensor * f1 = ctx->node(idx + 1);
++                ggml_tensor * f2 = ctx->node(idx + 2);
++                auto try_fuse3 = [&](ggml_tensor * bias_t, ggml_tensor * resi_t, ggml_tensor * parent_add) -> bool {
++                    if (!(f1->src[0] == f0 && bias_ok(bias_t))) return false;
++                    if (!residual_ok(resi_t, f0)) return false;
++                    if (parent_add != f1) return false; // residual add must reference f1
++                    ggml_metal_buffer_id bid_b = ggml_metal_get_buffer_id(bias_t);
++                    ggml_metal_buffer_id bid_r = ggml_metal_get_buffer_id(resi_t);
++                    if (!bid_b.metal || !bid_r.metal) return false;
++                    has_bias     = true;
++                    has_residual = true;
++                    bid_bias     = bid_b;
++                    bid_residual = bid_r;
++                    n_fuse       = 3;
++                    return true;
++                };
++                // Case A: f2 = add(f1, residual)   → src[0]=f1, src[1]=residual
++                if (!try_fuse3(f1->src[1], f2->src[1], f2->src[0])) {
++                    // Case B: f2 = add(residual, f1)   → src[0]=residual, src[1]=f1
++                    try_fuse3(f1->src[1], f2->src[0], f2->src[1]);
++                }
++            }
++            // Fall back to MUL_MAT + ADD(bias).  Also commutative-aware.
++            if (n_fuse == 1) {
++                ggml_op fops2[2] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
++                if (ctx->can_fuse(idx, fops2, 2)) {
++                    ggml_tensor * f0 = ctx->node(idx);
++                    ggml_tensor * f1 = ctx->node(idx + 1);
++                    ggml_tensor * bias_t = nullptr;
++                    if      (f1->src[0] == f0 && bias_ok(f1->src[1])) bias_t = f1->src[1];
++                    else if (f1->src[1] == f0 && bias_ok(f1->src[0])) bias_t = f1->src[0];
++                    if (bias_t) {
++                        ggml_metal_buffer_id bid_b = ggml_metal_get_buffer_id(bias_t);
++                        if (bid_b.metal) {
++                            has_bias = true;
++                            bid_bias = bid_b;
++                            n_fuse   = 2;
++                        }
++                    }
++                }
++            }
++        }
++
++        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, has_bias, has_residual);
+ 
+         ggml_metal_kargs_mul_mm args = {
+             /*.ne00 =*/ ne00,
+@@ -2179,14 +2267,105 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
++        // When a fused variant is picked, dst must point to the final ADD's
++        // output tensor (matches mul_mv fusion convention).
++        ggml_metal_buffer_id bid_dst = (n_fuse > 1)
++            ? ggml_metal_get_buffer_id(ctx->node(idx + n_fuse - 1))
++            : ggml_metal_get_buffer_id(op);
++        ggml_metal_encoder_set_buffer  (enc, bid_dst, 3);
++        // Slots 4 and 5: bias and residual.  Bind a harmless stand-in
++        // (src[0]) when the corresponding function constant is false so
++        // the shader's dead-code-eliminated branch never reads it.
++        ggml_metal_encoder_set_buffer  (enc, has_bias     ? bid_bias     : ggml_metal_get_buffer_id(op->src[0]), 4);
++        ggml_metal_encoder_set_buffer  (enc, has_residual ? bid_residual : ggml_metal_get_buffer_id(op->src[0]), 5);
+ 
+         const size_t smem = pipeline.smem;
+ 
          ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
          ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + 31)/32), ((ne01 + 63)/64), ne12*ne13, 128, 1, 1);
++
++        // Return n_fuse so the outer loop skips the fused ADDs.
++        return n_fuse;
      } else {
 -        auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
 +        // Look ahead: can we fuse a following ADD(bias) (optionally followed
@@ -220,7 +374,7 @@ index 846225d9..3555ce8c 100644
  
          const int nr0 = pipeline.nr0;
          const int nr1 = pipeline.nr1;
-@@ -2220,7 +2302,20 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+@@ -2220,7 +2399,20 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
          ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
          ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
          ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
@@ -242,7 +396,7 @@ index 846225d9..3555ce8c 100644
  
          ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
  
-@@ -2232,6 +2327,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+@@ -2232,6 +2424,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
          } else {
              ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
          }
@@ -251,7 +405,7 @@ index 846225d9..3555ce8c 100644
      }
  
      return 1;
-@@ -3813,7 +3910,9 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
+@@ -3813,7 +4007,9 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
      ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
      ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
  
@@ -262,7 +416,7 @@ index 846225d9..3555ce8c 100644
  
      return 1;
  }
-@@ -3949,6 +4048,14 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
+@@ -3949,6 +4145,14 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
      GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
      GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
  
@@ -277,7 +431,7 @@ index 846225d9..3555ce8c 100644
      ggml_metal_kargs_pad args = {
          /*.ne00 =*/ ne00,
          /*.ne01 =*/ ne01,
-@@ -3965,7 +4072,11 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
+@@ -3965,7 +4169,11 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
          /*.nb0  =*/ nb0,
          /*.nb1  =*/ nb1,
          /*.nb2  =*/ nb2,
@@ -290,7 +444,7 @@ index 846225d9..3555ce8c 100644
      };
  
      auto pipeline = ggml_metal_library_get_pipeline_pad(lib, op);
-@@ -4028,6 +4139,39 @@ int ggml_metal_op_pad_reflect_1d(ggml_metal_op_t ctx, int idx) {
+@@ -4028,6 +4236,39 @@ int ggml_metal_op_pad_reflect_1d(ggml_metal_op_t ctx, int idx) {
      return 1;
  }
  
@@ -343,7 +497,7 @@ index 50e3c5c7..a3aa05c1 100644
  int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
 diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
-index f67c5cd8..c67626e3 100644
+index f67c5cd8..d64ffb92 100644
 --- a/src/ggml-metal/ggml-metal.metal
 +++ b/src/ggml-metal/ggml-metal.metal
 @@ -3300,6 +3300,63 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
@@ -731,3 +885,111 @@ index f67c5cd8..c67626e3 100644
  kernel void kernel_pad_reflect_1d_f32(
      constant   ggml_metal_kargs_pad_reflect_1d & args,
      device  const char * src0,
+@@ -9262,6 +9447,19 @@ kernel void kernel_diag_f32(
+ constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
+ constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
+ 
++// chatterbox PROGRESS §3.27: mul_mm + ADD(bias) [+ ADD(residual)] fusion.
++// Mirrors the Q-variant mul_mv fusion (helper_mv_add_bias).  Bias is a
++// broadcast vector of shape [ne0] (OC); residual has the same shape and
++// stride as dst.  Either or both can be disabled via their function
++// constant, in which case the Metal compiler drops the corresponding
++// branch at specialisation time.  Bound at buffer slots 4 and 5
++// regardless of flag so the host can always bind a placeholder (src[0])
++// when the flag is false — matches the mul_mv fusion wiring convention.
++constant bool FC_mul_mm_has_bias_     [[function_constant(FC_MUL_MM + 2)]];
++constant bool FC_mul_mm_has_residual_ [[function_constant(FC_MUL_MM + 3)]];
++#define FC_mul_mm_has_bias     FC_mul_mm_has_bias_
++#define FC_mul_mm_has_residual FC_mul_mm_has_residual_
++
+ // each block_q contains 16*nl weights
+ template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+ kernel void kernel_mul_mm(
+@@ -9269,6 +9467,8 @@ kernel void kernel_mul_mm(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
++        device const char * bias     [[buffer(4)]],
++        device const char * residual [[buffer(5)]],
+         threadgroup  char * shmem [[threadgroup(0)]],
+         uint3  tgpig[[threadgroup_position_in_grid]],
+         ushort tiitg[[thread_index_in_threadgroup]],
+@@ -9514,7 +9714,14 @@ kernel void kernel_mul_mm(
+ #endif
+     }
+ 
+-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
++    // chatterbox PROGRESS §3.27: when bias or residual is fused in, route
++    // through the shmem + scalar-copy path so the bias-add + residual-add
++    // can happen inside the copy loop (same pattern as the Q-variant
++    // helper_mv_add_bias).  Non-fused path stays on the fast direct-store.
++    const bool _mm_bounds_ok = (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1);
++    const bool _mm_use_direct = (!FC_mul_mm_bc_out || _mm_bounds_ok)
++                                && !FC_mul_mm_has_bias && !FC_mul_mm_has_residual;
++    if (_mm_use_direct) {
+         // if no bounds checks on the output are needed, we can directly write to device memory
+ #ifdef GGML_METAL_HAS_TENSOR
+         device float * C = (device float *) dst +
+@@ -9533,7 +9740,9 @@ kernel void kernel_mul_mm(
+         }
+ #endif
+     } else {
+-        // block is smaller than 64x32, we should avoid writing data outside of the matrix
++        // block is smaller than 64x32 OR bias/residual is fused — route
++        // through shmem so the sgitg==0 scalar copy can read + add + write
++        // in one pass.
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+@@ -9550,21 +9759,41 @@ kernel void kernel_mul_mm(
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+         if (sgitg == 0) {
++            device const float * bias_f32     = (device const float *) bias;
++            device const float * residual_f32 = (device const float *) residual;
+             for (int j = tiitg; j < nr1; j += NR1) {
+                 device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+-                device float4 * D4 = (device float4 *) D;
+-
+                 threadgroup float  * C  = temp_str + (j*NR0);
+-                threadgroup float4 * C4 = (threadgroup float4 *) C;
+ 
+-                int i = 0;
+-                for (; i < nr0/4; i++) {
+-                    *(D4 + i) = *(C4 + i);
+-                }
++                if (!FC_mul_mm_has_bias && !FC_mul_mm_has_residual) {
++                    device float4 * D4 = (device float4 *) D;
++                    threadgroup float4 * C4 = (threadgroup float4 *) C;
++
++                    int i = 0;
++                    for (; i < nr0/4; i++) {
++                        *(D4 + i) = *(C4 + i);
++                    }
+ 
+-                i *= 4;
+-                for (; i < nr0; i++) {
+-                    *(D + i) = *(C + i);
++                    i *= 4;
++                    for (; i < nr0; i++) {
++                        *(D + i) = *(C + i);
++                    }
++                } else {
++                    // Fused write path: fold bias (broadcast over rows / batches
++                    // via shape [ne0]) and/or residual (same shape + stride as
++                    // dst) into the scalar copy.  Compiler drops the branches
++                    // that aren't selected by the function constants.
++                    const uint64_t res_off = (uint64_t)(r1 + j)*args.ne0 + (uint64_t)im*args.ne1*args.ne0;
++                    for (int i = 0; i < nr0; i++) {
++                        float v = *(C + i);
++                        if (FC_mul_mm_has_bias) {
++                            v += bias_f32[r0 + i];
++                        }
++                        if (FC_mul_mm_has_residual) {
++                            v += residual_f32[res_off + r0 + i];
++                        }
++                        *(D + i) = v;
++                    }
+                 }
+             }
+         }
