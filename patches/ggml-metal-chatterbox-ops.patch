@@ -1,5 +1,5 @@
 diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
-index e8548b05..e934e8c5 100644
+index e8548b05..9114903b 100644
 --- a/src/ggml-metal/ggml-metal-device.cpp
 +++ b/src/ggml-metal/ggml-metal-device.cpp
 @@ -668,7 +668,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
@@ -11,7 +11,7 @@ index e8548b05..e934e8c5 100644
      char base[256];
      char name[256];
  
-@@ -679,27 +679,34 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+@@ -679,27 +679,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
      const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0;
  
      snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
@@ -41,7 +41,8 @@ index e8548b05..e934e8c5 100644
 +    // when the output size is not multiple of 64x32, or any of bias /
 +    // residual / gelu_erf is fused, we need the shmem path (8 KB) to
 +    // host the temp_str buffer so the scalar-copy loop can read + fold
-+    // + write.
++    // + write.  (Attempted §3.29 direct-store RMW variant reverted —
++    // see §3.29 writeup.)
 +    res.smem = (bc_out || has_bias || has_residual || has_gelu_erf) ? 8192 : 4096 + 2048;
  
      return res;
@@ -52,7 +53,7 @@ index e8548b05..e934e8c5 100644
      GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
      GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
  
-@@ -857,13 +864,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+@@ -857,13 +865,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
      };
  
      snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
@@ -70,7 +71,7 @@ index e8548b05..e934e8c5 100644
  
          res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
  
-@@ -1854,6 +1863,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d(g
+@@ -1854,6 +1864,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d(g
      return res;
  }
  
@@ -532,7 +533,7 @@ index 50e3c5c7..a3aa05c1 100644
  int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
 diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
-index f67c5cd8..f7084c35 100644
+index f67c5cd8..5bb4ad5d 100644
 --- a/src/ggml-metal/ggml-metal.metal
 +++ b/src/ggml-metal/ggml-metal.metal
 @@ -3300,6 +3300,63 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
@@ -956,7 +957,7 @@ index f67c5cd8..f7084c35 100644
          threadgroup  char * shmem [[threadgroup(0)]],
          uint3  tgpig[[threadgroup_position_in_grid]],
          ushort tiitg[[thread_index_in_threadgroup]],
-@@ -9514,7 +9721,17 @@ kernel void kernel_mul_mm(
+@@ -9514,7 +9721,32 @@ kernel void kernel_mul_mm(
  #endif
      }
  
@@ -966,6 +967,21 @@ index f67c5cd8..f7084c35 100644
 +    // so the fold-in can happen inside the copy loop (same pattern as
 +    // the Q-variant helper_mv_add_bias).  Non-fused path stays on the
 +    // fast direct-store.
++    //
++    // §3.29 ATTEMPTED to also patch the direct-store path to do an
++    // RMW fold-in pass (instead of forcing shmem) — goal was to
++    // reclaim the shmem-roundtrip cost on M3 Ultra.  That attempt
++    // produced wrong output (T3 EOS'd early at 70 tokens vs expected
++    // 84, md5 `06ee1aaaa94a10d70eec2835d3da7dbf` vs §3.28 baseline
++    // `d8a1b22375dbcb2259c686426a7d76c5`) despite test-metal-ops
++    // passing — root cause was never isolated in the §3.29 session.
++    // Suspects: per-simdgroup partition doesn't match cT.store's
++    // cooperative layout, threadgroup-barrier memory ordering with
++    // mem_flags::mem_device is weaker than expected on A17/M3,
++    // or an index/broadcast bug in the RMW pass that test-metal-ops
++    // doesn't exercise.  Reverted to the §3.28 shmem-forcing
++    // behaviour.  Tracked as a structural follow-up — see §3.29
++    // writeup for what a future attempt should test first.
 +    const bool _mm_bounds_ok = (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1);
 +    const bool _mm_use_direct = (!FC_mul_mm_bc_out || _mm_bounds_ok)
 +                                && !FC_mul_mm_has_bias
@@ -975,7 +991,7 @@ index f67c5cd8..f7084c35 100644
          // if no bounds checks on the output are needed, we can directly write to device memory
  #ifdef GGML_METAL_HAS_TENSOR
          device float * C = (device float *) dst +
-@@ -9533,7 +9750,9 @@ kernel void kernel_mul_mm(
+@@ -9533,7 +9765,9 @@ kernel void kernel_mul_mm(
          }
  #endif
      } else {
@@ -986,7 +1002,7 @@ index f67c5cd8..f7084c35 100644
          threadgroup_barrier(mem_flags::mem_threadgroup);
  
          threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
-@@ -9550,21 +9769,55 @@ kernel void kernel_mul_mm(
+@@ -9550,21 +9784,55 @@ kernel void kernel_mul_mm(
          threadgroup_barrier(mem_flags::mem_threadgroup);
  
          if (sgitg == 0) {

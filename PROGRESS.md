@@ -3641,3 +3641,172 @@ M3 Ultra by fusing bias into the direct-store paths (both
 tensor-API `cT.store` and simdgroup-fallback `simdgroup_store`).
 2–3 h of Metal kernel work; predicted to flip the §3.27 contribution
 from neutral to +3–5 ms CFM on top of today's §3.28 gain.
+
+### 3.29  Direct-store fold-in — _negative finding, reverted_
+
+Goal: reclaim the §3.27 neutral-on-M3-Ultra result by keeping the
+fast `cT.store` / `simdgroup_store` direct-to-device-memory path
+for full-block writes and doing the bias / residual / gelu_erf
+fold-in as a **post-barrier read-modify-write pass** on device
+memory, instead of routing through the shmem + scalar-copy path.
+
+The shmem path that §3.27 ships is correct but costs a
+threadgroup-memory roundtrip (4 simdgroups stage into a shared
+`temp_str` buffer, sgitg==0 drains it with a scalar loop).  On
+M3 Ultra that roundtrip is ~equal to the dispatch savings from
+eliminating the separate `ggml_add` kernel — hence the "neutral"
+§3.27 result.  §3.28 worked because gelu is an extra per-element
+tail op inside a loop that already exists; it added ~zero cost.
+§3.29 tried to do the same for bias, but on a different path.
+
+#### What was tried
+
+```cpp
+if (_mm_use_direct) {
+#ifdef GGML_METAL_HAS_TENSOR
+    cT.store(tC);                    // cooperative 64x32 store
+#else
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], ...); // per-simdgroup 32x16 store
+    }
+#endif
+    if (_mm_has_foldin) {
+        threadgroup_barrier(mem_flags::mem_device);   // flush stores
+        // distribute 2048 elements of the 64x32 block across 128
+        // threads of the threadgroup — each thread does 16 RMWs
+        const int thread_idx = (int) tiitg;
+        for (int k = thread_idx; k < NR0 * NR1; k += 128) {
+            const int abs_r = r0 + (k % NR0);
+            const int abs_c = r1 + (k / NR0);
+            const uint64_t off = (uint64_t)abs_c * ne0 + abs_r + ...;
+            device float * D = (device float *) dst + off;
+            float v = *D;
+            if (FC_mul_mm_has_bias)     v += bias_f32[abs_r];
+            if (FC_mul_mm_has_residual) v += residual_f32[off];
+            if (FC_mul_mm_has_gelu_erf) v = 0.5f*v*(1.0f + erf_approx(v * SQRT_2_INV));
+            *D = v;
+        }
+    }
+}
+```
+
+`get_pipeline_mul_mm` sized back down to the non-fold-in shmem
+(6 KB) when fold-ins are active, on the theory that only edge
+blocks need `temp_str`.
+
+#### What happened
+
+`test-metal-ops` PASSed on all pre-existing ops (diag_mask_inf,
+pad_ext, conv_transpose_1d × 3 + tiny edge) — the kernel compiled
+clean, the new `_short` / `_4` / `bias=1` variants all built.
+
+But the end-to-end chatterbox synth produced **wrong output**:
+
+| Metric      | §3.28 baseline                         | §3.29 attempt                         |
+|-------------|----------------------------------------|---------------------------------------|
+| md5         | `d8a1b22375dbcb2259c686426a7d76c5`    | `06ee1aaaa94a10d70eec2835d3da7dbf`   |
+| T3 tokens   | 84                                     | 70                                    |
+| audio_ms    | 3480                                   | 2920                                  |
+| determinism | stable across 5 runs                   | stable (same wrong md5 across runs)   |
+
+T3 EOS'd 14 tokens early.  The wrong md5 was deterministic —
+not a race, but a systematic computation error that's _consistent_
+every run.  Reverted to the §3.28 shmem-forcing behaviour
+(byte-exact to `d8a1b22…`).
+
+#### Suspected root causes (not isolated in this session)
+
+1. **Cooperative tensor-store layout**: `cT.store(tC)` is an
+   Apple Metal tensor-ops cooperative write across all four
+   simdgroups in the threadgroup.  Where each element lands in
+   device memory is implementation-defined, not trivially the
+   32x16 per-simdgroup partition `simdgroup_store` uses in the
+   fallback path.  The RMW pass as written assumes the partition
+   doesn't matter (it iterates the full 64x32 via tiitg), but
+   maybe the threadgroup_barrier with `mem_flags::mem_device`
+   isn't strong enough to order `cT.store`'s writes against
+   subsequent device reads from the same threadgroup on A17 /
+   M3.  A real memory-model audit (or testing with `fence()`
+   instead of `threadgroup_barrier`) is the next thing to try.
+
+2. **`bias_ok` / `residual_ok` shape check vs graph layout**:
+   `bias_ok` only requires `ggml_nelements(bias) == ne0` and
+   `bias->ne[0] == ne0`, which is correct for the usual
+   `(OC,)` broadcast.  But `residual_ok` requires
+   `ggml_are_same_shape(resi, mul_mat_result)`.  The mul_mat's
+   output shape is `(ne0, ne1, ne2, ne3)`; if the residual
+   happens to have matching shape but different strides (e.g.,
+   a non-contiguous view), the RMW would silently read the
+   wrong bytes.  §3.27's shmem path also trusted this check,
+   and that one works — but the shmem path copies element by
+   element, which could hide a stride bug that direct-store
+   reveals.  Worth an audit.
+
+3. **Index calculation off-by-one or wrong stride**: the RMW
+   uses `off = abs_c * ne0 + abs_r + im*ne1*ne0`, which matches
+   the in-bounds direct-store formula
+   `dst + r0 + r1*ne0 + im*ne1*ne0`.  But I didn't pass `nb0` /
+   `nb1` through — the direct-store uses `args.ne0` as stride
+   assuming contiguous f32 output.  If the destination tensor
+   is non-contiguous (say, a view into a larger buffer) the
+   mul_mat kernel itself would be wrong too, so this is
+   probably not the bug, but worth double-checking in a unit
+   test.
+
+#### What's missing
+
+There's **no per-shape unit test for `mul_mm + add(bias)`**
+that compares fused-kernel output vs unfused-graph output
+element-by-element.  `test-metal-ops` only covers
+diag_mask_inf, pad_ext, and conv_transpose_1d.  Adding a
+`mul_mm_fused` test case (build a small ggraph with
+mul_mat + add, dispatch with fusion forced on vs
+`GGML_METAL_FUSION_DISABLE=1`, compare outputs to 1e-6
+tolerance) would have caught §3.29's bug in seconds.  The
+§3.27 and §3.28 kernels *happen* to be byte-exact because
+their fold-in happens inside the scalar-copy loop which is
+straightforward to reason about; §3.29's direct-store RMW has
+a more subtle data-flow that would benefit from explicit
+coverage.
+
+#### Files touched / reverted
+
+| File | Change |
+|------|--------|
+| `ggml/src/ggml-metal/ggml-metal.metal` | Direct-store RMW block *removed*; 21-line commentary added in place explaining §3.29 attempt + failure + suspected causes for the next person to read. `_mm_use_direct` reverts to §3.28's "no fold-in allowed on direct-store path" condition. |
+| `ggml/src/ggml-metal/ggml-metal-device.cpp` | `get_pipeline_mul_mm` shmem sizing reverts to §3.28 behavior (8 KB when any of `bc_out` / `has_bias` / `has_residual` / `has_gelu_erf` is set). |
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | Regenerated from pinned `58c38058`.  1054 → 1070 lines (+16, the inline documentation block). |
+
+#### Result
+
+`cb_rev.wav` md5 matches §3.26/§3.27/§3.28 baseline
+`d8a1b22375dbcb2259c686426a7d76c5` byte-exact.  T3 back to 84
+tokens / 3480 ms audio.  No code change from §3.28 beyond the
+documentation block.
+
+M3 Ultra §3.27 shmem-roundtrip cost (~8 ms on CFM) remains
+standing.  M4 / iOS predicted wins for §3.27 / §3.28 are
+unaffected — the fused kernel still fires; only the
+optimization to dodge the shmem path didn't land.
+
+#### Next-person notes
+
+If you pick this up:
+
+- Add a `test-metal-ops` case for fused `mul_mm + add(bias)` FIRST.
+  Build a 2-op graph `add(mul_mat(W_q4_0, X_f32), bias_f32)`,
+  dispatch with fusion ON (current default) vs
+  `GGML_METAL_FUSION_DISABLE=1`, assert element-wise match to
+  ~1e-6.  Should be ~80 lines.
+- Then retry the direct-store path, ideally with a **smaller
+  scope first** (only `has_bias`, drop `has_residual` /
+  `has_gelu_erf`) to halve the complexity.  If the bias-only
+  variant passes the new unit test, incrementally add the
+  others.
+- Apple's [Metal Shading Language Specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf),
+  §5.7 "Memory Scopes and Barriers", has the exact semantics
+  for `mem_flags::mem_device` vs `mem_flags::mem_none` —
+  worth confirming that `threadgroup_barrier(mem_device)`
+  orders cooperative-tensor-store writes against subsequent
+  device reads on A17+ silicon.  Cf. `simdgroup_fence_t` as
+  an alternative to `threadgroup_barrier`.
