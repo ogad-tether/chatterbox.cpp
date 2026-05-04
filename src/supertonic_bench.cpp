@@ -14,7 +14,7 @@
 // Usage:
 //   ./build/supertonic-bench --model models/supertonic2.gguf \
 //       --text "..." [--voice M1] [--language en] [--steps 5] [--speed 1.05] \
-//       [--seed 42] [--noise-npy noise.npy] [--runs 5] [--warmup 1]
+//       [--seed 42] [--noise-npy noise.npy] [--runs 5] [--warmup 1] [--json-out result.json]
 
 #include "supertonic_internal.h"
 #include "npy.h"
@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -44,7 +45,7 @@ void usage(const char * argv0) {
         "usage: %s --model supertonic2.gguf --text TEXT\n"
         "          [--voice M1] [--language en] [--steps 5] [--speed 1.05]\n"
         "          [--seed 42] [--noise-npy /path/to/noise.npy]\n"
-        "          [--runs 5] [--warmup 1] [--threads N]\n",
+        "          [--runs 5] [--warmup 1] [--threads N] [--json-out FILE]\n",
         argv0);
 }
 
@@ -79,6 +80,27 @@ void print_stage(const Stage & s) {
            minv(s.ms), median(s.ms), mean(s.ms), percentile(s.ms, 0.95), maxv(s.ms));
 }
 
+std::string json_escape(const std::string & s) {
+    std::string out;
+    for (char ch : s) {
+        if (ch == '\\' || ch == '"') { out.push_back('\\'); out.push_back(ch); }
+        else if (ch == '\n') out += "\\n";
+        else out.push_back(ch);
+    }
+    return out;
+}
+
+void write_json_stage(std::ofstream & os, const Stage & s, bool comma) {
+    os << "    \"" << json_escape(s.name) << "\": {"
+       << "\"n\": " << s.ms.size()
+       << ", \"min_ms\": " << minv(s.ms)
+       << ", \"median_ms\": " << median(s.ms)
+       << ", \"mean_ms\": " << mean(s.ms)
+       << ", \"p95_ms\": " << percentile(s.ms, 0.95)
+       << ", \"max_ms\": " << maxv(s.ms)
+       << "}" << (comma ? "," : "") << "\n";
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -87,6 +109,7 @@ int main(int argc, char ** argv) {
     std::string model_path, text;
     std::string voice = "M1", language = "en";
     std::string noise_npy;
+    std::string json_out;
     int steps = 5;
     float speed = 1.05f;
     int seed = 42;
@@ -111,6 +134,7 @@ int main(int argc, char ** argv) {
         else if (a == "--runs") runs = std::stoi(next("--runs"));
         else if (a == "--warmup") warmup = std::stoi(next("--warmup"));
         else if (a == "--threads") n_threads = std::stoi(next("--threads"));
+        else if (a == "--json-out") json_out = next("--json-out");
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 2; }
     }
@@ -265,6 +289,42 @@ int main(int argc, char ** argv) {
                minv(rtfs), median(rtfs), mean(rtfs), percentile(rtfs, 0.95), maxv(rtfs));
         printf("  Real-time multiplier:   med=%.2fx (1 second of audio per %.2f ms)\n",
                1.0 / median(rtfs), median(st_tot.ms) / last_audio_s);
+    }
+    if (!json_out.empty()) {
+        std::ofstream os(json_out);
+        if (!os) {
+            fprintf(stderr, "failed to open json output: %s\n", json_out.c_str());
+            free_supertonic_model(model);
+            return 1;
+        }
+        os << "{\n";
+        os << "  \"runtime\": \"ggml-cpp\",\n";
+        os << "  \"model\": \"" << json_escape(model_path) << "\",\n";
+        os << "  \"text_length\": " << text.size() << ",\n";
+        os << "  \"voice\": \"" << json_escape(voice) << "\",\n";
+        os << "  \"language\": \"" << json_escape(language) << "\",\n";
+        os << "  \"steps\": " << steps << ",\n";
+        os << "  \"speed\": " << speed << ",\n";
+        os << "  \"threads\": " << model.n_threads << ",\n";
+        os << "  \"audio_s\": " << last_audio_s << ",\n";
+        os << "  \"runs\": " << runs << ",\n";
+        os << "  \"warmup\": " << warmup << ",\n";
+        os << "  \"rtf\": {"
+           << "\"min\": " << minv(rtfs)
+           << ", \"median\": " << median(rtfs)
+           << ", \"mean\": " << mean(rtfs)
+           << ", \"p95\": " << percentile(rtfs, 0.95)
+           << ", \"max\": " << maxv(rtfs)
+           << "},\n";
+        os << "  \"stages\": {\n";
+        write_json_stage(os, st_pre, true);
+        write_json_stage(os, st_dur, true);
+        write_json_stage(os, st_te, true);
+        write_json_stage(os, st_ve, true);
+        write_json_stage(os, st_voc, true);
+        write_json_stage(os, st_tot, false);
+        os << "  }\n";
+        os << "}\n";
     }
 
     free_supertonic_model(model);
