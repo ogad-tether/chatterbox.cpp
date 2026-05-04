@@ -1815,7 +1815,14 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 // retry still comes out short.
                 if (generated.size() > best_generated.size()) best_generated = generated;
 
-                const bool plausible = (int)generated.size() >= min_tokens;
+                // The 5x speech-tokens-per-BPE-token floor was calibrated for
+                // English Turbo (GPT-2 BPE, ~5 speech tokens per text token).
+                // MTL uses the Llama tokenizer with a ~1.7x ratio, so a clean
+                // stop-token termination on a short MTL segment looks
+                // "implausible" by this heuristic and would trigger up to 3
+                // spurious retries (4x T3 wall time).  The 3x-repeated-token
+                // early-stop (above) handles MTL's catastrophic case.
+                const bool plausible = is_mtl || (int)generated.size() >= min_tokens;
                 if (!stopped_by_stop_token || plausible) {
                     if (attempt > 0) {
                         fprintf(stderr, "  [t3 segment %zu/%zu] recovered after %d retries (%zu tokens)\n",

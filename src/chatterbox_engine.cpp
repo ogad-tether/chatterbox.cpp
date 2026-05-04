@@ -89,6 +89,28 @@ struct Engine::Impl {
             throw std::runtime_error("Engine: failed to load T3 GGUF: " + opts.t3_gguf_path);
         }
 
+        // Engine currently only wires the Turbo (GPT-2 Medium) variant.  An
+        // MTL (Llama-520M multilingual) GGUF loads cleanly via load_model_gguf
+        // -> load_model_gguf_mtl (populating model.layers_mtl, leaving
+        // model.layers empty), but synthesize() unconditionally calls
+        // eval_prompt() -> build_prompt_graph() -> build_transformer_core(),
+        // which iterates model.layers[il] and would index into an empty
+        // vector (UB / crash).  Reject up front with a clear error until
+        // the public Engine API is extended with language / cfg_weight /
+        // min_p / exaggeration and synthesize() learns to dispatch on
+        // model.hparams.variant.  The CLI (tts-cli / chatterbox) uses the
+        // lower-level eval_prompt_mtl / eval_step_mtl / sample_next_token_mtl
+        // helpers directly and is unaffected.
+        if (model.hparams.variant != CHBX_VARIANT_TURBO) {
+            free_model();
+            throw std::runtime_error(
+                "Engine: T3 GGUF reports chatterbox.variant != t3_turbo "
+                "(multilingual / t3_mtl is not yet supported through the "
+                "public Engine API).  Use the tts-cli binary or the "
+                "internal eval_*_mtl helpers in chatterbox_t3_internal.h "
+                "for now.  Path: " + opts.t3_gguf_path);
+        }
+
         s3gen_preload_thread = std::thread([path = opts.s3gen_gguf_path,
                                             ngpu = opts.n_gpu_layers]() {
             s3gen_preload(path, ngpu);

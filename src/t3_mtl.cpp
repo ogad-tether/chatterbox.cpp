@@ -1416,12 +1416,18 @@ bool load_model_gguf_mtl(const std::string & path,
 
             // Copy Q/K/V rows into wqkv via host scratch. Q4_0 row
             // layout is M-major (rows packed contiguously), so we just
-            // append wq's rows, then wk's, then wv's.
+            // append wq's rows, then wk's, then wv's.  The early type-
+            // equality guard above implies wq/wk/wv have identical sizes
+            // today, but max over all three so a future shape divergence
+            // can't silently truncate a per-layer copy.
             size_t scratch_bytes = 0;
             for (int i = 0; i < hp.n_layer; ++i) {
                 auto & l = model.layers_mtl[i];
                 if (!l.wqkv) continue;
-                scratch_bytes = std::max(scratch_bytes, ggml_nbytes(l.wq));
+                scratch_bytes = std::max({scratch_bytes,
+                                          ggml_nbytes(l.wq),
+                                          ggml_nbytes(l.wk),
+                                          ggml_nbytes(l.wv)});
             }
             std::vector<char> scratch(scratch_bytes);
             for (int i = 0; i < hp.n_layer; ++i) {
@@ -1631,7 +1637,14 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     if (p.top_k > 0 && (size_t) p.top_k < V) {
         std::vector<int> idx(V);
         for (size_t i = 0; i < V; ++i) idx[i] = (int) i;
-        std::nth_element(idx.begin(), idx.begin() + p.top_k, idx.end(),
+        // Partition so that idx[k-1] holds the k-th largest logit.  The
+        // earlier nth_element(begin, begin+k, ..., greater) call placed the
+        // (k+1)-th largest at idx[k] and left positions [0, k) as some
+        // unordered partition of the top-k, so idx[k-1] could be any
+        // top-k element (often not the smallest), making the threshold
+        // too high and erasing legitimate top-k logits.  See sample_next_token_ex
+        // in src/main.cpp for the equivalent (correct) Turbo-side variant.
+        std::nth_element(idx.begin(), idx.begin() + (p.top_k - 1), idx.end(),
                          [&](int a, int b){ return l[a] > l[b]; });
         const float cut = l[idx[p.top_k - 1]];
         for (float & x : l) if (x < cut) x = -INFINITY;

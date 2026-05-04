@@ -2109,6 +2109,20 @@ int s3gen_synthesize_to_wav(
             for (size_t i = 0; i < dxdt_cond.size(); ++i) {
                 dxdt_cond[i] = (1.0f + cfg_rate) * dxdt_cond[i] - cfg_rate * dxdt_uncond[i];
             }
+        } else if (!meanflow && cfg_rate != 0.0f) {
+            // Non-Metal CFG path (CPU + any backend where use_b2 is false).
+            // Run the conditional and unconditional passes back-to-back on
+            // the same B=1 graph (cfm_estimator_cache key (T, b2=false)
+            // means both calls reuse the same cached graph) and combine
+            // with the standard CFG mix.  Restoring this branch fixes a
+            // silent regression introduced when the b2 path landed on Metal:
+            // previously the else clause computed only the conditional pass
+            // and dropped CFG entirely on every non-Metal backend.
+            dxdt_cond = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, opts.cfm_f16_kv_attn);
+            auto dxdt_uncond = cfm_estimator_forward(m, cfm_cache, z, zero_mu, t_emb, zero_spks, zero_cond, T_mu, opts.cfm_f16_kv_attn);
+            for (size_t i = 0; i < dxdt_cond.size(); ++i) {
+                dxdt_cond[i] = (1.0f + cfg_rate) * dxdt_cond[i] - cfg_rate * dxdt_uncond[i];
+            }
         } else {
             dxdt_cond = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, opts.cfm_f16_kv_attn);
         }
