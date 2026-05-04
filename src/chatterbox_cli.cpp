@@ -13,6 +13,7 @@
 // reader, save-voice dumper, multi-segment crossfade logic, etc.
 
 #include "gpt2_bpe.h"
+#include "mtl_tokenizer.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
@@ -56,6 +57,7 @@
 #include "tts-cpp/tts-cpp.h"
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "chatterbox_t3_internal.h"
+#include "t3_mtl.h"
 #include "npy.h"
 #include "voice_features.h"
 #include "voice_encoder.h"
@@ -331,11 +333,19 @@ struct cli_params {
     float   top_p          = 0.95f;
     float   temp           = 0.8f;
     float   repeat_penalty = 1.2f;
-    // Optional: override CFM Euler step count for batch synthesis.  Defaults
-    // to 2 (matches Python's meanflow); setting 1 lowers latency with a small
-    // quality trade-off.
-    int32_t cfm_steps      = 0;
+    // Experimental: route CFM flash-attn through the F32 Q + F16 K/V path
+    // so backends with `flash_attn_f32_f16` (Adreno OpenCL) dispatch the
+    // mixed-precision kernel.  Opt-in mobile latency knob.  See PROGRESS.md
+    // "OpenCL / Adreno bring-up".
     bool    cfm_f16_kv_attn = false;
+
+    // Multilingual-only knobs. Python ChatterboxMultilingualTTS.generate()
+    // defaults: cfg_weight=0.5, temperature=0.8, repetition_penalty=2.0,
+    // min_p=0.05, top_p=1.0 (top_k unused).
+    float       cfg_weight   = 0.5f;   // classifier-free guidance strength
+    float       min_p        = 0.05f;  // minimum-probability warp (0 = off)
+    std::string language;              // tier-1 lang code when variant = t3_mtl
+    float       exaggeration = 0.5f;   // emotion_adv scalar (0..1)
 
     // Streaming synthesis (PROGRESS.md B1).  When > 0, speech tokens from
     // T3 are fed to S3Gen+HiFT in chunks of this size, with `cache_source`
@@ -353,6 +363,12 @@ struct cli_params {
     // to 2 (matches Python's meanflow); setting 1 halves CFM cost at the
     // price of a bit of extra high-frequency noise.
     int32_t stream_cfm_steps          = 0;
+    // Override CFM Euler step count for non-streaming synthesis.  Defaults
+    // to 0 (= use the GGUF's `n_timesteps`: 10 for Multilingual standard
+    // CFM, 2 for Turbo's meanflow).  Lowering N (e.g. 7-8 on Multilingual)
+    // reduces S3Gen wall-clock proportionally; the §3.21 sweep documents
+    // the audio-cosine knee.  Streaming uses --stream-cfm-steps instead.
+    int32_t cfm_steps                 = 0;
 
     // Auto-split the input text into sentences before running the pipeline.
     // Chatterbox Turbo's T3 degrades badly on autoregressive outputs longer
@@ -445,10 +461,14 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --top-p P               (default: 0.95)\n");
     fprintf(stderr, "  --temp T                (default: 0.8)\n");
     fprintf(stderr, "  --repeat-penalty R      (default: 1.2)\n");
-    fprintf(stderr, "  --cfm-steps N           CFM Euler step count for batch synthesis.\n");
-    fprintf(stderr, "                          Python uses 2; 1 is faster but slightly noisier.\n");
-    fprintf(stderr, "                          (default: 0 = 2)\n");
-    fprintf(stderr, "  --cfm-f16-kv-attn       Experimental: CFM flash-attn uses F16 K/V.\n");
+    fprintf(stderr, "  --min-p P               Minimum-probability warp (default: 0.05; t3_mtl only)\n");
+    fprintf(stderr, "  --cfg-weight W          Classifier-free guidance strength (default: 0.5;\n");
+    fprintf(stderr, "                          t3_mtl only)\n");
+    fprintf(stderr, "  --exaggeration X        Emotion-adv scalar in [0,1] (default: 0.5; t3_mtl only)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "multilingual (variant=t3_mtl) options:\n");
+    fprintf(stderr, "  --language CODE         Required for t3_mtl GGUFs. Tier-1: en, es, fr, de, it,\n");
+    fprintf(stderr, "                          pt, nl, pl, tr, sv, da, fi, no, el, ms, sw, ar, ko.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --stream-chunk-tokens N Synthesize the wav in streaming chunks of N speech\n");
     fprintf(stderr, "                          tokens each (~1 s audio per 25-token chunk).  With\n");
@@ -461,6 +481,14 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          as --stream-chunk-tokens)\n");
     fprintf(stderr, "  --stream-cfm-steps N    CFM Euler step count per chunk.  Python uses 2 for\n");
     fprintf(stderr, "                          meanflow; 1 halves CFM cost.  (default: 0 = 2)\n");
+    fprintf(stderr, "  --cfm-steps N           Non-streaming CFM Euler step count.  Multilingual's\n");
+    fprintf(stderr, "                          standard CFM ships at 10 steps; lower (e.g. 7-8)\n");
+    fprintf(stderr, "                          trades small audio quality for proportional S3Gen\n");
+    fprintf(stderr, "                          speedup.  Turbo's meanflow defaults to 2 steps.\n");
+    fprintf(stderr, "                          See PROGRESS.md §3.21 for the quality knee sweep.\n");
+    fprintf(stderr, "                          (default: 0 = GGUF's n_timesteps)\n");
+    fprintf(stderr, "  --cfm-f16-kv-attn       Experimental: CFM flash-attn uses F32 Q + F16 K/V so\n");
+    fprintf(stderr, "                          OpenCL/Adreno can dispatch flash_attn_f32_f16.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --input-file PATH       Stream text from PATH as another process writes to it.\n");
     fprintf(stderr, "                          tail -f semantics: each complete sentence (ending in\n");
@@ -553,7 +581,28 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--top-p")          { if (!parse_float("--top-p",          params.top_p))          return false; }
         else if (arg == "--temp")           { if (!parse_float("--temp",           params.temp))           return false; }
         else if (arg == "--repeat-penalty") { if (!parse_float("--repeat-penalty", params.repeat_penalty)) return false; }
-        else if (arg == "--cfm-steps")      { if (!parse_int  ("--cfm-steps",      params.cfm_steps))      return false; }
+        else if (arg == "--min-p") {
+            if (!parse_float("--min-p", params.min_p)) return false;
+            if (params.min_p < 0.0f || params.min_p > 1.0f) {
+                fprintf(stderr, "error: --min-p must be in [0, 1] (got %g)\n", (double) params.min_p);
+                return false;
+            }
+        }
+        else if (arg == "--cfg-weight") {
+            if (!parse_float("--cfg-weight", params.cfg_weight)) return false;
+            if (params.cfg_weight < 0.0f) {
+                fprintf(stderr, "error: --cfg-weight must be >= 0 (got %g)\n", (double) params.cfg_weight);
+                return false;
+            }
+        }
+        else if (arg == "--exaggeration") {
+            if (!parse_float("--exaggeration", params.exaggeration)) return false;
+            if (params.exaggeration < 0.0f || params.exaggeration > 1.0f) {
+                fprintf(stderr, "error: --exaggeration must be in [0, 1] (got %g)\n", (double) params.exaggeration);
+                return false;
+            }
+        }
+        else if (arg == "--language")       { auto v = next("--language");       if (!v) return false; params.language = v; }
         else if (arg == "--cfm-f16-kv-attn") { params.cfm_f16_kv_attn = true; }
         else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
@@ -561,6 +610,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--stream-chunk-tokens")       { if (!parse_int("--stream-chunk-tokens",       params.stream_chunk_tokens))       return false; }
         else if (arg == "--stream-first-chunk-tokens") { if (!parse_int("--stream-first-chunk-tokens", params.stream_first_chunk_tokens)) return false; }
         else if (arg == "--stream-cfm-steps")          { if (!parse_int("--stream-cfm-steps",          params.stream_cfm_steps))          return false; }
+        else if (arg == "--cfm-steps")                 { if (!parse_int("--cfm-steps",                 params.cfm_steps))                 return false; }
         else if (arg == "--input-file")       { auto v = next("--input-file");       if (!v) return false; params.input_file = v; }
         else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
         else if (arg == "--input-by-line")    { params.input_by_line = true; }
@@ -989,19 +1039,27 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             // tears the device down.  (S3Gen's cache registers its own
             // atexit hook; T3 has no such hook, main() is its owner.)
             auto free_t3 = [&]() {
+                if (model.buffer_stack || model.ctx_stack) {
+                    tts_cpp::chatterbox::detail::t3_stack_unregister(
+                        model.buffer_stack, model.ctx_stack);
+                }
                 ggml_backend_buffer_free(model.buffer_w);
                 ggml_backend_buffer_free(model.buffer_kv);
+                if (model.buffer_stack)    ggml_backend_buffer_free(model.buffer_stack);
                 if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
                 ggml_backend_free(model.backend);
                 ggml_free(model.ctx_w);
                 ggml_free(model.ctx_kv);
+                if (model.ctx_stack)    ggml_free(model.ctx_stack);
                 if (model.ctx_override) ggml_free(model.ctx_override);
                 model.buffer_w = nullptr;
                 model.buffer_kv = nullptr;
+                model.buffer_stack = nullptr;
                 model.buffer_override = nullptr;
                 model.backend = nullptr;
                 model.ctx_w = nullptr;
                 model.ctx_kv = nullptr;
+                model.ctx_stack = nullptr;
                 model.ctx_override = nullptr;
             };
 
@@ -1053,6 +1111,9 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            // Live-input streaming: --stream-cfm-steps takes precedence per
+            // chunk; --cfm-steps falls in as the per-chunk default below
+            // (`stream_cfm_steps > 0 ? stream_cfm_steps : cfm_steps`).
             opts.cfm_steps       = params.cfm_steps;
             opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
@@ -1516,15 +1577,44 @@ int tts_cpp_cli_main(int argc, char ** argv) {
         // when --stream-chunk-tokens requests streaming output, and when
         // --dump-tokens-only prints a single token list.
         gpt2_bpe bpe;
+        mtl_tokenizer mtl_tok;
+        const bool is_mtl = (model.hparams.variant == CHBX_VARIANT_MTL);
         if (!params.text.empty()) {
-            if (model.tok_tokens.empty()) {
-                fprintf(stderr,
-                    "error: this GGUF has no embedded tokenizer. Re-run\n"
-                    "       scripts/convert-t3-turbo-to-gguf.py to produce a fresh GGUF\n"
-                    "       with tokenizer.ggml.* metadata.\n");
-                return 1;
+            if (is_mtl) {
+                if (model.mtl_tokenizer_json.empty()) {
+                    fprintf(stderr,
+                        "error: this t3_mtl GGUF has no embedded MTL tokenizer. Re-run\n"
+                        "       scripts/convert-t3-mtl-to-gguf.py.\n");
+                    return 1;
+                }
+                if (!mtl_tok.load_from_json(model.mtl_tokenizer_json)) {
+                    fprintf(stderr, "error: failed to parse embedded MTL tokenizer\n");
+                    return 1;
+                }
+                if (params.language.empty()) {
+                    fprintf(stderr,
+                        "error: t3_mtl variant requires --language CODE (tier-1: en, es, fr,\n"
+                        "       de, it, pt, nl, pl, tr, sv, da, fi, no, el, ms, sw, ar, ko).\n");
+                    return 1;
+                }
+                if (!mtl_tok.is_language_supported(params.language)) {
+                    fprintf(stderr,
+                        "error: language '%s' is not supported in this build.\n"
+                        "       Supported tier-1 codes: ", params.language.c_str());
+                    for (const auto & l : mtl_tokenizer::supported_languages()) fprintf(stderr, "%s ", l.c_str());
+                    fprintf(stderr, "\n");
+                    return 1;
+                }
+            } else {
+                if (model.tok_tokens.empty()) {
+                    fprintf(stderr,
+                        "error: this GGUF has no embedded tokenizer. Re-run\n"
+                        "       scripts/convert-t3-turbo-to-gguf.py to produce a fresh GGUF\n"
+                        "       with tokenizer.ggml.* metadata.\n");
+                    return 1;
+                }
+                bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
             }
-            bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
         }
 
         const bool auto_split_enabled =
@@ -1543,6 +1633,25 @@ int tts_cpp_cli_main(int argc, char ** argv) {
         if (!params.text.empty()) {
             seg_text_tokens.reserve(text_segments.size());
             for (size_t si = 0; si < text_segments.size(); ++si) {
+                if (is_mtl) {
+                    // MTLTokenizer applies its own normalization (NFKD +
+                    // lowercase + language prefix); skip gpt2_bpe::punc_norm.
+                    std::vector<int32_t> ids = mtl_tok.encode(text_segments[si], params.language);
+                    // Python ChatterboxMultilingualTTS.generate pads with
+                    // start_text_token (255) + ids + stop_text_token (0).
+                    std::vector<int32_t> padded;
+                    padded.reserve(ids.size() + 2);
+                    padded.push_back(model.hparams.start_text_token);
+                    padded.insert(padded.end(), ids.begin(), ids.end());
+                    padded.push_back(model.hparams.stop_text_token);
+                    seg_text_tokens.push_back(std::move(padded));
+                    if (params.verbose) {
+                        fprintf(stderr, "%s: text[%zu] [lang=%s]: \"%s\" (%zu tokens incl. SOT/EOT)\n",
+                                __func__, si, params.language.c_str(),
+                                text_segments[si].c_str(), seg_text_tokens.back().size());
+                    }
+                    continue;
+                }
                 std::string normalized = gpt2_bpe::punc_norm(text_segments[si]);
                 seg_text_tokens.push_back(bpe.tokenize(normalized));
                 if (params.verbose) {
@@ -1597,6 +1706,16 @@ int tts_cpp_cli_main(int argc, char ** argv) {
         auto run_t3_for_segment = [&](size_t si) {
             const int64_t _t0 = ggml_time_us();
 
+            chatterbox_sampling_params sp_mtl;
+            if (is_mtl) {
+                sp_mtl.top_k          = params.top_k;
+                sp_mtl.top_p          = params.top_p;
+                sp_mtl.temp           = params.temp;
+                sp_mtl.repeat_penalty = params.repeat_penalty;
+                sp_mtl.min_p          = params.min_p;
+                sp_mtl.cfg_weight     = params.cfg_weight;
+            }
+
             // Early-stop heuristic.  T3 occasionally samples `stop_speech_token`
             // way too soon when the speaker conditioning is out-of-distribution
             // (most visible with cloned voices).  Python doesn't hit this
@@ -1622,36 +1741,88 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 rng.discard((size_t)attempt * 1009);   // move to a different RNG stream each retry
 
                 std::vector<float> logits;
+                std::vector<float> logits_c, logits_u;
                 int prompt_len = 0;
-                if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
-                    throw std::runtime_error("prompt eval failed");
+                if (is_mtl) {
+                    if (!eval_prompt_mtl(model, allocr, params.n_threads,
+                                         seg_text_tokens[si], params.exaggeration,
+                                         logits_c, logits_u, prompt_len))
+                        throw std::runtime_error("prompt eval failed");
+                } else {
+                    if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
+                        throw std::runtime_error("prompt eval failed");
+                }
 
                 int n_past = prompt_len;
                 generated.clear();
                 generated.reserve(params.n_predict + 1);
 
-                int32_t current = sample_next_token(logits, generated, params, rng);
+                int32_t current = is_mtl
+                    ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
+                                            model.hparams.stop_speech_token)
+                    : sample_next_token(logits, generated, params, rng);
                 generated.push_back(current);
 
                 bool stopped_by_stop_token = false;
+                bool stopped_by_repetition  = false;
                 for (int i = 0; i < params.n_predict; ++i) {
                     if (current == model.hparams.stop_speech_token) { stopped_by_stop_token = true; break; }
                     if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
-                    if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
-                        throw std::runtime_error("step eval failed");
+                    bool step_ok;
+                    if (is_mtl) {
+                        step_ok = eval_step_mtl(model, allocr, params.n_threads, n_past, current,
+                                                logits_c, logits_u);
+                    } else {
+                        step_ok = eval_step(model, allocr, params.n_threads, n_past, current, logits);
+                    }
+                    if (!step_ok) throw std::runtime_error("step eval failed");
                     ++n_past;
-                    current = sample_next_token(logits, generated, params, rng);
+                    current = is_mtl
+                        ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
+                                                model.hparams.stop_speech_token)
+                        : sample_next_token(logits, generated, params, rng);
                     generated.push_back(current);
+
+                    // Port of the token_repetition check in the Python
+                    // AlignmentStreamAnalyzer.  MTL T3 sometimes emits a
+                    // plausible end-of-speech silence cadence mid-utterance
+                    // and then hallucinates more low-energy content before
+                    // eventually stopping.  Three consecutive identical
+                    // tokens cleanly signal this cadence without firing on
+                    // normal speech.  Gated to MTL because the turbo
+                    // codebook has a different cadence signature.
+                    if (is_mtl && generated.size() >= 3) {
+                        size_t n = generated.size();
+                        if (generated[n - 1] == generated[n - 2] &&
+                            generated[n - 2] == generated[n - 3]) {
+                            stopped_by_repetition = true;
+                            break;
+                        }
+                    }
                 }
 
                 if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
                     generated.pop_back();
 
+                if (stopped_by_repetition && params.verbose) {
+                    fprintf(stderr, "  [t3 segment %zu/%zu] stopped on 3x repeated token (%d) "
+                                    "at %zu tokens; MTL end-of-speech cadence\n",
+                            si + 1, N_SEG, generated.empty() ? -1 : (int)generated.back(),
+                            generated.size());
+                }
+
                 // Keep the longest attempt as the fallback in case every
                 // retry still comes out short.
                 if (generated.size() > best_generated.size()) best_generated = generated;
 
-                const bool plausible = (int)generated.size() >= min_tokens;
+                // The 5x speech-tokens-per-BPE-token floor was calibrated for
+                // English Turbo (GPT-2 BPE, ~5 speech tokens per text token).
+                // MTL uses the Llama tokenizer with a ~1.7x ratio, so a clean
+                // stop-token termination on a short MTL segment looks
+                // "implausible" by this heuristic and would trigger up to 3
+                // spurious retries (4x T3 wall time).  The 3x-repeated-token
+                // early-stop (above) handles MTL's catastrophic case.
+                const bool plausible = is_mtl || (int)generated.size() >= min_tokens;
                 if (!stopped_by_stop_token || plausible) {
                     if (attempt > 0) {
                         fprintf(stderr, "  [t3 segment %zu/%zu] recovered after %d retries (%zu tokens)\n",
@@ -1737,6 +1908,9 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            // Non-streaming CFM Euler step count (0 = GGUF default).
+            // Streaming chunks honour --stream-cfm-steps with --cfm-steps as
+            // fallback when copts is set up further below.
             opts.cfm_steps       = params.cfm_steps;
             opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {

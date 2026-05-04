@@ -1,6 +1,8 @@
 // Standalone validation for the Metal kernels we added/fixed in ggml:
 //   - GGML_OP_DIAG_MASK_INF
 //   - GGML_OP_PAD with non-zero front-pad offsets (lp0..lp3)
+//   - GGML_OP_MUL_MAT + GGML_OP_ADD(bias) [+ GGML_OP_UNARY(GELU_ERF)]
+//     fusion in kernel_mul_mm (PROGRESS §3.27, §3.28)
 //
 // Runs each op twice (once on CPU, once on Metal) with the same input and
 // compares element-by-element.  Exits non-zero on mismatch.
@@ -219,6 +221,120 @@ static int test_conv_transpose_1d(ggml_backend_t cpu, ggml_backend_t gpu,
     return 1;
 }
 
+// Test the MUL_MAT + ADD(bias) [+ GELU_ERF] fusion in kernel_mul_mm.
+// Builds the 2- or 3-op subgraph on both CPU and GPU backends, dispatches,
+// and compares output element-wise.  On the GPU side, ggml-metal's fusion
+// system (FC_MUL_MM + 2 / +3 / +4, PROGRESS §3.27 / §3.28) collapses these
+// into a single `kernel_mul_mm_..._bias=1_res=X_gelu=Y` dispatch; the CPU
+// path is always the unfused triple.  Any numerical drift beyond atol
+// indicates either a kernel bug or a shape-handling mismatch.
+//
+// Uses Q4_0 weights to match the chatterbox CFM hot path — that's the
+// shape the fused kernel is specifically targeting.  K must be %32 for
+// Q4_0 blocks; N / T are unconstrained.
+//
+// fuse_mode: 0 = MUL_MAT + ADD(bias), 1 = MUL_MAT + ADD(bias) + GELU_ERF.
+static int test_mul_mm_fused(ggml_backend_t cpu, ggml_backend_t gpu,
+                             int K, int N, int T, int B, int fuse_mode,
+                             const char * label) {
+    fprintf(stderr, "[mul_mm_fused %s] ", label);
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+    // W: (K, N) in ggml layout → src0 of shape [K, N] = ggml ne=[K, N].
+    //    Quantized to Q4_0 — block of 32 in the K (innermost) dim.
+    // X: (K, T, B) → src1 of shape [K, T, B] in ggml ne=[K, T, B].
+    // Output: (N, T, B).
+    // bias: (N,) — broadcast over T, B.
+    std::vector<float> W_f32(K * N);
+    std::vector<float> X_f32(K * T * B);
+    std::vector<float> bias_f32(N);
+    for (auto & v : W_f32)    v = dist(rng);
+    for (auto & v : X_f32)    v = dist(rng);
+    for (auto & v : bias_f32) v = dist(rng);
+
+    auto run_one = [&](ggml_backend_t backend) {
+        static size_t buf_size = 32 * 1024 * 1024;
+        std::vector<uint8_t> buf(buf_size);
+        ggml_init_params p = { buf_size, buf.data(), true };
+        ggml_context * ctx = ggml_init(p);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+
+        ggml_tensor * W    = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K, N);
+        ggml_tensor * X    = (B == 1) ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T)
+                                      : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, T, B);
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N);
+        ggml_set_name(W,    "W");    ggml_set_input(W);
+        ggml_set_name(X,    "X");    ggml_set_input(X);
+        ggml_set_name(bias, "bias"); ggml_set_input(bias);
+
+        ggml_tensor * mm   = ggml_mul_mat(ctx, W, X);
+        ggml_tensor * mmb  = ggml_add(ctx, mm, bias);
+        ggml_tensor * out  = (fuse_mode == 1) ? ggml_gelu_erf(ctx, mmb) : mmb;
+        ggml_set_name(out, "out"); ggml_set_output(out);
+        ggml_build_forward_expand(gf, out);
+
+        auto * allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        // Quantise W to Q4_0 into the backend buffer.
+        {
+            std::vector<uint8_t> qbuf(ggml_nbytes(ggml_graph_get_tensor(gf, "W")));
+            ggml_quantize_chunk(GGML_TYPE_Q4_0, W_f32.data(), qbuf.data(), 0, N, K, nullptr);
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "W"),
+                                    qbuf.data(), 0, qbuf.size());
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "X"),    X_f32.data(),    0, X_f32.size()    * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "bias"), bias_f32.data(), 0, bias_f32.size() * sizeof(float));
+
+        ggml_backend_graph_compute(backend, gf);
+        ggml_tensor * out_t = ggml_graph_get_tensor(gf, "out");
+        std::vector<float> res(ggml_nelements(out_t));
+        ggml_backend_tensor_get(out_t, res.data(), 0, ggml_nbytes(out_t));
+
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx);
+        return res;
+    };
+
+    auto ref = run_one(cpu);
+    auto got = run_one(gpu);
+
+    int bad = 0;
+    float max_err = 0.f, max_rel = 0.f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float d = std::fabs(got[i] - ref[i]);
+        const float r = d / std::max(std::fabs(ref[i]), 1e-6f);
+        if (d > max_err) max_err = d;
+        if (r > max_rel) max_rel = r;
+        // Tolerance: the CPU reference and the GPU kernel both dequantize
+        // Q4_0 then do f32 mul_mat, but in different accumulation orders
+        // (CPU walks rows scalarly, Metal kernel_mul_mm uses cooperative
+        // matmul on 8x8 tiles).  Observed max abs ~5e-3 on Q4_0 shapes
+        // in the 256..1024 range.  Fail only if abs diff exceeds 2e-2
+        // — that's 4x the Q4_0 noise floor, catches real kernel bugs
+        // (like §3.29's reverted direct-store RMW which would have
+        // shown up as wholesale >1e-1 drift) without flagging
+        // accumulation-order drift.
+        if (d > 2e-2f) {
+            if (bad < 5) {
+                fprintf(stderr, "\n  mismatch @ %zu: cpu=%.6g gpu=%.6g diff=%.3e rel=%.3e",
+                        i, ref[i], got[i], d, r);
+            }
+            ++bad;
+        }
+    }
+    if (bad == 0) {
+        fprintf(stderr, "OK (K=%d N=%d T=%d B=%d fuse=%s, max_abs=%.1e max_rel=%.1e)\n",
+                K, N, T, B, fuse_mode == 1 ? "gelu" : "bias", max_err, max_rel);
+        return 0;
+    }
+    fprintf(stderr, "\n[mul_mm_fused %s] FAIL: %d / %zu mismatched (max_err=%.3e max_rel=%.3e)\n",
+            label, bad, ref.size(), max_err, max_rel);
+    return 1;
+}
+
 int main() {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (!cpu) { fprintf(stderr, "CPU backend init failed\n"); return 1; }
@@ -242,6 +358,23 @@ int main() {
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/5200, /*IC=*/128, /*OC=*/64,  /*K=*/11, /*s0=*/3, "ups[2]");
     // A small sanity case too.
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/10,   /*IC=*/3,   /*OC=*/4,   /*K=*/5,  /*s0=*/2, "tiny");
+
+    // MUL_MAT + ADD(bias) fusion (PROGRESS §3.27): CFM transformer hot shapes.
+    //   K=256, N=256 — attn to_q / to_k / to_v
+    //   K=256, N=512 — attn to_out
+    //   K=256, N=1024 — FF gate (ff0; also tested with gelu)
+    //   K=1024, N=256 — FF down (ff2)
+    // T=87, B=2 matches CFM's use_b2=true configuration.
+    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 256, /*T=*/87, /*B=*/2, /*fuse=*/0, "cfm-attn-qkv");
+    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 512, /*T=*/87, /*B=*/2, /*fuse=*/0, "cfm-attn-out");
+    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/1024, /*T=*/87, /*B=*/2, /*fuse=*/0, "cfm-ff-gate-bias");
+    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/1024, /*T=*/87, /*B=*/2, /*fuse=*/1, "cfm-ff-gate-bias+gelu");
+    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/1024, /*N=*/ 256, /*T=*/87, /*B=*/2, /*fuse=*/0, "cfm-ff-down");
+    // Batch=1 sanity — exercises the non-batch path of the dispatcher.
+    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 512, /*T=*/87, /*B=*/1, /*fuse=*/0, "cfm-b1");
+    // Non-64-multiple N to exercise the bounds-checked (bco=1) shmem path.
+    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 320, /*T=*/87, /*B=*/2, /*fuse=*/0, "bco-bias");
+    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 320, /*T=*/87, /*B=*/2, /*fuse=*/1, "bco-gelu");
 
     ggml_backend_free(gpu);
     ggml_backend_free(cpu);

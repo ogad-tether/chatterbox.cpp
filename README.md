@@ -1,12 +1,21 @@
 # chatterbox.cpp
 
-**Chatterbox Turbo** (Resemble AI, MIT-licensed zero-shot text-to-speech)
-ported to [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference
-on CPU / Metal / CUDA / Vulkan, with no runtime dependency on Python or
-PyTorch.
+**Chatterbox** (Resemble AI, MIT-licensed zero-shot text-to-speech) ported
+to [`ggml`](https://github.com/ggml-org/ggml).  Pure C++/ggml inference on
+CPU / Metal / CUDA / Vulkan, no runtime dependency on Python or PyTorch.
+Ships both variants out of one binary, autodetected from GGUF metadata:
+
+- **Turbo** — English, GPT-2 Medium T3, meanflow 2-step CFM.  Optimised for
+  lowest-latency CLI use.
+- **Multilingual** — 23 languages, Llama-520M T3 + perceiver resampler +
+  classifier-free guidance, standard 10-step CFM with CFG inside.  Tier-1
+  subset wired up natively (`en, es, fr, de, it, pt, nl, pl, tr, sv, da,
+  fi, no, el, ms, sw, ar, ko`); `ja/he/ru/zh/hi` stay on the backlog.
 
 End-to-end inference on a short sentence with voice cloning from an 11 s
 reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
+
+**Turbo:**
 
 | Backend                              | Wall      | `RTF`  | vs real-time | vs ONNX Runtime |
 |--------------------------------------|----------:|-------:|-------------:|----------------:|
@@ -16,12 +25,59 @@ reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
 | CPU (Mac Studio M3 Ultra, NEON)      | 7 568 ms  | 1.05   | 0.96×        | 2.3× faster     |
 | Reference (ONNX Runtime, CPU Q4)     | 6.4–17 s  | 1.2–3.2 | 0.3–0.85×   | —               |
 
+**Multilingual** (same Spanish prompt, seed 42, built-in voice;
+ONNX reference uses `jfk.wav` via the [multilingual-bench][bench] script):
+
+| Backend                              | Wall      | `RTF` | vs real-time | vs ONNX Runtime |
+|--------------------------------------|----------:|------:|-------------:|----------------:|
+| **Metal (M3 Ultra, Q4_0, `--cfm-steps 7`)** | **1.05 s**| **0.30** | **3.3×**     | **48.4× faster**¹ |
+| Metal (M3 Ultra, Q4_0)               |  **1.22 s** | 0.35  | 2.9×        | **42.0× faster**¹ |
+| Metal (M3 Ultra, F16, `--cfm-steps 7`)| 1.16 s   |  0.32  | 3.2×        | **45.9× faster**¹ |
+| Metal (M3 Ultra, F16)                |  1.41 s   |  0.38  | 2.6×        | **37.5× faster**¹ |
+| **Metal (M4, Q4_0)**                 |  **3.0 s**| 1.37  | 0.73×        | **10.6× faster**¹ |
+| Metal (M4, F16)                      |   4.0 s   | 1.65  | 0.61×        | **14.2× faster**¹ |
+| CPU (M4, 4t NEON, Q4_0)              |  10.7 s²  | 4.32² | 0.23×        | **3.0× faster**¹  |
+| CPU (M4, 4t NEON, F16)               |  17.1 s²  | 6.70² | 0.15×        | **3.1× faster**¹  |
+| Reference (ONNX Runtime, CPU 4t, q4) |  31.7 s   |14.55  | 0.07×        | —                |
+| Reference (ONNX Runtime, CPU 4t, fp16)|53.3 s   |23.50  | 0.04×        | —                |
+
+The M3 Ultra rows reflect the §3.21 optimisation pass — CFG cond+uncond
+batched into one Metal forward (B=2) on T3, the new `--cfm-steps N` knob
+on the standard 10-step CFM (N=7 is the recommended quality knee, log-mel
+cosine vs N=10 = **0.995**), and `ggml_swiglu_split` on the Llama MLP.
+The M4 rows are kept for continuity with §3.19/§3.20.
+
+¹ ONNX Runtime's multilingual ONNX export ships **without** the
+`text_emb_weight.bin` tensor and logs `CFG disabled` at load, so it's
+running half the compute of the ggml pipeline (1 T3 forward per token
+instead of 2 — no classifier-free guidance, no CFG-combined CFM). If
+the ONNX CFG path were wired up, its RTF would roughly double and the
+gap vs ggml would widen to ~10–14× (CPU) / ~20–28× (Metal). ggml runs
+the full CFG pipeline in every row above. Reproduction + per-stage
+breakdown in [`PROGRESS.md §3.19–3.20`](PROGRESS.md) and
+[`qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js`][bench].
+
+² **CPU multilingual rows re-measured after restoring CFG on the
+non-Metal CFM path.**  The previous numbers in this row (`6.0 s / 2.69`
+and `7.8 s / 3.24`) were captured between Apr 23–May 4 while the
+non-`use_b2` branch in the CFM step loop was silently running only the
+conditional pass — i.e. half the CFM compute, no classifier-free
+guidance steering on CPU/Vulkan/CUDA.  Fixed in commit `6d9b42b`; the
+two rows above are now end-to-end re-measurements on the same M4 host
+with CFG correctly applied (12 CFM steps × 2 forward calls).
+S3Gen wall-time roughly doubled, RTF went up ~2×.  Metal rows are
+unaffected (the `use_b2` branched path always carried the CFG combine).
+
+[bench]: https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js
+
 See the [full benchmark](#performance) section below for the per-stage
 breakdown, or [`PROGRESS.md`](PROGRESS.md) for the full chronological
 development journal — every numerical-parity stage and optimization pass
 (T3 Flash Attention, KV-cache layout rework, Metal kernel patches,
 CAMPPlus + VoiceEncoder + S3TokenizerV2 ported to ggml graphs, mel
-extraction via STFT matmul, legacy Q4/Q5/Q8 quantization, etc.).
+extraction via STFT matmul, T3 Q4/Q5/Q8 quantization, the multilingual
+Llama-520M port + CFG dual-cache (§3.19), and the shared S3Gen weight-
+quantisation pass that ships in this repo (§3.20)).
 
 ---
 
@@ -32,17 +88,28 @@ extraction via STFT matmul, legacy Q4/Q5/Q8 quantization, etc.).
        │                                                        ▲
        ▼                                                        │
   ┌────────────────────────────────────────────────────────────────┐
-  │                        tts-cli                                 │
+  │                       tts-cli (libtts-cpp)                     │
   │                                                                │
-  │   T3 (GPT-2 Medium)  ──►  S3Gen encoder  ──►  CFM (meanflow)   │
-  │   text → speech toks      speech toks → h      h → mel         │
+  │      T3      ──►   S3Gen encoder   ──►        CFM              │
+  │  text → toks       toks → h                   h → mel          │
   │                                                                │
-  │                          HiFT vocoder  ──►  24 kHz wav         │
+  │                         HiFT vocoder  ──►  24 kHz wav          │
   └────────────────────────────────────────────────────────────────┘
        ▲                                              ▲
-   BPE tokenizer                               reference voice
+   text tokenizer                              reference voice
    (embedded in T3 GGUF metadata)              (embedded in S3Gen GGUF)
 ```
+
+`tts-cli` (and the back-compat `chatterbox` binary, same code) handles
+**both** Chatterbox variants — the runtime auto-detects the variant
+from `chatterbox.variant` GGUF metadata and dispatches:
+
+| Stage         | Turbo                                      | Multilingual                                        |
+|---------------|--------------------------------------------|-----------------------------------------------------|
+| Tokenizer     | GPT-2 byte-level BPE (English)             | HuggingFace `tokenizers.json` (23 langs, NFKD pre)  |
+| T3 backbone   | GPT-2 Medium, 24 layers, single forward    | Llama-520M, 30 layers, CFG cond+uncond per token    |
+| CFM solver    | Meanflow, 2 Euler steps                    | Standard, 10 Euler steps with `cfg_rate=0.7`        |
+| HiFT vocoder  | shared (same checkpoint format)            | shared (same checkpoint format)                     |
 
 One binary, one invocation, end to end — `scripts/synthesize.sh` is a
 thin convenience wrapper that fills in the two GGUF paths.
@@ -102,11 +169,13 @@ Linux/Windows with a Vulkan loader, `-DGGML_OPENCL=ON` for OpenCL
 runtime to actually use the GPU. See `patches/README.md` for what the
 patches do and why.
 
-This produces the main binary plus a set of per-stage validation harnesses:
+This produces the end-to-end binary, a back-compat alias of the same
+code, and a set of per-stage validation harnesses:
 
 | Binary | What it does |
 |--------|--------------|
-| `build/tts-cli`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Also handles voice cloning via `--reference-audio`. |
+| `build/tts-cli`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Handles voice cloning via `--reference-audio`, autodetects Turbo vs Multilingual from the T3 GGUF. |
+| `build/chatterbox`         | Identical second binary kept for backward compatibility with pre-rename scripts; same source as `tts-cli`. |
 | `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
 | `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
 | `build/test-resample`         | Round-trip SNR of the C++ Kaiser-windowed sinc resampler |
@@ -116,6 +185,10 @@ This produces the main binary plus a set of per-stage validation harnesses:
 | `build/test-campplus`         | CAMPPlus 192-d embedding parity |
 | `build/test-voice-embedding`  | wav → fbank → CAMPPlus end-to-end parity |
 | `build/test-s3tokenizer`      | S3TokenizerV2 log-mel + speech-token parity |
+| `build/test-streaming`        | Per-chunk CFM + HiFT parity for the streaming pipeline (B1) |
+| `build/test-mtl-tokenizer`    | Multilingual grapheme tokenizer parity vs the HF reference |
+| `build/test-t3-mtl`           | End-to-end MTL T3 (Llama-520M) forward-pass parity |
+| `build/test-t3-mtl-stages`    | Staged MTL T3 parity (cond/text/inputs/layers/head) |
 | `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
 
 You'll normally only need `build/tts-cli`; the `test-*` binaries are
@@ -151,30 +224,72 @@ package-manager-driven builds.
 # Activate the Python environment from the Prerequisites step
 . ../chatterbox-ref/.venv/bin/activate
 
-# Convert T3 weights + tokenizer + voice conditionals
+# --- Turbo (English, default) ---
 python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
+python scripts/convert-s3gen-to-gguf.py    --out models/chatterbox-s3gen.gguf
 
-# Convert S3Gen encoder + CFM + HiFT weights
-# (the built-in reference voice is embedded inside this GGUF)
-python scripts/convert-s3gen-to-gguf.py --out models/chatterbox-s3gen.gguf
+# --- Multilingual (23 languages) ---
+python scripts/convert-t3-mtl-to-gguf.py            --out models/chatterbox-t3-mtl.gguf
+python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3gen-mtl.gguf
+
+# --- Multilingual, quantised (recommended for speed) ---
+# Matches the RTF numbers in the benchmark table above.  --quant accepts
+# {f32,f16,q8_0,q5_0,q4_0} on convert-s3gen-to-gguf.py (default f16) and
+# {f16,q8_0,q5_0,q4_0} on convert-t3-mtl-to-gguf.py (default f16, since
+# the T3 storage baseline is already F16).  The flag controls the large
+# matmul weights only — biases, LayerNorm gammas/betas, embedding tables,
+# voice encoders, and built-in voice conditioning always stay at full
+# precision (see the deny-list in scripts/requantize-gguf.py for the
+# exact policy; the same policy is used by all three tools).
+python scripts/convert-t3-mtl-to-gguf.py --quant q4_0 \
+       --out models/chatterbox-t3-mtl-q4_0.gguf
+python scripts/convert-s3gen-to-gguf.py  --variant mtl --quant q4_0 \
+       --out models/chatterbox-s3gen-mtl-q4_0.gguf
 ```
 
-The scripts pull `ResembleAI/chatterbox-turbo` from Hugging Face Hub on
-first run (about 1.5 GB). The BPE tokenizer (`vocab.json` + `merges.txt` +
-`added_tokens.json`) is **embedded directly into the T3 GGUF** as
-`tokenizer.ggml.*` metadata, so you don't need to keep those three files
-around on disk.
+The Turbo converter pulls `ResembleAI/chatterbox-turbo` (~1.5 GB), the MTL
+converter pulls `ResembleAI/chatterbox` (~3 GB).  The BPE tokenizer for
+Turbo (`vocab.json` + `merges.txt` + `added_tokens.json`) is **embedded
+directly into the T3 GGUF** as `tokenizer.ggml.*` metadata; for MTL we
+embed the full HuggingFace `tokenizers.json` blob (plus a Korean-Jamo /
+NFKD Unicode table for offline preprocessing), so in both cases you don't
+need to keep the source tokenizer files around on disk.
 
-You should now have:
+The quantisation flag on `convert-s3gen-to-gguf.py` is new as of §3.20 —
+it's pure data-format work, so the binary needs no changes and every
+backend (CPU, Metal, Vulkan, CUDA) picks up the faster matmul kernels
+transparently.  The per-tensor decision lives in `should_quantize()`
+inside `scripts/requantize-gguf.py` (single source of truth shared
+with the offline rewriter): biases, norm scales, embedding tables,
+spectral filterbanks, voice-cloning preprocessors (CAMPPlus,
+VoiceEncoder, S3TokenizerV2) and any tensor whose reduction dim isn't
+block-aligned all stay at full precision.  See `PROGRESS.md §3.20` for
+the full deny-list and resulting size / speed numbers.
+
+You should now have (either pair is usable on its own):
 
 ```
 models/
   chatterbox-t3-turbo.gguf   (~742 MB) — T3 GPT-2 Medium + embedded GPT-2 BPE
                                tokenizer + VoiceEncoder weights + built-in voice
-  chatterbox-s3gen.gguf      (~1.0 GB) — S3Gen encoder/CFM + HiFT vocoder
-                               + CAMPPlus speaker encoder + S3TokenizerV2
-                               (everything needed for voice cloning, on top of
-                               the built-in reference voice)
+  chatterbox-s3gen.gguf      (~1.0 GB) — S3Gen encoder/CFM (meanflow 2-step)
+                               + HiFT vocoder + CAMPPlus + S3TokenizerV2
+                               + built-in voice (everything needed for voice
+                               cloning Turbo-side)
+
+  chatterbox-t3-mtl.gguf          (~1.1 GB) — T3 Llama-520M + perceiver resampler
+                                    + emotion adv + learned pos embs + embedded
+                                    MTL grapheme tokenizer JSON + VoiceEncoder
+                                    + built-in voice
+  chatterbox-s3gen-mtl.gguf       (~1.0 GB) — S3Gen encoder/CFM (standard 10-step
+                                    + CFG inside, cfg_rate=0.7) + HiFT vocoder
+                                    + CAMPPlus + S3TokenizerV2 + built-in voice
+
+  # Optional quantised multilingual variants — numerically very close to F16 but
+  # ~1.5-2x faster on every backend (CPU/Metal/Vulkan/CUDA) due to lower weight
+  # memory bandwidth.  Recommended for production use; see benchmark table above.
+  chatterbox-t3-mtl-q4_0.gguf     (~344 MB) — Q4_0 T3 Llama-520M
+  chatterbox-s3gen-mtl-q4_0.gguf  (~685 MB) — Q4_0 MTL S3Gen
 ```
 
 For numerical validation against PyTorch (optional, step 4), also run:
@@ -187,11 +302,13 @@ python scripts/dump-s3gen-reference.py \
 
 ### Optional: quantize the models (smaller + faster)
 
-Both GGUFs can be quantized to `Q8_0` (near-lossless) or `Q4_0`
-(different CFM sample but same subjective quality, smaller).
-`llama-quantize` doesn't recognize the `chatterbox` / `chatterbox-s3gen`
-custom architectures, so we ship a small standalone rewriter that
-works on either model:
+Both GGUFs can be quantized to `Q8_0` (near-lossless), `Q5_0`, or
+`Q4_0` (different CFM sample but same subjective quality, smaller).
+The same machinery works on the multilingual GGUFs too — the
+benchmark numbers at the top of this README use the q4_0 variants
+shown there.  `llama-quantize` doesn't recognize the `chatterbox` /
+`chatterbox-s3gen` custom architectures, so we ship a small standalone
+rewriter that works on any of the four GGUFs:
 
 ```bash
 # T3
@@ -270,6 +387,33 @@ That's equivalent to running the binary directly:
   --text        "Hello from native C plus plus." \
   --out         /tmp/out.wav
 ```
+
+**Multilingual** takes the same flags plus a required `--language CODE`
+(one of the tier-1 codes listed at the top of the README) and runs all the
+CFG / perceiver / 10-step-CFM machinery automatically based on the GGUF's
+`chatterbox.variant` metadata:
+
+```bash
+./build/tts-cli \
+  --model       models/chatterbox-t3-mtl.gguf \
+  --s3gen-gguf  models/chatterbox-s3gen-mtl.gguf \
+  --text        "Hola, esto es una demostración multilingüe." \
+  --language    es \
+  --out         /tmp/mtl_es.wav
+```
+
+Extra MTL-only knobs: `--cfg-weight F` (default 0.5, must be ≥ 0),
+`--min-p F` (0.05, in [0, 1]), `--exaggeration F` (0.5 — emotion
+intensity, in [0, 1]).  `--reference-audio` works
+the same way on both variants.
+
+`--cfm-steps N` lowers the CFM Euler step count for non-streaming
+synthesis (default 10 for Multilingual's standard CFM).  N=7 saves ~22%
+of S3Gen wall time at log-mel cosine 0.995 vs the N=10 reference and is
+the recommended quality knee on M3 Ultra (see [`PROGRESS.md §3.21`](PROGRESS.md));
+N=6 is too aggressive (cosine 0.990 right at the threshold, PCM cosine
+drops to 0.88).  Streaming chunks ignore this flag and use
+`--stream-cfm-steps` instead.
 
 Everything is self-contained in the two `.gguf` files:
 
@@ -512,6 +656,148 @@ HiFT `conv_transpose_1d` upsampling is the single biggest stage on
 Metal today; the 5090 chews through it 3.4× faster, which is where the
 remaining end-to-end gap comes from.
 
+### Multilingual (Apple M4, F16 weights)
+
+Same prompt + seed run through both variants on the same M4, for apples-to-
+apples comparison.  MTL is 30 transformer layers vs Turbo's 24 plus CFG on
+both T3 and CFM (2 forward passes per step), and it samples standard CFM
+for 10 Euler steps instead of Turbo's meanflow 2.
+
+| Config                              | T3 infer            | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|---------------------:|-------------:|------:|--------:|
+| Turbo, Metal                        |  788 ms /  73 tok   |    768 ms    | 3.04 s| 0.51    |
+| Turbo, CPU 4t                       | 1 721 ms /  73 tok  |  3 334 ms    | 3.04 s| 1.66    |
+| Multilingual, Metal *(batched CFM)* | 1 865 ms /  61 tok  |  2 247 ms    | 2.56 s| 1.61    |
+| Multilingual, CPU 4t *(2-call CFM)*³| 3 210 ms /  85 tok  | 25 660 ms    | 3.52 s| 8.20    |
+
+The MTL Metal path packs the CFG cond+uncond into a single batch=2
+decoder forward (`use_b2 = !ggml_backend_is_cpu(...)`), since kernel
+dispatch overhead amortises well across the bigger workload; on ggml-cpu
+the extra permute+cont ops that a batched attention block needs regress
+throughput, so CPU keeps the two-call path.  See
+[`PROGRESS.md §3.19`](PROGRESS.md) for the measurement and a discussion
+of where the MTL slowdown lives relative to Turbo.
+
+³ Re-measured on the same M4 host after commit `6d9b42b` restored the
+CFG combine on the non-`use_b2` (CPU) CFM path.  The previous row in
+this table (`2 711 ms / 71 tok`, `8 029 ms`, `RTF 3.63`) was captured
+while CPU was silently running only the conditional CFM pass — i.e.
+half the CFM compute and no classifier-free guidance steering.  S3Gen
+wall-time roughly doubled (one extra forward call per CFM step) and
+RTF went from 3.63 → 8.20.  The remeasurement here uses the local
+`gianni.wav` reference (jfk.wav was not on the host) — that accounts
+for the slightly larger token count (85 vs the original 71); the per-
+audio-second cost ratio is what shifted, ~2×, in line with restoring
+the missing pass.  Turbo and the Metal multilingual row are
+unaffected — they always carried the CFG combine.
+
+### Multilingual (Mac Studio M3 Ultra, after §3.21 optimisation pass)
+
+Same Spanish prompt (`"Hola, esto es una demostración multilingüe."`,
+`--language es`), `jfk.wav` voice, seed 42, greedy (`--temp 0 --top-k 1`),
+3 warm runs averaged.  T3 is now CFG-batched into a single Metal forward
+(B=2, mirrors S3Gen's `use_b2`); MLP uses `ggml_swiglu_split` so the 30
+SiLU+Mul element-wise pairs collapse into one fused Metal kernel per
+layer.  The new `--cfm-steps N` flag exposes the standard CFM step count
+(default 10); N=7 is the recommended quality knee (log-mel cosine vs N=10
+= **0.995**).
+
+| Config                              | T3 infer           | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|-------------------:|------------:|------:|--------:|
+| MTL, Metal Q4_0, `--cfm-steps 7`    |  478 ms /  84 tok  |    576 ms   | 3.48 s|  0.30   |
+| MTL, Metal Q4_0 (default N=10)      |  482 ms /  84 tok  |    730 ms   | 3.48 s|  0.35   |
+| MTL, Metal F16, `--cfm-steps 7`     |  579 ms /  89 tok  |    586 ms   | 3.68 s|  0.32   |
+| MTL, Metal F16 (default N=10)       |  613 ms /  89 tok  |    752 ms   | 3.68 s|  0.37   |
+
+Compared to the M4 multilingual numbers above, the M3 Ultra hits
+**RTF 0.30** on Q4_0 — a 4.6× speedup.  The CFG-batching alone drops T3
+by 42–45% (see PROGRESS.md §3.21 for the full bench matrix and the
+NEGATIVE results for F16 KV cache and SwiGLU on F16).
+
+### Multilingual (M3 Ultra, post §3.24–§3.31 Metal kernel portfolio)
+
+Same prompt, voice, seed as §3.21 above.  Adds, on top of §3.21:
+
+- **§3.24** — HiFT conv-kernel F16 quantisation (64 tensors).
+- **§3.26** — `kernel_mul_mv_f32_f16{,_4,_short}` Metal kernel variants
+  to unblock 21 more HiFT `source_*` F16 tensors
+  (GGUF shrinks **754 → 747 MB**, WAV cos 1.000000 vs §3.24).
+- **§3.27** — `kernel_mul_mm` + `ADD(bias)` [+ `ADD(residual)`] fusion
+  for the CFM transformer Q4_0 mat-muls (1820 saved `ggml_add`
+  dispatches per synth).
+- **§3.28** — extends the fusion to absorb `GELU_ERF` (CFM FF ff0
+  activation path; 1120 additional saved dispatches).
+- **§3.30** — `test-metal-ops` fused-mul_mm parity harness + bias-only
+  direct-store variant.
+- **§3.31** — iOS-arm64 cross-build portability +
+  `scripts/bench-m4-validation.sh` for M4 hand-off.
+
+5-invocation averages (`default N=10` CFM — compare to the §3.21 N=10 row):
+
+| Config                              | T3 infer            | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|--------------------:|------------:|------:|--------:|
+| MTL, Metal Q4_0 + HiFT F16 v2 (§3.28) |  433 ms / 84 tok  |    706 ms   | 3.48 s| **0.33** |
+| MTL, Metal Q4_0 baseline (§3.21 N=10) |  482 ms / 84 tok  |    730 ms   | 3.48 s|  0.35    |
+| **Δ §3.21 → §3.28**                   |  **−49 ms / −10.2 %** | **−24 ms / −3.3 %** | — | **−0.02** |
+
+WAV is byte-exact deterministic across runs (md5
+`d8a1b22375dbcb2259c686426a7d76c5` ×5).  Parity harness
+`test-metal-ops` passes 14 gates (3 base + 3 conv_transpose_1d + 8
+fused `mul_mm`).  Patch `patches/ggml-metal-chatterbox-ops.patch`
+(1088 lines) applies cleanly on a fresh ggml clone at pinned
+`58c38058`.  All §3.24–§3.30 kernel changes cross-compile cleanly
+for iOS-arm64 (portability verified; runtime measurement deferred
+until an M4 / iPhone / iPad run of
+[`scripts/bench-m4-validation.sh`](scripts/bench-m4-validation.sh)).
+
+M3 Ultra CFM time specifically drops from 541.9 ms → 534.0 ms
+(**−1.5 %**) — modest on this chip because per-dispatch overhead
+is very low; expected to be larger on bandwidth-limited silicon
+(M4 / A-series) where each saved `ggml_add` dispatch is worth more
+relative to compute.
+
+### Reference comparison vs onnxruntime (Multilingual, M4 CPU, F16)
+
+Same prompt, seed, and reference audio fed through
+[`qvac-lib-infer-onnx-tts`][onnx-tts] (the in-house ONNX Runtime TTS
+addon) and our ggml build back-to-back via
+[`examples/chatterbox-multilingual-bench.js`][bench].  4 CPU threads on
+both.  ONNX Runtime's multilingual export currently ships without the
+`text_emb_weight.bin` tensor and emits `CFG disabled` at load — so its
+numbers are already against a half-compute pipeline:
+
+```
+                     onnxruntime-fp16   ggml-cpu-f16⁴
+  -------------------------------------------------
+  cold load               42 829 ms        ~500 ms   (85x faster)
+  inference wall          51 447 ms     10 168 ms   (5.06x faster)
+  audio produced           2 740 ms      2 400 ms
+  RTF                        18.78          4.24
+  CFG enabled                  no           yes⁴
+```
+
+ggml is **5.06× faster per utterance and ~85× faster on cold load**,
+while doing the full CFG pipeline (2 CFM estimator passes + 2 T3 passes
+per step) that ONNX skips.  If the ONNX CFG path were wired up, its RTF
+would roughly double and the gap would be ~10×.  Quality is comparable
+— the two wavs (`bench-onnx.wav` / `bench-ggml.wav`) sound like the same
+Spanish sentence in the JFK-cloned voice.
+
+⁴ The ggml-cpu-f16 column above was captured during the same Apr 23–May 4
+window where the non-`use_b2` CFM path was silently dropping the
+unconditional pass on CPU; "CFG enabled: yes" overstated what was running
+in this specific column.  After commit `6d9b42b` restored CFG on the CPU
+path, the per-utterance ggml number on M4 CPU F16 should roughly double
+(see footnotes ² and ³ above for the 2× ratio observed on standalone CPU
+runs).  Re-running `chatterbox-multilingual-bench.js` with current
+`multilingual_merged` will produce a corrected column; the ONNX side is
+unchanged so the ratio should land near `~2.5–3× faster` rather than the
+historical `5.06×`.  Cold-load (`~85×`) is a load-time figure and
+unaffected by the runtime fix.
+
+[onnx-tts]: https://github.com/tetherto/qvac2/tree/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts
+[bench]: https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js
+
 ### Reproducing these numbers
 
 ```bash
@@ -665,20 +951,31 @@ chatterbox.cpp/
   ggml/                          pristine ggml clone (not tracked; populated
                                    by scripts/setup-ggml.sh, or skipped entirely
                                    when building with -DTTS_CPP_USE_SYSTEM_GGML=ON)
+  include/tts-cpp/               installed public headers (Engine API)
+    tts-cpp.h                    library entry; declares tts_cpp_cli_main()
+    chatterbox/engine.h          Engine + EngineOptions (text → wav)
+    chatterbox/s3gen_pipeline.h  low-level S3Gen + HiFT pipeline entries
   src/
-    main.cpp                     T3 runtime + shared helpers  (libtts-cpp)
-    chatterbox_cli.cpp           CLI entry (`tts-cli` binary)
+    main.cpp                     T3 turbo runtime + shared helpers (libtts-cpp)
+    t3_mtl.{h,cpp}               T3 multilingual (Llama-520M) runtime + stage builders
+    chatterbox_t3_internal.h     internal T3 declarations shared by main/engine/CLI
+    chatterbox_engine.cpp        public Engine API impl (libtts-cpp)
+    chatterbox_cli.cpp           CLI entry (`tts-cli` + `chatterbox` binaries)
+    cli_main.cpp                 thin int-main forwarder; calls tts_cpp_cli_main()
     chatterbox_tts.cpp           S3Gen + HiFT pipeline        (libtts-cpp)
-    s3gen_pipeline.h             public API for the S3Gen+HiFT back half
     mel2wav.cpp                  HiFT-only demo              (mel2wav)
-    gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer
+    gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer (Turbo)
+    mtl_tokenizer.{h,cpp}        multilingual grapheme tokenizer
+                                   (HF tokenizers.json + NFKD lowercasing)
+    mtl_unicode_tables.inc       embedded NFKD + Korean Jamo lookup tables
 
     voice_features.{h,cpp}       WAV I/O, sinc resampler, LUFS meter,
                                    24 kHz & 16 kHz log-mel extraction,
                                    Kaldi-style 80-ch fbank
+    mel_extract_stft.cpp         STFT-based mel extraction shared by C++ pipelines
     voice_encoder.{h,cpp}        3-layer LSTM → 256-d speaker_emb
                                    (matches Resemble VoiceEncoder)
-    campplus.{h,cpp}              FunASR x-vector port (FCM + 3× CAMDense
+    campplus.{h,cpp}             FunASR x-vector port (FCM + 3× CAMDense
                                    TDNN) → 192-d embedding
     s3tokenizer.{h,cpp}          6-layer FSMN-attn transformer + FSQ →
                                    25-Hz speech tokens
@@ -686,15 +983,26 @@ chatterbox.cpp/
     npy.h                        minimal .npy load / save + compare
 
     test_*.cpp                   per-stage numerical-parity harnesses
+                                   (S3Gen / HiFT / streaming / MTL T3 /
+                                    MTL tokenizer / voice features / Metal ops)
   scripts/
-    synthesize.sh                text → wav wrapper
-    convert-t3-turbo-to-gguf.py  T3 weights + tokenizer + VE + builtin
-                                   voice → T3 GGUF
+    setup-ggml.sh                clones the pinned ggml commit + applies patches
+    synthesize.sh                text → wav wrapper around tts-cli
+    convert-t3-turbo-to-gguf.py  Turbo T3 weights + GPT-2 BPE + VE + builtin
+                                   voice → T3 GGUF (--quant)
+    convert-t3-mtl-to-gguf.py    MTL T3 (Llama-520M) + perceiver + emotion-adv
+                                   + tokenizers.json + builtin voice → T3 GGUF (--quant)
     convert-s3gen-to-gguf.py     S3Gen encoder + CFM + HiFT + CAMPPlus +
-                                   S3TokenizerV2 + mel filterbanks →
-                                   S3Gen GGUF
+                                   S3TokenizerV2 + mel filterbanks → S3Gen GGUF
+                                   (--variant {turbo,mtl}, --quant)
+    requantize-gguf.py           in-place block-quantise of an existing
+                                   T3/S3Gen GGUF (canonical deny-list lives here)
+    extract-voice.py             one-shot voice-clone prep (silencedetect +
+                                   codec-aware EQ + optional `--save-voice` bake)
+    gen-nfkd-table.py            generates src/mtl_unicode_tables.inc
     dump-*-reference.py          PyTorch → .npy intermediates for the
-                                   per-stage harnesses
+                                   per-stage harnesses (S3Gen, CAMPPlus,
+                                   S3TokenizerV2, streaming, MTL T3)
     reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
   patches/
@@ -719,6 +1027,22 @@ converter to produce a fresh GGUF:
 ```bash
 python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
 ```
+
+**`warning: s3gen GGUF lacks variant keys`** — you're running against a
+legacy S3Gen GGUF produced before the variant metadata was added in
+§3.19/§3.20. The defaults (`meanflow=true, n_timesteps=2, cfg_rate=0`)
+match the historical Turbo behaviour, so legacy Turbo GGUFs continue
+to work.  For a Multilingual S3Gen GGUF, however, those defaults are
+wrong and the output will be garbage — re-run the converter:
+
+```bash
+python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3gen-mtl.gguf
+```
+
+**`error: --min-p must be in [0, 1]`** / `--cfg-weight must be >= 0` /
+`--exaggeration must be in [0, 1]` — the MTL sampling knobs reject
+out-of-range values up front instead of producing wrong-but-not-crashing
+output.  Pass values inside the documented ranges (see "Run" above).
 
 **`--debug requires --ref-dir`** — debug mode substitutes Python-dumped
 random bits to make every intermediate tensor bit-exactly comparable.
