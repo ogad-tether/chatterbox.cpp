@@ -82,13 +82,24 @@ _DENY_SUBSTRINGS = (
     "mel_fb",                   # T3 VoiceEncoder and S3Gen mel filterbank tensors
     "pos_emb",                  # positional embeddings — small, keep F32
     "pe/pe",                    # conformer pos enc
+    "pre_attention_query",      # MTL T3 perceiver: learned query embedding
+                                # (CLS-like).  Used as an *activation* (passed
+                                # as the right-hand side of mul_mat after
+                                # reshape), not a weight, so quantising it
+                                # breaks ggml_reshape_2d / ggml_norm /
+                                # ggml_mul_mat-as-src1 in build_perceiver.
+                                # Pre-existing latent bug: was always wrongly
+                                # quantizable (3-D shape (1024, 32, 1) clears
+                                # the K%32==0 gate); only surfaced now because
+                                # the shipped q4_0 GGUF was produced via an
+                                # earlier code path that kept it at source
+                                # dtype.
     # Biases / norms / scale params — always 1-D or near-1-D
     "/b",                       # legacy biases (gpt-2 /b, s3gen /b)
     "/bias",                    # pytorch-style bias
     "/bn/",                     # batchnorm params
     "/norm/",                   # layernorms
     "/ln_",                     # GPT-2 style layernorms (ln_1, ln_2, ln_f)
-    "/g",                       # GPT-2 style norm scale (matches /g, /ga[mma], /gate — accept the occasional false deny)
     "/scale",                   # legacy scale weights (narrowed from the
                                 # old "/s" glob so HiFT source_* conv
                                 # weights are no longer incidentally
@@ -119,6 +130,18 @@ _DENY_SUBSTRINGS = (
     "voice_encoder/",           # T3 VoiceEncoder (3-layer bi-LSTM + projection)
     "campplus/",                # S3Gen CAMPPlus (TDNN x-vector extractor)
     "s3tokv2/",                 # S3Gen S3TokenizerV2 (conformer + FSQ quantizer)
+)
+
+
+# Suffix-anchored denies.  Use this for one-letter param names that would
+# otherwise hit too many incidental substring matches.  The classic case
+# is the GPT-2 / Llama RMSNorm scale tensor `.../ln_attn/g`, `.../norm/g`:
+# matched as a substring, "/g" also wrongly catches `.../mlp/gate/w` (30
+# tensors × ~4 MB each ≈ 120 MB on the multilingual T3 Q4_0 GGUF) and is
+# the reason §3.23 observed `mlp_gate` shipping as F16 while `mlp_up`
+# shipped as Q4_0 — a converter bug, not by design.
+_DENY_SUFFIXES = (
+    "/g",                       # GPT-2 / Llama RMSNorm / LayerNorm scale at end of path
 )
 
 
@@ -153,6 +176,9 @@ def should_quantize(name: str, shape: tuple[int, ...], qtype: gguf.GGMLQuantizat
     # Deny-list.
     for s in _DENY_SUBSTRINGS:
         if s in name:  # case-sensitive for path-like names
+            return False
+    for s in _DENY_SUFFIXES:
+        if name.endswith(s):  # one-letter param names that would over-match as substring
             return False
 
     block = gguf.GGML_QUANT_SIZES[qtype][0]
