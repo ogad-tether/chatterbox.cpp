@@ -52,7 +52,12 @@ ALLOW_PATTERNS = [
     "Cangjie5_TC.json",
 ]
 
-SUPPORTED_LANGUAGES = [
+# All language codes the *Python reference tokenizer* accepts. The C++
+# tokenizer in src/mtl_tokenizer.cpp only honors the tier-1 subset (18
+# of these); the other 5 (ja, he, ru, zh, hi) need external preprocessing
+# (pykakasi / dicta / russian_text_stresser / Cangjie) and hard-error at
+# runtime. See mtl_tokenizer::supported_languages() for the runtime list.
+ALL_KNOWN_LANGUAGES = [
     "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi",
     "it", "ja", "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv",
     "sw", "tr", "zh",
@@ -279,8 +284,8 @@ def write_tokenizer(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     text = tok_path.read_text(encoding="utf-8")
     writer.add_string("tokenizer.ggml.model", "mtl_grapheme")
     writer.add_string("tokenizer.ggml.mtl_json", text)
-    writer.add_array("tokenizer.ggml.mtl_languages", SUPPORTED_LANGUAGES)
-    print(f"Embedded tokenizer JSON ({len(text)} bytes), {len(SUPPORTED_LANGUAGES)} languages")
+    writer.add_array("tokenizer.ggml.mtl_languages", ALL_KNOWN_LANGUAGES)
+    print(f"Embedded tokenizer JSON ({len(text)} bytes), {len(ALL_KNOWN_LANGUAGES)} languages")
 
 
 def write_voice_encoder(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:

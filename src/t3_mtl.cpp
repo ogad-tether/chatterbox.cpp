@@ -198,6 +198,9 @@ ggml_tensor * build_perceiver_attn(ggml_context * ctx,
     const int T_kv = perc_kv->ne[1];
 
     // LayerNorm on both inputs (same affine weights as Python's self.norm).
+    // eps fixed at 1e-5 to match nn.LayerNorm's PyTorch default; this is
+    // intentionally NOT hp.eps (which is the Llama backbone's RMSNorm eps
+    // and only applies to the 30 transformer blocks).
     auto ln = [&](ggml_tensor * x) {
         ggml_tensor * n = ggml_norm(ctx, x, /*eps=*/1e-5f);
         return ggml_add(ctx, ggml_mul(ctx, n, w.norm_g), w.norm_b);

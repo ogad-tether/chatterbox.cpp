@@ -19,7 +19,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, "/Users/gustavoefa/dev/chatterbox-ref/src")
+ref_src = os.environ.get(
+    "CHATTERBOX_REF_SRC",
+    str(Path(__file__).resolve().parent.parent.parent / "chatterbox-ref" / "src"),
+)
+sys.path.insert(0, ref_src)
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS  # noqa: E402
 
 

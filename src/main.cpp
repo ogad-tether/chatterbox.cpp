@@ -357,8 +357,10 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
                 const char * v = gguf_get_val_str(peek_ctx, vk);
                 if (v) variant = v;
             } else if (vk >= 0) {
-                fprintf(stderr, "%s: ignoring %s with unexpected GGUF type %d (defaulting to t3_turbo)\n",
+                fprintf(stderr, "%s: %s has unexpected GGUF type %d (expected STRING); refusing to load\n",
                         __func__, KEY_VARIANT, (int) gguf_get_kv_type(peek_ctx, vk));
+                gguf_free(peek_ctx);
+                return false;
             }
             gguf_free(peek_ctx);
             if (variant == "t3_mtl") {
