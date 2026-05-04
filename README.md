@@ -36,8 +36,8 @@ ONNX reference uses `jfk.wav` via the [multilingual-bench][bench] script):
 | Metal (M3 Ultra, F16)                |  1.41 s   |  0.38  | 2.6×        | **37.5× faster**¹ |
 | **Metal (M4, Q4_0)**                 |  **3.0 s**| 1.37  | 0.73×        | **10.6× faster**¹ |
 | Metal (M4, F16)                      |   4.0 s   | 1.65  | 0.61×        | **14.2× faster**¹ |
-| CPU (M4, 4t NEON, Q4_0)              |   6.0 s   | 2.69  | 0.37×        | **5.4× faster**¹  |
-| CPU (M4, 4t NEON, F16)               |   7.8 s   | 3.24  | 0.31×        | **7.3× faster**¹  |
+| CPU (M4, 4t NEON, Q4_0)              |  10.7 s²  | 4.32² | 0.23×        | **3.0× faster**¹  |
+| CPU (M4, 4t NEON, F16)               |  17.1 s²  | 6.70² | 0.15×        | **3.1× faster**¹  |
 | Reference (ONNX Runtime, CPU 4t, q4) |  31.7 s   |14.55  | 0.07×        | —                |
 | Reference (ONNX Runtime, CPU 4t, fp16)|53.3 s   |23.50  | 0.04×        | —                |
 
@@ -56,6 +56,17 @@ gap vs ggml would widen to ~10–14× (CPU) / ~20–28× (Metal). ggml runs
 the full CFG pipeline in every row above. Reproduction + per-stage
 breakdown in [`PROGRESS.md §3.19–3.20`](PROGRESS.md) and
 [`qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js`][bench].
+
+² **CPU multilingual rows re-measured after restoring CFG on the
+non-Metal CFM path.**  The previous numbers in this row (`6.0 s / 2.69`
+and `7.8 s / 3.24`) were captured between Apr 23–May 4 while the
+non-`use_b2` branch in the CFM step loop was silently running only the
+conditional pass — i.e. half the CFM compute, no classifier-free
+guidance steering on CPU/Vulkan/CUDA.  Fixed in commit `6d9b42b`; the
+two rows above are now end-to-end re-measurements on the same M4 host
+with CFG correctly applied (12 CFM steps × 2 forward calls).
+S3Gen wall-time roughly doubled, RTF went up ~2×.  Metal rows are
+unaffected (the `use_b2` branched path always carried the CFG combine).
 
 [bench]: https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js
 
@@ -657,7 +668,7 @@ for 10 Euler steps instead of Turbo's meanflow 2.
 | Turbo, Metal                        |  788 ms /  73 tok   |    768 ms    | 3.04 s| 0.51    |
 | Turbo, CPU 4t                       | 1 721 ms /  73 tok  |  3 334 ms    | 3.04 s| 1.66    |
 | Multilingual, Metal *(batched CFM)* | 1 865 ms /  61 tok  |  2 247 ms    | 2.56 s| 1.61    |
-| Multilingual, CPU 4t *(2-call CFM)* | 2 711 ms /  71 tok  |  8 029 ms    | 2.96 s| 3.63    |
+| Multilingual, CPU 4t *(2-call CFM)*³| 3 210 ms /  85 tok  | 25 660 ms    | 3.52 s| 8.20    |
 
 The MTL Metal path packs the CFG cond+uncond into a single batch=2
 decoder forward (`use_b2 = !ggml_backend_is_cpu(...)`), since kernel
@@ -666,6 +677,19 @@ the extra permute+cont ops that a batched attention block needs regress
 throughput, so CPU keeps the two-call path.  See
 [`PROGRESS.md §3.19`](PROGRESS.md) for the measurement and a discussion
 of where the MTL slowdown lives relative to Turbo.
+
+³ Re-measured on the same M4 host after commit `6d9b42b` restored the
+CFG combine on the non-`use_b2` (CPU) CFM path.  The previous row in
+this table (`2 711 ms / 71 tok`, `8 029 ms`, `RTF 3.63`) was captured
+while CPU was silently running only the conditional CFM pass — i.e.
+half the CFM compute and no classifier-free guidance steering.  S3Gen
+wall-time roughly doubled (one extra forward call per CFM step) and
+RTF went from 3.63 → 8.20.  The remeasurement here uses the local
+`gianni.wav` reference (jfk.wav was not on the host) — that accounts
+for the slightly larger token count (85 vs the original 71); the per-
+audio-second cost ratio is what shifted, ~2×, in line with restoring
+the missing pass.  Turbo and the Metal multilingual row are
+unaffected — they always carried the CFG combine.
 
 ### Multilingual (Mac Studio M3 Ultra, after §3.21 optimisation pass)
 
@@ -743,13 +767,13 @@ both.  ONNX Runtime's multilingual export currently ships without the
 numbers are already against a half-compute pipeline:
 
 ```
-                     onnxruntime-fp16   ggml-cpu-f16
+                     onnxruntime-fp16   ggml-cpu-f16⁴
   -------------------------------------------------
   cold load               42 829 ms        ~500 ms   (85x faster)
   inference wall          51 447 ms     10 168 ms   (5.06x faster)
   audio produced           2 740 ms      2 400 ms
   RTF                        18.78          4.24
-  CFG enabled                  no           yes
+  CFG enabled                  no           yes⁴
 ```
 
 ggml is **5.06× faster per utterance and ~85× faster on cold load**,
@@ -758,6 +782,18 @@ per step) that ONNX skips.  If the ONNX CFG path were wired up, its RTF
 would roughly double and the gap would be ~10×.  Quality is comparable
 — the two wavs (`bench-onnx.wav` / `bench-ggml.wav`) sound like the same
 Spanish sentence in the JFK-cloned voice.
+
+⁴ The ggml-cpu-f16 column above was captured during the same Apr 23–May 4
+window where the non-`use_b2` CFM path was silently dropping the
+unconditional pass on CPU; "CFG enabled: yes" overstated what was running
+in this specific column.  After commit `6d9b42b` restored CFG on the CPU
+path, the per-utterance ggml number on M4 CPU F16 should roughly double
+(see footnotes ² and ³ above for the 2× ratio observed on standalone CPU
+runs).  Re-running `chatterbox-multilingual-bench.js` with current
+`multilingual_merged` will produce a corrected column; the ONNX side is
+unchanged so the ratio should land near `~2.5–3× faster` rather than the
+historical `5.06×`.  Cold-load (`~85×`) is a load-time figure and
+unaffected by the runtime fix.
 
 [onnx-tts]: https://github.com/tetherto/qvac2/tree/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts
 [bench]: https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js
