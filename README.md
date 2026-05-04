@@ -117,13 +117,19 @@ Current status:
   (preprocess, duration, text encoder, vector estimator, vocoder), and the
   full pipeline (`test-supertonic-pipeline`) reproduces the ONNX reference
   waveform when fed the same initial noise tensor.
-- The production path is GGML-backed for duration, vocoder, vector estimator,
-  text ConvNeXt, and speech-prompted text attention.  Text encoder
-  relative-position self-attention is still a scalar continuation because it
-  needs relative key and value terms inside the attention softmax; plain
-  `ggml_flash_attn_ext` cannot express that bias/value path.
+- The production path is GGML-backed for duration, text encoder, vector
+  estimator, and vocoder.  Text relative-position self-attention is expressed
+  with stock GGML ops, and the speech-prompted text attention / vector
+  attention blocks use `ggml_flash_attn_ext` where the math allows it.
+- Vector estimator still uses several smaller graph islands with explicit
+  host-side layout packing between them.  `SUPERTONIC_VECTOR_PROFILE=1` prints
+  per-island timings for tuning those boundaries.
 - CPU thread count is controlled by `--threads`; the default caps at 4 threads
   because the current small-graph Supertonic path regresses when oversubscribed.
+- Current quick-brown-fox CPU baseline on this machine (F1, English,
+  5 steps, speed `1.05`, 4 GGML threads) is median `RTF ≈ 0.170`
+  (`~5.9x` real time).  Matched ONNX Runtime CPU with 1 thread is median
+  `RTF ≈ 0.116`.
 
 Example:
 
