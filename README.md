@@ -25,17 +25,27 @@ reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
 | CPU (Mac Studio M3 Ultra, NEON)      | 7 568 ms  | 1.05   | 0.96×        | 2.3× faster     |
 | Reference (ONNX Runtime, CPU Q4)     | 6.4–17 s  | 1.2–3.2 | 0.3–0.85×   | —               |
 
-**Multilingual** (same Spanish prompt, seed 42, M4 Mac, built-in voice;
+**Multilingual** (same Spanish prompt, seed 42, built-in voice;
 ONNX reference uses `jfk.wav` via the [multilingual-bench][bench] script):
 
 | Backend                              | Wall      | `RTF` | vs real-time | vs ONNX Runtime |
 |--------------------------------------|----------:|------:|-------------:|----------------:|
+| **Metal (M3 Ultra, Q4_0, `--cfm-steps 7`)** | **1.05 s**| **0.30** | **3.3×**     | **48.4× faster**¹ |
+| Metal (M3 Ultra, Q4_0)               |  **1.22 s** | 0.35  | 2.9×        | **42.0× faster**¹ |
+| Metal (M3 Ultra, F16, `--cfm-steps 7`)| 1.16 s   |  0.32  | 3.2×        | **45.9× faster**¹ |
+| Metal (M3 Ultra, F16)                |  1.41 s   |  0.38  | 2.6×        | **37.5× faster**¹ |
 | **Metal (M4, Q4_0)**                 |  **3.0 s**| 1.37  | 0.73×        | **10.6× faster**¹ |
 | Metal (M4, F16)                      |   4.0 s   | 1.65  | 0.61×        | **14.2× faster**¹ |
 | CPU (M4, 4t NEON, Q4_0)              |   6.0 s   | 2.69  | 0.37×        | **5.4× faster**¹  |
 | CPU (M4, 4t NEON, F16)               |   7.8 s   | 3.24  | 0.31×        | **7.3× faster**¹  |
 | Reference (ONNX Runtime, CPU 4t, q4) |  31.7 s   |14.55  | 0.07×        | —                |
 | Reference (ONNX Runtime, CPU 4t, fp16)|53.3 s   |23.50  | 0.04×        | —                |
+
+The M3 Ultra rows reflect the §3.21 optimisation pass — CFG cond+uncond
+batched into one Metal forward (B=2) on T3, the new `--cfm-steps N` knob
+on the standard 10-step CFM (N=7 is the recommended quality knee, log-mel
+cosine vs N=10 = **0.995**), and `ggml_swiglu_split` on the Llama MLP.
+The M4 rows are kept for continuity with §3.19/§3.20.
 
 ¹ ONNX Runtime's multilingual ONNX export ships **without** the
 `text_emb_weight.bin` tensor and logs `CFG disabled` at load, so it's
@@ -386,6 +396,14 @@ Extra MTL-only knobs: `--cfg-weight F` (default 0.5, must be ≥ 0),
 intensity, in [0, 1]).  `--reference-audio` works
 the same way on both variants.
 
+`--cfm-steps N` lowers the CFM Euler step count for non-streaming
+synthesis (default 10 for Multilingual's standard CFM).  N=7 saves ~22%
+of S3Gen wall time at log-mel cosine 0.995 vs the N=10 reference and is
+the recommended quality knee on M3 Ultra (see [`PROGRESS.md §3.21`](PROGRESS.md));
+N=6 is too aggressive (cosine 0.990 right at the threshold, PCM cosine
+drops to 0.88).  Streaming chunks ignore this flag and use
+`--stream-cfm-steps` instead.
+
 Everything is self-contained in the two `.gguf` files:
 
 - `chatterbox-t3-turbo.gguf` embeds the BPE tokenizer (vocab + merges +
@@ -648,6 +666,71 @@ the extra permute+cont ops that a batched attention block needs regress
 throughput, so CPU keeps the two-call path.  See
 [`PROGRESS.md §3.19`](PROGRESS.md) for the measurement and a discussion
 of where the MTL slowdown lives relative to Turbo.
+
+### Multilingual (Mac Studio M3 Ultra, after §3.21 optimisation pass)
+
+Same Spanish prompt (`"Hola, esto es una demostración multilingüe."`,
+`--language es`), `jfk.wav` voice, seed 42, greedy (`--temp 0 --top-k 1`),
+3 warm runs averaged.  T3 is now CFG-batched into a single Metal forward
+(B=2, mirrors S3Gen's `use_b2`); MLP uses `ggml_swiglu_split` so the 30
+SiLU+Mul element-wise pairs collapse into one fused Metal kernel per
+layer.  The new `--cfm-steps N` flag exposes the standard CFM step count
+(default 10); N=7 is the recommended quality knee (log-mel cosine vs N=10
+= **0.995**).
+
+| Config                              | T3 infer           | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|-------------------:|------------:|------:|--------:|
+| MTL, Metal Q4_0, `--cfm-steps 7`    |  478 ms /  84 tok  |    576 ms   | 3.48 s|  0.30   |
+| MTL, Metal Q4_0 (default N=10)      |  482 ms /  84 tok  |    730 ms   | 3.48 s|  0.35   |
+| MTL, Metal F16, `--cfm-steps 7`     |  579 ms /  89 tok  |    586 ms   | 3.68 s|  0.32   |
+| MTL, Metal F16 (default N=10)       |  613 ms /  89 tok  |    752 ms   | 3.68 s|  0.37   |
+
+Compared to the M4 multilingual numbers above, the M3 Ultra hits
+**RTF 0.30** on Q4_0 — a 4.6× speedup.  The CFG-batching alone drops T3
+by 42–45% (see PROGRESS.md §3.21 for the full bench matrix and the
+NEGATIVE results for F16 KV cache and SwiGLU on F16).
+
+### Multilingual (M3 Ultra, post §3.24–§3.31 Metal kernel portfolio)
+
+Same prompt, voice, seed as §3.21 above.  Adds, on top of §3.21:
+
+- **§3.24** — HiFT conv-kernel F16 quantisation (64 tensors).
+- **§3.26** — `kernel_mul_mv_f32_f16{,_4,_short}` Metal kernel variants
+  to unblock 21 more HiFT `source_*` F16 tensors
+  (GGUF shrinks **754 → 747 MB**, WAV cos 1.000000 vs §3.24).
+- **§3.27** — `kernel_mul_mm` + `ADD(bias)` [+ `ADD(residual)`] fusion
+  for the CFM transformer Q4_0 mat-muls (1820 saved `ggml_add`
+  dispatches per synth).
+- **§3.28** — extends the fusion to absorb `GELU_ERF` (CFM FF ff0
+  activation path; 1120 additional saved dispatches).
+- **§3.30** — `test-metal-ops` fused-mul_mm parity harness + bias-only
+  direct-store variant.
+- **§3.31** — iOS-arm64 cross-build portability +
+  `scripts/bench-m4-validation.sh` for M4 hand-off.
+
+5-invocation averages (`default N=10` CFM — compare to the §3.21 N=10 row):
+
+| Config                              | T3 infer            | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|--------------------:|------------:|------:|--------:|
+| MTL, Metal Q4_0 + HiFT F16 v2 (§3.28) |  433 ms / 84 tok  |    706 ms   | 3.48 s| **0.33** |
+| MTL, Metal Q4_0 baseline (§3.21 N=10) |  482 ms / 84 tok  |    730 ms   | 3.48 s|  0.35    |
+| **Δ §3.21 → §3.28**                   |  **−49 ms / −10.2 %** | **−24 ms / −3.3 %** | — | **−0.02** |
+
+WAV is byte-exact deterministic across runs (md5
+`d8a1b22375dbcb2259c686426a7d76c5` ×5).  Parity harness
+`test-metal-ops` passes 14 gates (3 base + 3 conv_transpose_1d + 8
+fused `mul_mm`).  Patch `patches/ggml-metal-chatterbox-ops.patch`
+(1088 lines) applies cleanly on a fresh ggml clone at pinned
+`58c38058`.  All §3.24–§3.30 kernel changes cross-compile cleanly
+for iOS-arm64 (portability verified; runtime measurement deferred
+until an M4 / iPhone / iPad run of
+[`scripts/bench-m4-validation.sh`](scripts/bench-m4-validation.sh)).
+
+M3 Ultra CFM time specifically drops from 541.9 ms → 534.0 ms
+(**−1.5 %**) — modest on this chip because per-dispatch overhead
+is very low; expected to be larger on bandwidth-limited silicon
+(M4 / A-series) where each saved `ggml_add` dispatch is worth more
+relative to compute.
 
 ### Reference comparison vs onnxruntime (Multilingual, M4 CPU, F16)
 
