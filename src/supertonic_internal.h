@@ -155,6 +155,8 @@ bool supertonic_vector_step_cpu(const supertonic_model & model,
 
 bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
                                        const float * noisy_latent,
+                                       const float * text_emb,
+                                       int text_len,
                                        const float * latent_mask,
                                        int latent_len,
                                        std::vector<supertonic_trace_tensor> & scalar_trace,

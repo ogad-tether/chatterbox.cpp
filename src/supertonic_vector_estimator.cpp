@@ -142,6 +142,21 @@ ggml_tensor * layer_norm_ggml(ggml_context * ctx,
     return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
 }
 
+ggml_tensor * dense_matmul_time_ggml(ggml_context * ctx,
+                                     ggml_tensor * x,
+                                     ggml_tensor * w,
+                                     ggml_tensor * b) {
+    // Raw ONNX MatMul weights are [IC, OC] in row-major order, while GGML
+    // tensors are loaded as ne=[OC, IC].  Make that transpose contiguous, then
+    // view it as a Conv1d kernel [K=1, IC, OC] so it can consume the repo's
+    // standard time-major activation layout [T, IC].
+    ggml_tensor * wt = ggml_cont(ctx, ggml_transpose(ctx, w));
+    ggml_tensor * kernel = ggml_reshape_3d(ctx, wt, 1, w->ne[1], w->ne[0]);
+    ggml_tensor * y = conv1d_f32(ctx, kernel, x, 1, 0, 1);
+    if (b) y = ggml_add(ctx, y, repeat_like(ctx, b, y));
+    return y;
+}
+
 ggml_tensor * vector_convnext_ggml(ggml_context * ctx,
                                    const supertonic_model & model,
                                    const std::string & p,
@@ -175,6 +190,12 @@ std::vector<float> tensor_to_time_channel(ggml_tensor * t) {
             out[(size_t) i * C + c] = raw[(size_t) c * L + i];
         }
     }
+    return out;
+}
+
+std::vector<float> tensor_raw_f32(ggml_tensor * t) {
+    std::vector<float> out((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
     return out;
 }
 
@@ -349,6 +370,8 @@ bool supertonic_vector_step_cpu(const supertonic_model & model, const float * no
 
 bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
                                        const float * noisy_latent,
+                                       const float * text_emb,
+                                       int text_len,
                                        const float * latent_mask,
                                        int latent_len,
                                        std::vector<supertonic_trace_tensor> & scalar_trace,
@@ -399,7 +422,63 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         convnext(model, "vector_estimator:tts.ttl.vector_field.main_blocks.2.convnext.0", block, L, C, 1);
         push_trace(scalar_trace, "ve_block2_convnext0", L, C, block);
 
-        constexpr int MAX_NODES = 256;
+        const int A = 256;
+        std::string base = "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.";
+        std::vector<float> q, k, v;
+        dense_matmul_time(block, L, C, read_f32(model, "vector_estimator:onnx::MatMul_3101"),
+                          read_f32(model, base + "W_query.linear.bias"), A, q);
+        std::vector<float> text_lc((size_t) text_len * 256);
+        for (int t = 0; t < text_len; ++t) {
+            for (int c = 0; c < 256; ++c) {
+                text_lc[(size_t)t * 256 + c] = text_emb[(size_t)c * text_len + t];
+            }
+        }
+        dense_matmul_time(text_lc, text_len, 256, read_f32(model, "vector_estimator:onnx::MatMul_3102"),
+                          read_f32(model, base + "W_key.linear.bias"), A, k);
+        dense_matmul_time(text_lc, text_len, 256, read_f32(model, "vector_estimator:onnx::MatMul_3103"),
+                          read_f32(model, base + "W_value.linear.bias"), A, v);
+        push_trace(scalar_trace, "ve_attn0_q", L, A, q);
+        push_trace(scalar_trace, "ve_attn0_k", text_len, A, k);
+        push_trace(scalar_trace, "ve_attn0_v", text_len, A, v);
+        auto theta_t = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
+        apply_rope(theta_t.data.data(), q, L, 4, 64);
+        apply_rope(theta_t.data.data(), k, text_len, 4, 64);
+        push_trace(scalar_trace, "ve_attn0_q_rope", L, A, q);
+        push_trace(scalar_trace, "ve_attn0_k_rope", text_len, A, k);
+
+        std::vector<float> attn_ctx((size_t)L*A, 0.0f), scores(text_len), probs(text_len);
+        const int H = 4, D = 64;
+        const float scale = 1.0f / 16.0f;
+        for (int h = 0; h < H; ++h) for (int qi = 0; qi < L; ++qi) {
+            float mx = -INFINITY;
+            for (int kj = 0; kj < text_len; ++kj) {
+                float s = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    s += q[((size_t)qi*H+h)*D+d] * k[((size_t)kj*H+h)*D+d] * scale;
+                }
+                scores[kj] = s;
+                mx = std::max(mx, s);
+            }
+            float den = 0.0f;
+            for (int kj = 0; kj < text_len; ++kj) {
+                probs[kj] = std::exp(scores[kj] - mx);
+                den += probs[kj];
+            }
+            for (int d = 0; d < D; ++d) {
+                float sum = 0.0f;
+                for (int kj = 0; kj < text_len; ++kj) {
+                    sum += (probs[kj] / den) * v[((size_t)kj*H+h)*D+d];
+                }
+                attn_ctx[(size_t)qi*A + h*D + d] = sum;
+            }
+        }
+        push_trace(scalar_trace, "ve_attn0_ctx", L, A, attn_ctx);
+        std::vector<float> attn_out;
+        dense_matmul_time(attn_ctx, L, A, read_f32(model, "vector_estimator:onnx::MatMul_3110"),
+                          read_f32(model, base + "out_fc.linear.bias"), C, attn_out);
+        push_trace(scalar_trace, "ve_attn0_out", L, C, attn_out);
+
+        constexpr int MAX_NODES = 2048;
         static size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
                                  ggml_graph_overhead_custom(MAX_NODES, false);
         thread_local std::vector<uint8_t> buf(buf_size);
@@ -416,6 +495,18 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_tensor * t_emb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
         ggml_set_name(t_emb, "ve_time_emb");
         ggml_set_input(t_emb);
+        ggml_tensor * text_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, text_len, 256);
+        ggml_set_name(text_in, "ve_text_lc");
+        ggml_set_input(text_in);
+        ggml_tensor * q_rope_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, L, 4);
+        ggml_set_name(q_rope_in, "ve_q_rope_dlh");
+        ggml_set_input(q_rope_in);
+        ggml_tensor * k_rope_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, text_len, 4);
+        ggml_set_name(k_rope_in, "ve_k_rope_dlh");
+        ggml_set_input(k_rope_in);
+        ggml_tensor * v_rope_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, text_len, 4);
+        ggml_set_name(v_rope_in, "ve_v_dlh");
+        ggml_set_input(v_rope_in);
 
         ggml_tensor * y = conv1d_f32(ctx, require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.proj_in.net.weight"), x, 1, 0, 1);
         ggml_tensor * masked = ggml_mul(ctx, y, repeat_like(ctx, mask, y));
@@ -454,6 +545,51 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_set_output(cur);
         ggml_build_forward_expand(gf, cur);
 
+        ggml_tensor * q_t = dense_matmul_time_ggml(ctx, cur,
+            require_source_tensor(model, "vector_estimator:onnx::MatMul_3101"),
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.W_query.linear.bias"));
+        ggml_set_name(q_t, "ve_attn0_q");
+        ggml_set_output(q_t);
+        ggml_build_forward_expand(gf, q_t);
+        ggml_tensor * k_t = dense_matmul_time_ggml(ctx, text_in,
+            require_source_tensor(model, "vector_estimator:onnx::MatMul_3102"),
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.W_key.linear.bias"));
+        ggml_set_name(k_t, "ve_attn0_k");
+        ggml_set_output(k_t);
+        ggml_build_forward_expand(gf, k_t);
+        ggml_tensor * v_t = dense_matmul_time_ggml(ctx, text_in,
+            require_source_tensor(model, "vector_estimator:onnx::MatMul_3103"),
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.W_value.linear.bias"));
+        ggml_set_name(v_t, "ve_attn0_v");
+        ggml_set_output(v_t);
+        ggml_build_forward_expand(gf, v_t);
+
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, q_rope_in, k_rope_in, v_rope_in,
+                                                 nullptr, 1.0f/16.0f, 0.0f, 0.0f);
+        attn = ggml_reshape_2d(ctx, attn, 256, L);
+        ggml_tensor * attn_tc = ggml_cont(ctx, ggml_transpose(ctx, attn));
+        ggml_set_name(attn_tc, "ve_attn0_ctx");
+        ggml_set_output(attn_tc);
+        ggml_build_forward_expand(gf, attn_tc);
+        ggml_tensor * attn_out_t = dense_matmul_time_ggml(ctx, attn_tc,
+            require_source_tensor(model, "vector_estimator:onnx::MatMul_3110"),
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.out_fc.linear.bias"));
+        ggml_set_name(attn_out_t, "ve_attn0_out");
+        ggml_set_output(attn_out_t);
+        ggml_build_forward_expand(gf, attn_out_t);
+        ggml_tensor * cur2 = ggml_cont(ctx, ggml_reshape_2d(ctx, cur, L, C));
+        ggml_tensor * attn2 = ggml_cont(ctx, ggml_reshape_2d(ctx, attn_out_t, L, C));
+        ggml_tensor * attn_res = ggml_cont(ctx, ggml_add(ctx, attn2, cur2));
+        ggml_set_name(attn_res, "ve_attn0_residual");
+        ggml_set_output(attn_res);
+        ggml_build_forward_expand(gf, attn_res);
+        ggml_tensor * attn_norm = layer_norm_ggml(ctx, attn_res,
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.weight"),
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.bias"));
+        ggml_set_name(attn_norm, "ve_attn0_norm");
+        ggml_set_output(attn_norm);
+        ggml_build_forward_expand(gf, attn_norm);
+
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) throw std::runtime_error("ggml_gallocr_new failed");
         if (!ggml_gallocr_reserve(allocr, gf)) {
@@ -466,6 +602,13 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_backend_tensor_set(mask, latent_mask, 0, (size_t) L * sizeof(float));
         std::vector<float> te_host = time_embedding(model, 0, 5);
         ggml_backend_tensor_set(t_emb, te_host.data(), 0, te_host.size() * sizeof(float));
+        std::vector<float> text_lc_host((size_t) text_len * 256);
+        for (int c = 0; c < 256; ++c) {
+            for (int t = 0; t < text_len; ++t) {
+                text_lc_host[(size_t)c * text_len + t] = text_emb[(size_t)c * text_len + t];
+            }
+        }
+        ggml_backend_tensor_set(text_in, text_lc_host.data(), 0, text_lc_host.size() * sizeof(float));
         ggml_backend_graph_compute(model.backend, gf);
 
         ggml_trace.push_back({"ve_latent_tc", {L, Cin}, in});
@@ -476,6 +619,33 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         }
         ggml_trace.push_back({"ve_time_add0", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_time_add0"))});
         ggml_trace.push_back({"ve_block2_convnext0", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_block2_convnext0"))});
+        std::vector<float> q_out = tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_q"));
+        std::vector<float> k_out = tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_k"));
+        std::vector<float> v_out = tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_v"));
+        ggml_trace.push_back({"ve_attn0_q", {L, 256}, q_out});
+        ggml_trace.push_back({"ve_attn0_k", {text_len, 256}, k_out});
+        ggml_trace.push_back({"ve_attn0_v", {text_len, 256}, v_out});
+        f32_tensor theta = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
+        apply_rope(theta.data.data(), q_out, L, 4, 64);
+        apply_rope(theta.data.data(), k_out, text_len, 4, 64);
+        std::vector<float> q_dlh((size_t)64*L*4), k_dlh((size_t)64*text_len*4), v_dlh((size_t)64*text_len*4);
+        for (int h = 0; h < 4; ++h) {
+            for (int t = 0; t < L; ++t) for (int d = 0; d < 64; ++d) {
+                q_dlh[(size_t)d + 64*((size_t)t + (size_t)L*h)] = q_out[(size_t)t*256 + h*64 + d];
+            }
+            for (int t = 0; t < text_len; ++t) for (int d = 0; d < 64; ++d) {
+                k_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = k_out[(size_t)t*256 + h*64 + d];
+                v_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = v_out[(size_t)t*256 + h*64 + d];
+            }
+        }
+        ggml_backend_tensor_set(q_rope_in, q_dlh.data(), 0, q_dlh.size() * sizeof(float));
+        ggml_backend_tensor_set(k_rope_in, k_dlh.data(), 0, k_dlh.size() * sizeof(float));
+        ggml_backend_tensor_set(v_rope_in, v_dlh.data(), 0, v_dlh.size() * sizeof(float));
+        ggml_backend_graph_compute(model.backend, gf);
+        ggml_trace.push_back({"ve_attn0_q_rope", {L, 256}, q_out});
+        ggml_trace.push_back({"ve_attn0_k_rope", {text_len, 256}, k_out});
+        ggml_trace.push_back({"ve_attn0_ctx", {L, 256}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_ctx"))});
+        ggml_trace.push_back({"ve_attn0_out", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_out"))});
 
         ggml_gallocr_free(allocr);
         if (error) error->clear();
