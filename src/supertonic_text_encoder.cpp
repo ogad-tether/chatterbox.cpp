@@ -311,91 +311,109 @@ void relpos_attention(const supertonic_model & m, int idx, std::vector<float> & 
     x.swap(proj);
 }
 
-void relpos_attention_ggml(const supertonic_model & m, int idx,
-                           const std::vector<float> & x_lc,
-                           int L,
-                           int C,
-                           std::vector<float> & out_lc) {
+struct text_relpos_graph_cache {
+    const supertonic_model * model = nullptr;
+    int idx = -1;
+    int L = 0;
+    int C = 0;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * x_in = nullptr;
+    ggml_tensor * masks[9] = {};
+};
+
+void free_relpos_cache(text_relpos_graph_cache & cache) {
+    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void build_relpos_cache(text_relpos_graph_cache & cache,
+                        const supertonic_model & m,
+                        int idx,
+                        int L,
+                        int C) {
+    free_relpos_cache(cache);
+    cache.model = &m;
+    cache.idx = idx;
+    cache.L = L;
+    cache.C = C;
     const int H = 4;
     const int D = C / H;
     const float scale = 1.0f / std::sqrt((float)D);
     const std::string p = "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers." + std::to_string(idx);
-
     constexpr int N_MASKS = 9;
     constexpr int MAX_NODES = 768;
-    static size_t buf_size = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
-    thread_local std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+    const size_t buf_size = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params gp = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, MAX_NODES, false);
 
-    ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
-    ggml_set_name(x_in, "relpos_x"); ggml_set_input(x_in);
-    ggml_tensor * masks[N_MASKS] = {};
+    cache.x_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(cache.x_in, "relpos_x"); ggml_set_input(cache.x_in);
     for (int i = 0; i < N_MASKS; ++i) {
-        masks[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, L, 1);
+        cache.masks[i] = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, L, L, 1);
         const std::string name = "relpos_mask_" + std::to_string(i);
-        ggml_set_name(masks[i], name.c_str()); ggml_set_input(masks[i]);
+        ggml_set_name(cache.masks[i], name.c_str()); ggml_set_input(cache.masks[i]);
     }
 
-    ggml_tensor * q = conv1d_f32(ctx, require_source_tensor(m, p + ".conv_q.weight"), x_in, 1, 0, 1);
-    q = ggml_add(ctx, q, repeat_like(ctx, require_source_tensor(m, p + ".conv_q.bias"), q));
-    ggml_tensor * k = conv1d_f32(ctx, require_source_tensor(m, p + ".conv_k.weight"), x_in, 1, 0, 1);
-    k = ggml_add(ctx, k, repeat_like(ctx, require_source_tensor(m, p + ".conv_k.bias"), k));
-    ggml_tensor * v = conv1d_f32(ctx, require_source_tensor(m, p + ".conv_v.weight"), x_in, 1, 0, 1);
-    v = ggml_add(ctx, v, repeat_like(ctx, require_source_tensor(m, p + ".conv_v.bias"), v));
+    ggml_tensor * q = conv1d_f32(cache.ctx, require_source_tensor(m, p + ".conv_q.weight"), cache.x_in, 1, 0, 1);
+    q = ggml_add(cache.ctx, q, repeat_like(cache.ctx, require_source_tensor(m, p + ".conv_q.bias"), q));
+    ggml_tensor * k = conv1d_f32(cache.ctx, require_source_tensor(m, p + ".conv_k.weight"), cache.x_in, 1, 0, 1);
+    k = ggml_add(cache.ctx, k, repeat_like(cache.ctx, require_source_tensor(m, p + ".conv_k.bias"), k));
+    ggml_tensor * v = conv1d_f32(cache.ctx, require_source_tensor(m, p + ".conv_v.weight"), cache.x_in, 1, 0, 1);
+    v = ggml_add(cache.ctx, v, repeat_like(cache.ctx, require_source_tensor(m, p + ".conv_v.bias"), v));
 
-    ggml_tensor * q_dlh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q, L, D, H), 1, 0, 2, 3));
-    ggml_tensor * k_dlh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, L, D, H), 1, 0, 2, 3));
-    ggml_tensor * v_dlh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, v, L, D, H), 1, 0, 2, 3));
+    ggml_tensor * q_dlh = ggml_cont(cache.ctx, ggml_permute(cache.ctx, ggml_reshape_3d(cache.ctx, q, L, D, H), 1, 0, 2, 3));
+    ggml_tensor * k_dlh = ggml_cont(cache.ctx, ggml_permute(cache.ctx, ggml_reshape_3d(cache.ctx, k, L, D, H), 1, 0, 2, 3));
+    ggml_tensor * v_dlh = ggml_cont(cache.ctx, ggml_permute(cache.ctx, ggml_reshape_3d(cache.ctx, v, L, D, H), 1, 0, 2, 3));
 
-    ggml_tensor * scores = ggml_scale(ctx, ggml_mul_mat(ctx, k_dlh, q_dlh), scale); // [key, query, head]
-    ggml_tensor * rel_k = require_source_tensor(m, p + ".emb_rel_k");              // [D, 9]
-    ggml_tensor * rel_scores = ggml_mul_mat(ctx, rel_k, q_dlh);                    // [delta, query, head]
+    ggml_tensor * scores = ggml_scale(cache.ctx, ggml_mul_mat(cache.ctx, k_dlh, q_dlh), scale);
+    ggml_tensor * rel_k = require_source_tensor(m, p + ".emb_rel_k");
+    ggml_tensor * rel_scores = ggml_mul_mat(cache.ctx, rel_k, q_dlh);
     for (int ri = 0; ri < N_MASKS; ++ri) {
-        ggml_tensor * rel_delta = ggml_view_3d(ctx, rel_scores, 1, L, H,
+        ggml_tensor * rel_delta = ggml_view_3d(cache.ctx, rel_scores, 1, L, H,
                                                rel_scores->nb[1], rel_scores->nb[2],
                                                (size_t)ri * rel_scores->nb[0]);
-        rel_delta = ggml_repeat(ctx, rel_delta, scores);
-        ggml_tensor * mask = ggml_repeat(ctx, masks[ri], scores);
-        scores = ggml_add(ctx, scores, ggml_mul(ctx, ggml_scale(ctx, rel_delta, scale), mask));
+        rel_delta = ggml_repeat(cache.ctx, rel_delta, scores);
+        ggml_tensor * mask = ggml_repeat(cache.ctx, cache.masks[ri], scores);
+        scores = ggml_add(cache.ctx, scores, ggml_mul(cache.ctx, ggml_scale(cache.ctx, rel_delta, scale), mask));
     }
 
-    ggml_tensor * attn = ggml_soft_max(ctx, scores);
-    ggml_tensor * v_for_mm = ggml_cont(ctx, ggml_permute(ctx, v_dlh, 1, 0, 2, 3));  // [key, D, head]
-    ggml_tensor * out = ggml_mul_mat(ctx, v_for_mm, attn);                         // [D, query, head]
+    ggml_tensor * attn = ggml_soft_max(cache.ctx, scores);
+    ggml_tensor * v_for_mm = ggml_cont(cache.ctx, ggml_permute(cache.ctx, v_dlh, 1, 0, 2, 3));
+    ggml_tensor * out = ggml_mul_mat(cache.ctx, v_for_mm, attn);
 
-    ggml_tensor * rel_v = require_source_tensor(m, p + ".emb_rel_v");              // [D, 9]
-    ggml_tensor * rel_out = ggml_scale(ctx, out, 0.0f);
+    ggml_tensor * rel_v = require_source_tensor(m, p + ".emb_rel_v");
+    ggml_tensor * rel_out = ggml_scale(cache.ctx, out, 0.0f);
     for (int ri = 0; ri < N_MASKS; ++ri) {
-        ggml_tensor * mask = ggml_repeat(ctx, masks[ri], attn);
-        ggml_tensor * p_delta = ggml_sum_rows(ctx, ggml_mul(ctx, attn, mask));      // [1, query, head]
-        p_delta = ggml_repeat(ctx, p_delta, out);
-        ggml_tensor * rv_delta = ggml_view_3d(ctx, rel_v, D, 1, 1,
+        ggml_tensor * mask = ggml_repeat(cache.ctx, cache.masks[ri], attn);
+        ggml_tensor * p_delta = ggml_sum_rows(cache.ctx, ggml_mul(cache.ctx, attn, mask));
+        p_delta = ggml_repeat(cache.ctx, p_delta, out);
+        ggml_tensor * rv_delta = ggml_view_3d(cache.ctx, rel_v, D, 1, 1,
                                               rel_v->nb[1], rel_v->nb[2],
                                               (size_t)ri * rel_v->nb[1]);
-        rv_delta = ggml_repeat(ctx, rv_delta, out);
-        rel_out = ggml_add(ctx, rel_out, ggml_mul(ctx, p_delta, rv_delta));
+        rv_delta = ggml_repeat(cache.ctx, rv_delta, out);
+        rel_out = ggml_add(cache.ctx, rel_out, ggml_mul(cache.ctx, p_delta, rv_delta));
     }
-    out = ggml_add(ctx, out, rel_out);
+    out = ggml_add(cache.ctx, out, rel_out);
 
-    ggml_tensor * out_lc_t = ggml_cont(ctx, ggml_permute(ctx, out, 1, 0, 2, 3));
-    out_lc_t = ggml_reshape_2d(ctx, out_lc_t, L, C);
-    out_lc_t = conv1d_f32(ctx, require_source_tensor(m, p + ".conv_o.weight"), out_lc_t, 1, 0, 1);
-    out_lc_t = ggml_add(ctx, out_lc_t, repeat_like(ctx, require_source_tensor(m, p + ".conv_o.bias"), out_lc_t));
+    ggml_tensor * out_lc_t = ggml_cont(cache.ctx, ggml_permute(cache.ctx, out, 1, 0, 2, 3));
+    out_lc_t = ggml_reshape_2d(cache.ctx, out_lc_t, L, C);
+    out_lc_t = conv1d_f32(cache.ctx, require_source_tensor(m, p + ".conv_o.weight"), out_lc_t, 1, 0, 1);
+    out_lc_t = ggml_add(cache.ctx, out_lc_t, repeat_like(cache.ctx, require_source_tensor(m, p + ".conv_o.bias"), out_lc_t));
     ggml_set_name(out_lc_t, "relpos_out"); ggml_set_output(out_lc_t);
-    ggml_build_forward_expand(gf, out_lc_t);
+    ggml_build_forward_expand(cache.gf, out_lc_t);
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    if (!allocr) throw std::runtime_error("ggml_gallocr_new text relpos failed");
-    if (!ggml_gallocr_reserve(allocr, gf)) {
-        ggml_gallocr_free(allocr);
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new text relpos failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
         throw std::runtime_error("ggml_gallocr_reserve text relpos failed");
     }
-    ggml_gallocr_alloc_graph(allocr, gf);
-
-    std::vector<float> x_raw = pack_time_channel_for_ggml(x_lc, L, C);
-    ggml_backend_tensor_set(x_in, x_raw.data(), 0, x_raw.size()*sizeof(float));
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
     for (int ri = 0; ri < N_MASKS; ++ri) {
         const int delta = ri - 4;
         std::vector<float> mask((size_t)L * L, 0.0f);
@@ -403,11 +421,25 @@ void relpos_attention_ggml(const supertonic_model & m, int idx,
             const int kj = qi + delta;
             if (kj >= 0 && kj < L) mask[(size_t)kj + (size_t)L*qi] = 1.0f;
         }
-        ggml_backend_tensor_set(masks[ri], mask.data(), 0, mask.size()*sizeof(float));
+        ggml_backend_tensor_set(cache.masks[ri], mask.data(), 0, mask.size()*sizeof(float));
     }
-    supertonic_graph_compute(m, gf);
-    out_lc = tensor_to_time_channel(ggml_graph_get_tensor(gf, "relpos_out"));
-    ggml_gallocr_free(allocr);
+}
+
+void relpos_attention_ggml(const supertonic_model & m, int idx,
+                           const std::vector<float> & x_lc,
+                           int L,
+                           int C,
+                           std::vector<float> & out_lc) {
+    if (idx < 0 || idx >= 4) throw std::runtime_error("invalid text relpos layer index");
+    thread_local text_relpos_graph_cache caches[4];
+    text_relpos_graph_cache & cache = caches[idx];
+    if (cache.model != &m || cache.idx != idx || cache.L != L || cache.C != C) {
+        build_relpos_cache(cache, m, idx, L, C);
+    }
+    std::vector<float> x_raw = pack_time_channel_for_ggml(x_lc, L, C);
+    ggml_backend_tensor_set(cache.x_in, x_raw.data(), 0, x_raw.size()*sizeof(float));
+    supertonic_graph_compute(m, cache.gf);
+    out_lc = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "relpos_out"));
 }
 
 void ffn_block(const supertonic_model & m, int idx, std::vector<float> & x, int L, int C) {
