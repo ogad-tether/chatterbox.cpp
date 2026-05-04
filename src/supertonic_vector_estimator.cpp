@@ -391,7 +391,8 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
                                        std::vector<supertonic_trace_tensor> & ggml_trace,
                                        std::string * error,
                                        bool include_scalar_trace,
-                                       bool include_ggml_trace) {
+                                       bool include_ggml_trace,
+                                       std::vector<float> * next_latent_tc_out) {
     try {
         scalar_trace.clear();
         ggml_trace.clear();
@@ -2149,7 +2150,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             PUSH_GGML_TRACE({name, {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(tailgf, name.c_str()))});
         }
         PUSH_GGML_TRACE({"ve_proj_out", {L, Cin}, tensor_to_time_channel(ggml_graph_get_tensor(tailgf, "ve_proj_out"))});
-        ggml_trace.push_back({"ve_next_latent_tc", {L, Cin}, tensor_to_time_channel(ggml_graph_get_tensor(tailgf, "ve_next_latent_tc"))});
+        std::vector<float> next_latent_tc = tensor_to_time_channel(ggml_graph_get_tensor(tailgf, "ve_next_latent_tc"));
+        if (next_latent_tc_out) *next_latent_tc_out = next_latent_tc;
+        PUSH_GGML_TRACE({"ve_next_latent_tc", {L, Cin}, next_latent_tc});
         ggml_gallocr_free(tailallocr);
         ggml_gallocr_free(g3allocr);
         ggml_gallocr_free(g2allocr);
@@ -2180,28 +2183,21 @@ bool supertonic_vector_step_ggml(const supertonic_model & model,
     try {
         std::vector<supertonic_trace_tensor> scalar_trace;
         std::vector<supertonic_trace_tensor> ggml_trace;
+        std::vector<float> next_tc;
         if (!supertonic_vector_trace_proj_ggml(model, noisy_latent, text_emb, text_len,
                                                style_ttl, latent_mask, latent_len,
                                                current_step, total_steps,
                                                scalar_trace, ggml_trace, error,
-                                               false, false)) {
+                                               false, false, &next_tc)) {
             return false;
         }
-        const supertonic_trace_tensor * next = nullptr;
-        for (const auto & t : ggml_trace) {
-            if (t.name == "ve_next_latent_tc") {
-                next = &t;
-                break;
-            }
-        }
-        if (!next) throw std::runtime_error("missing GGML vector trace output: ve_next_latent_tc");
         const int L = latent_len;
         const int C = model.hparams.latent_channels;
-        if (next->data.size() != (size_t)L*C) throw std::runtime_error("bad ve_next_latent_tc size");
+        if (next_tc.size() != (size_t)L*C) throw std::runtime_error("bad ve_next_latent_tc size");
         next_latent_out.assign((size_t)C*L, 0.0f);
         for (int c = 0; c < C; ++c) {
             for (int t = 0; t < L; ++t) {
-                next_latent_out[(size_t)c*L + t] = next->data[(size_t)t*C + c];
+                next_latent_out[(size_t)c*L + t] = next_tc[(size_t)t*C + c];
             }
         }
         if (error) error->clear();

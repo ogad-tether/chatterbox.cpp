@@ -150,7 +150,9 @@ bool supertonic_duration_trace_ggml(const supertonic_model & model,
                                     std::vector<supertonic_trace_tensor> & scalar_trace,
                                     std::vector<supertonic_trace_tensor> & ggml_trace,
                                     std::string * error = nullptr,
-                                    bool include_scalar_trace = true);
+                                    bool include_scalar_trace = true,
+                                    bool include_ggml_trace = true,
+                                    std::vector<float> * sentence_proj_out = nullptr);
 
 bool supertonic_text_encoder_forward_cpu(const supertonic_model & model,
                                          const int64_t * text_ids,
@@ -210,6 +212,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
                                        std::vector<supertonic_trace_tensor> & ggml_trace,
                                        std::string * error = nullptr,
                                        bool include_scalar_trace = true,
-                                       bool include_ggml_trace = true);
+                                       bool include_ggml_trace = true,
+                                       std::vector<float> * next_latent_tc_out = nullptr);
 
 } // namespace tts_cpp::supertonic::detail
