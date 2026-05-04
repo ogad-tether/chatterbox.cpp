@@ -34,6 +34,18 @@ int main(int argc, char ** argv) {
         print_compare("supertonic_vector_step0", s);
         if (s.max_abs_err > 5e-3) { fprintf(stderr, "supertonic vector parity FAILED\n"); rc = 1; }
         else fprintf(stderr, "supertonic vector parity PASS\n");
+
+        std::vector<float> got_ggml;
+        if (!supertonic_vector_step_ggml(model, npy_as_f32(noise), (int)noise.shape[2],
+                                         npy_as_f32(text_emb), (int)text_emb.shape[2],
+                                         npy_as_f32(style_ttl), npy_as_f32(latent_mask),
+                                         0, 5, got_ggml, &error)) {
+            throw std::runtime_error("vector ggml failed: " + error);
+        }
+        compare_stats sg = compare_f32(got_ggml.data(), npy_as_f32(ref), got_ggml.size());
+        print_compare("supertonic_vector_step0_ggml", sg);
+        if (sg.max_abs_err > 5e-3) { fprintf(stderr, "supertonic vector GGML parity FAILED\n"); rc = 1; }
+        else fprintf(stderr, "supertonic vector GGML parity PASS\n");
     } catch (const std::exception & e) { fprintf(stderr, "test failed: %s\n", e.what()); rc = 1; }
     free_supertonic_model(model);
     return rc;

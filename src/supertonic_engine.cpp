@@ -5,7 +5,7 @@
 
 #include <cmath>
 #include <cstring>
-#include <random>
+#include <cstdint>
 #include <stdexcept>
 
 namespace tts_cpp::supertonic {
@@ -19,6 +19,81 @@ std::vector<float> read_tensor_f32(ggml_tensor * t) {
     ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
     return out;
 }
+
+// NumPy RandomState-compatible MT19937 + standard_normal().  This matches the
+// legacy np.random.seed(seed); np.random.randn(...) sequence used by the ONNX
+// reference dumper.  std::normal_distribution is intentionally not used here:
+// its transform is implementation-defined and produced audibly different
+// Supertonic samples for the same seed.
+class numpy_random_state {
+public:
+    explicit numpy_random_state(uint32_t seed) {
+        mt_[0] = seed;
+        for (int i = 1; i < N; ++i) {
+            mt_[i] = 1812433253U * (mt_[i - 1] ^ (mt_[i - 1] >> 30)) + (uint32_t)i;
+        }
+        index_ = N;
+    }
+
+    float standard_normal() {
+        if (has_gauss_) {
+            has_gauss_ = false;
+            return (float) gauss_;
+        }
+        double x1 = 0.0, x2 = 0.0, r2 = 0.0;
+        do {
+            x1 = 2.0 * uniform_double() - 1.0;
+            x2 = 2.0 * uniform_double() - 1.0;
+            r2 = x1 * x1 + x2 * x2;
+        } while (r2 >= 1.0 || r2 == 0.0);
+        const double f = std::sqrt(-2.0 * std::log(r2) / r2);
+        gauss_ = x1 * f;
+        has_gauss_ = true;
+        return (float)(x2 * f);
+    }
+
+private:
+    static constexpr int N = 624;
+    static constexpr int M = 397;
+    static constexpr uint32_t MATRIX_A = 0x9908b0dfU;
+    static constexpr uint32_t UPPER_MASK = 0x80000000U;
+    static constexpr uint32_t LOWER_MASK = 0x7fffffffU;
+
+    uint32_t mt_[N]{};
+    int index_ = N + 1;
+    bool has_gauss_ = false;
+    double gauss_ = 0.0;
+
+    uint32_t uint32() {
+        static const uint32_t mag01[2] = {0x0U, MATRIX_A};
+        if (index_ >= N) {
+            int kk = 0;
+            for (; kk < N - M; ++kk) {
+                uint32_t y = (mt_[kk] & UPPER_MASK) | (mt_[kk + 1] & LOWER_MASK);
+                mt_[kk] = mt_[kk + M] ^ (y >> 1) ^ mag01[y & 0x1U];
+            }
+            for (; kk < N - 1; ++kk) {
+                uint32_t y = (mt_[kk] & UPPER_MASK) | (mt_[kk + 1] & LOWER_MASK);
+                mt_[kk] = mt_[kk + (M - N)] ^ (y >> 1) ^ mag01[y & 0x1U];
+            }
+            uint32_t y = (mt_[N - 1] & UPPER_MASK) | (mt_[0] & LOWER_MASK);
+            mt_[N - 1] = mt_[M - 1] ^ (y >> 1) ^ mag01[y & 0x1U];
+            index_ = 0;
+        }
+        uint32_t y = mt_[index_++];
+        y ^= (y >> 11);
+        y ^= (y << 7) & 0x9d2c5680U;
+        y ^= (y << 15) & 0xefc60000U;
+        y ^= (y >> 18);
+        return y;
+    }
+
+    double uniform_double() {
+        const uint32_t a = uint32() >> 5;
+        const uint32_t b = uint32() >> 6;
+        return (a * 67108864.0 + b) / 9007199254740992.0;
+    }
+};
 
 } // namespace
 
@@ -79,10 +154,9 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
             latent.resize(noise.n_elements());
             std::memcpy(latent.data(), npy_as_f32(noise), latent.size() * sizeof(float));
         } else {
-            std::mt19937 rng(opts.seed);
-            std::normal_distribution<float> normal(0.0f, 1.0f);
+            numpy_random_state rng((uint32_t) opts.seed);
             latent.assign((size_t) model.hparams.latent_channels * latent_len, 0.0f);
-            for (float & v : latent) v = normal(rng);
+            for (float & v : latent) v = rng.standard_normal();
         }
 
         std::vector<float> text_emb;
@@ -95,10 +169,10 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
 
         std::vector<float> next;
         for (int step = 0; step < steps; ++step) {
-            if (!supertonic_vector_step_cpu(model, latent.data(), latent_len,
-                                            text_emb.data(), (int) text_ids.size(),
-                                            style_ttl.data(), latent_mask.data(),
-                                            step, steps, next, &error)) {
+            if (!supertonic_vector_step_ggml(model, latent.data(), latent_len,
+                                             text_emb.data(), (int) text_ids.size(),
+                                             style_ttl.data(), latent_mask.data(),
+                                             step, steps, next, &error)) {
                 throw std::runtime_error("vector estimator failed: " + error);
             }
             latent.swap(next);

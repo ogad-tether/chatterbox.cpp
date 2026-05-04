@@ -153,14 +153,31 @@ bool supertonic_vector_step_cpu(const supertonic_model & model,
                                 std::vector<float> & next_latent_out,
                                 std::string * error = nullptr);
 
+bool supertonic_vector_step_ggml(const supertonic_model & model,
+                                 const float * noisy_latent,
+                                 int latent_len,
+                                 const float * text_emb,
+                                 int text_len,
+                                 const float * style_ttl,
+                                 const float * latent_mask,
+                                 int current_step,
+                                 int total_steps,
+                                 std::vector<float> & next_latent_out,
+                                 std::string * error = nullptr);
+
 bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
                                        const float * noisy_latent,
                                        const float * text_emb,
                                        int text_len,
+                                       const float * style_ttl,
                                        const float * latent_mask,
                                        int latent_len,
+                                       int current_step,
+                                       int total_steps,
                                        std::vector<supertonic_trace_tensor> & scalar_trace,
                                        std::vector<supertonic_trace_tensor> & ggml_trace,
-                                       std::string * error = nullptr);
+                                       std::string * error = nullptr,
+                                       bool include_scalar_trace = true,
+                                       bool include_ggml_trace = true);
 
 } // namespace tts_cpp::supertonic::detail

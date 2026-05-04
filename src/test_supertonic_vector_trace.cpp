@@ -29,12 +29,16 @@ int main(int argc, char ** argv) {
     try {
         npy_array noise = npy_load(std::string(argv[2]) + "/noise.npy");
         npy_array text_emb = npy_load(std::string(argv[2]) + "/text_emb.npy");
+        npy_array style_ttl = npy_load(std::string(argv[2]) + "/style_ttl.npy");
         npy_array latent_mask = npy_load(std::string(argv[2]) + "/latent_mask.npy");
         if (noise.dtype != "<f4" || noise.shape.size() != 3 || noise.shape[0] != 1) {
             throw std::runtime_error("bad noise.npy");
         }
         if (text_emb.dtype != "<f4" || text_emb.shape.size() != 3 || text_emb.shape[0] != 1) {
             throw std::runtime_error("bad text_emb.npy");
+        }
+        if (style_ttl.dtype != "<f4" || style_ttl.n_elements() != 50*256) {
+            throw std::runtime_error("bad style_ttl.npy");
         }
         if (latent_mask.dtype != "<f4" || latent_mask.n_elements() != (size_t) noise.shape[2]) {
             throw std::runtime_error("bad latent_mask.npy");
@@ -44,8 +48,9 @@ int main(int argc, char ** argv) {
         std::vector<supertonic_trace_tensor> scalar;
         std::vector<supertonic_trace_tensor> ggml;
         if (!supertonic_vector_trace_proj_ggml(model, npy_as_f32(noise), npy_as_f32(text_emb),
-                                               (int) text_emb.shape[2], npy_as_f32(latent_mask),
-                                               (int) noise.shape[2], scalar, ggml, &error)) {
+                                               (int) text_emb.shape[2], npy_as_f32(style_ttl),
+                                               npy_as_f32(latent_mask),
+                                               (int) noise.shape[2], 0, 5, scalar, ggml, &error)) {
             throw std::runtime_error("vector proj trace failed: " + error);
         }
 
