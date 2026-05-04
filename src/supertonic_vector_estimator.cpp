@@ -199,6 +199,16 @@ std::vector<float> tensor_raw_f32(ggml_tensor * t) {
     return out;
 }
 
+std::vector<float> pack_time_channel_for_ggml(const std::vector<float> & x, int L, int C) {
+    std::vector<float> out((size_t)L * C);
+    for (int t = 0; t < L; ++t) {
+        for (int c = 0; c < C; ++c) {
+            out[(size_t)c * L + t] = x[(size_t)t * C + c];
+        }
+    }
+    return out;
+}
+
 void push_trace(std::vector<supertonic_trace_tensor> & trace,
                 const std::string & name,
                 int L,
@@ -477,6 +487,15 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         dense_matmul_time(attn_ctx, L, A, read_f32(model, "vector_estimator:onnx::MatMul_3110"),
                           read_f32(model, base + "out_fc.linear.bias"), C, attn_out);
         push_trace(scalar_trace, "ve_attn0_out", L, C, attn_out);
+        std::vector<float> residual = block;
+        for (size_t i = 0; i < residual.size(); ++i) residual[i] += attn_out[i];
+        push_trace(scalar_trace, "ve_attn0_residual", L, C, residual);
+        layer_norm(residual, L, C,
+                   read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.weight"),
+                   read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.bias"));
+        push_trace(scalar_trace, "ve_attn0_norm", L, C, residual);
+        convnext(model, "vector_estimator:tts.ttl.vector_field.main_blocks.4.convnext.0", residual, L, C, 1);
+        push_trace(scalar_trace, "ve_block4_convnext0", L, C, residual);
 
         constexpr int MAX_NODES = 2048;
         static size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
@@ -605,7 +624,8 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             ggml_trace.push_back({name, {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, name.c_str()))});
         }
         ggml_trace.push_back({"ve_time_add0", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_time_add0"))});
-        ggml_trace.push_back({"ve_block2_convnext0", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_block2_convnext0"))});
+        std::vector<float> block2_ggml = tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_block2_convnext0"));
+        ggml_trace.push_back({"ve_block2_convnext0", {L, C}, block2_ggml});
         std::vector<float> q_out = tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_q"));
         std::vector<float> k_out = tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_k"));
         std::vector<float> v_out = tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_v"));
@@ -632,7 +652,49 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_trace.push_back({"ve_attn0_q_rope", {L, 256}, q_out});
         ggml_trace.push_back({"ve_attn0_k_rope", {text_len, 256}, k_out});
         ggml_trace.push_back({"ve_attn0_ctx", {L, 256}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_ctx"))});
-        ggml_trace.push_back({"ve_attn0_out", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_out"))});
+        std::vector<float> attn_out_ggml = tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_attn0_out"));
+        ggml_trace.push_back({"ve_attn0_out", {L, C}, attn_out_ggml});
+
+        constexpr int RES_NODES = 128;
+        static size_t res_buf_size = ggml_tensor_overhead() * RES_NODES +
+                                     ggml_graph_overhead_custom(RES_NODES, false);
+        thread_local std::vector<uint8_t> res_buf(res_buf_size);
+        ggml_init_params rp = { res_buf_size, res_buf.data(), true };
+        ggml_context * rctx = ggml_init(rp);
+        ggml_cgraph * rgf = ggml_new_graph_custom(rctx, RES_NODES, false);
+        ggml_tensor * lhs_in = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(lhs_in, "res_lhs"); ggml_set_input(lhs_in);
+        ggml_tensor * rhs_in = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(rhs_in, "res_rhs"); ggml_set_input(rhs_in);
+        ggml_tensor * res = ggml_add(rctx, lhs_in, rhs_in);
+        ggml_set_name(res, "ve_attn0_residual"); ggml_set_output(res);
+        ggml_build_forward_expand(rgf, res);
+        ggml_tensor * norm = layer_norm_ggml(rctx, res,
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.weight"),
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.bias"));
+        ggml_set_name(norm, "ve_attn0_norm"); ggml_set_output(norm);
+        ggml_build_forward_expand(rgf, norm);
+        ggml_tensor * post = vector_convnext_ggml(rctx, model,
+            "vector_estimator:tts.ttl.vector_field.main_blocks.4.convnext.0",
+            norm, 1);
+        ggml_set_name(post, "ve_block4_convnext0"); ggml_set_output(post);
+        ggml_build_forward_expand(rgf, post);
+        ggml_gallocr_t rallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!rallocr) throw std::runtime_error("ggml_gallocr_new residual failed");
+        if (!ggml_gallocr_reserve(rallocr, rgf)) {
+            ggml_gallocr_free(rallocr);
+            throw std::runtime_error("ggml_gallocr_reserve residual failed");
+        }
+        ggml_gallocr_alloc_graph(rallocr, rgf);
+        std::vector<float> lhs_raw = pack_time_channel_for_ggml(block2_ggml, L, C);
+        std::vector<float> rhs_raw = pack_time_channel_for_ggml(attn_out_ggml, L, C);
+        ggml_backend_tensor_set(lhs_in, lhs_raw.data(), 0, lhs_raw.size() * sizeof(float));
+        ggml_backend_tensor_set(rhs_in, rhs_raw.data(), 0, rhs_raw.size() * sizeof(float));
+        ggml_backend_graph_compute(model.backend, rgf);
+        ggml_trace.push_back({"ve_attn0_residual", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(rgf, "ve_attn0_residual"))});
+        ggml_trace.push_back({"ve_attn0_norm", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(rgf, "ve_attn0_norm"))});
+        ggml_trace.push_back({"ve_block4_convnext0", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(rgf, "ve_block4_convnext0"))});
+        ggml_gallocr_free(rallocr);
 
         ggml_gallocr_free(allocr);
         if (error) error->clear();
