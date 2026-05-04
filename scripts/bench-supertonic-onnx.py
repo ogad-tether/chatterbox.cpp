@@ -17,7 +17,7 @@ Usage:
       --onnx-dir /path/to/onnx_models/onnx \
       --text "..." [--lang en] [--steps 5] [--speed 1.05] [--seed 42] \
       [--noise-npy noise.npy] [--runs 5] [--warmup 1] \
-      [--providers CPUExecutionProvider]
+      [--providers CPUExecutionProvider] [--language-wrap-mode open_close] [--json-out result.json]
 """
 
 from __future__ import annotations
@@ -55,10 +55,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--providers", default="CPUExecutionProvider")
     p.add_argument("--threads", type=int, default=None,
                    help="Set intra/inter op thread counts on the ONNX Runtime session.")
+    p.add_argument("--language-wrap-mode", default="open_close",
+                   choices=("none", "prefix", "open_close"),
+                   help="Text language wrapping mode. Use open_close for Supertonic 2 quality parity.")
+    p.add_argument("--json-out", type=Path, default=None,
+                   help="Optional path to write structured benchmark metrics.")
     return p.parse_args()
 
 
-def preprocess_text(text: str, lang: str) -> str:
+def preprocess_text(text: str, lang: str, language_wrap_mode: str = "open_close") -> str:
     if lang not in AVAILABLE_LANGS:
         raise ValueError(f"invalid language: {lang}")
     text = normalize("NFKD", text)
@@ -100,11 +105,17 @@ def preprocess_text(text: str, lang: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     if not re.search(r"[.!?;:,'\"')\]}…。」』】〉》›»]$", text):
         text += "."
-    return f"<{lang}>{text} "
+    if language_wrap_mode == "none":
+        return text
+    if language_wrap_mode == "prefix":
+        return f"<{lang}>{text} "
+    if language_wrap_mode == "open_close":
+        return f"<{lang}>{text}</{lang}>"
+    raise ValueError(f"invalid language wrap mode: {language_wrap_mode}")
 
 
-def text_to_ids(text: str, lang: str, unicode_indexer: list[int]):
-    normalized = preprocess_text(text, lang)
+def text_to_ids(text: str, lang: str, unicode_indexer: list[int], language_wrap_mode: str):
+    normalized = preprocess_text(text, lang, language_wrap_mode=language_wrap_mode)
     ids = []
     for ch in normalized:
         cp = ord(ch)
@@ -135,6 +146,25 @@ def stats(name: str, samples: list[float]) -> str:
     mean = sum(s) / n
     return (f"  {name:<26s} n={n}  min={s[0]*1000:7.2f}  med={pct(0.5)*1000:7.2f}  "
             f"mean={mean*1000:7.2f}  p95={pct(0.95)*1000:7.2f}  max={s[-1]*1000:7.2f}  ms")
+
+
+def metric_dict(samples: list[float]) -> dict[str, float | int]:
+    if not samples:
+        return {"n": 0, "min_ms": 0.0, "median_ms": 0.0, "mean_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+    s = sorted(samples)
+    n = len(s)
+    def pct(p: float) -> float:
+        idx = p * (n - 1)
+        lo = int(idx); hi = min(lo + 1, n - 1)
+        return s[lo] * (1 - (idx - lo)) + s[hi] * (idx - lo)
+    return {
+        "n": n,
+        "min_ms": s[0] * 1000.0,
+        "median_ms": pct(0.5) * 1000.0,
+        "mean_ms": (sum(s) / n) * 1000.0,
+        "p95_ms": pct(0.95) * 1000.0,
+        "max_ms": s[-1] * 1000.0,
+    }
 
 
 def main() -> None:
@@ -188,7 +218,8 @@ def main() -> None:
     for r in range(total_runs):
         record = r >= args.warmup
         t0 = time.perf_counter()
-        text_ids, text_mask, normalized = text_to_ids(args.text, args.lang, unicode_indexer)
+        text_ids, text_mask, normalized = text_to_ids(
+            args.text, args.lang, unicode_indexer, args.language_wrap_mode)
         t1 = time.perf_counter()
 
         duration_raw = duration_sess.run(None, {
@@ -257,6 +288,7 @@ def main() -> None:
     print(f"  text length: {len(args.text)} chars")
     print(f"  voice style: {voice_style_path}")
     print(f"  language: {args.lang}, steps: {args.steps}, speed: {args.speed:.2f}")
+    print(f"  language wrap: {args.language_wrap_mode}")
     print(f"  audio per run: {audio_s_last:.3f}s @ {sample_rate} Hz")
     print(f"  providers: {providers}, threads: {args.threads}")
     print(f"  runs: {args.runs} (warmup discarded: {args.warmup})")
@@ -276,6 +308,36 @@ def main() -> None:
               f"mean={sum(rtfs)/len(rtfs):.3f}  max={max(rtfs):.3f}")
         print(f"  Real-time multiplier:   med={1/med:.2f}x "
               f"(1 second of audio per {sorted(tot_t)[len(tot_t)//2]/audio_s_last*1000:.2f} ms)")
+        if args.json_out is not None:
+            args.json_out.write_text(json.dumps({
+                "runtime": "onnxruntime",
+                "onnx_dir": str(args.onnx_dir),
+                "text_length": len(args.text),
+                "voice_style": str(voice_style_path),
+                "language": args.lang,
+                "language_wrap_mode": args.language_wrap_mode,
+                "steps": args.steps,
+                "speed": args.speed,
+                "providers": providers,
+                "threads": args.threads,
+                "audio_s": audio_s_last,
+                "runs": args.runs,
+                "warmup": args.warmup,
+                "rtf": {
+                    "min": min(rtfs),
+                    "median": med,
+                    "mean": sum(rtfs) / len(rtfs),
+                    "max": max(rtfs),
+                },
+                "stages": {
+                    "preprocess": metric_dict(pre_t),
+                    "duration": metric_dict(dur_t),
+                    "text_encoder": metric_dict(txt_t),
+                    f"vector_estimator ({args.steps} step)": metric_dict(vec_t),
+                    "vocoder": metric_dict(voc_t),
+                    "total": metric_dict(tot_t),
+                },
+            }, indent=2) + "\n")
 
 
 if __name__ == "__main__":
