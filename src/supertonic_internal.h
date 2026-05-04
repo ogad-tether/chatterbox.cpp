@@ -71,6 +71,7 @@ struct supertonic_model {
     supertonic_hparams hparams;
     supertonic_vocoder_weights vocoder;
 
+    int n_threads = 0;
     ggml_backend_t backend = nullptr;
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
@@ -89,6 +90,8 @@ bool load_supertonic_gguf(const std::string & path,
                           int n_gpu_layers = 0,
                           bool verbose = false);
 void free_supertonic_model(supertonic_model & model);
+void supertonic_set_n_threads(supertonic_model & model, int n_threads);
+void supertonic_graph_compute(const supertonic_model & model, ggml_cgraph * graph);
 
 ggml_tensor * require_tensor(const supertonic_model & model, const std::string & name);
 ggml_tensor * require_source_tensor(const supertonic_model & model, const std::string & source_name);
@@ -146,7 +149,8 @@ bool supertonic_duration_trace_ggml(const supertonic_model & model,
                                     int text_len,
                                     std::vector<supertonic_trace_tensor> & scalar_trace,
                                     std::vector<supertonic_trace_tensor> & ggml_trace,
-                                    std::string * error = nullptr);
+                                    std::string * error = nullptr,
+                                    bool include_scalar_trace = true);
 
 bool supertonic_text_encoder_forward_cpu(const supertonic_model & model,
                                          const int64_t * text_ids,

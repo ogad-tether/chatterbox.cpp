@@ -16,7 +16,9 @@
 #include "ggml-opencl.h"
 #endif
 
+#include <algorithm>
 #include <stdexcept>
+#include <thread>
 
 namespace tts_cpp::supertonic::detail {
 namespace {
@@ -114,6 +116,21 @@ ggml_tensor * require_source_tensor(const supertonic_model & model, const std::s
         throw std::runtime_error("missing source tensor: " + source_name);
     }
     return it->second;
+}
+
+void supertonic_set_n_threads(supertonic_model & model, int n_threads) {
+    if (n_threads <= 0) {
+        const int hw = (int) std::thread::hardware_concurrency();
+        n_threads = std::min(std::max(1, hw), 4);
+    }
+    model.n_threads = std::max(1, n_threads);
+}
+
+void supertonic_graph_compute(const supertonic_model & model, ggml_cgraph * graph) {
+    if (ggml_backend_is_cpu(model.backend) && model.n_threads > 0) {
+        ggml_backend_cpu_set_n_threads(model.backend, model.n_threads);
+    }
+    ggml_backend_graph_compute(model.backend, graph);
 }
 
 static void bind_vocoder_weights(supertonic_model & model) {

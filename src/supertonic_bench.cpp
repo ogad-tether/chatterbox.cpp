@@ -44,7 +44,7 @@ void usage(const char * argv0) {
         "usage: %s --model supertonic2.gguf --text TEXT\n"
         "          [--voice M1] [--language en] [--steps 5] [--speed 1.05]\n"
         "          [--seed 42] [--noise-npy /path/to/noise.npy]\n"
-        "          [--runs 5] [--warmup 1]\n",
+        "          [--runs 5] [--warmup 1] [--threads N]\n",
         argv0);
 }
 
@@ -92,6 +92,7 @@ int main(int argc, char ** argv) {
     int seed = 42;
     int runs = 5;
     int warmup = 1;
+    int n_threads = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -109,6 +110,7 @@ int main(int argc, char ** argv) {
         else if (a == "--noise-npy") noise_npy = next("--noise-npy");
         else if (a == "--runs") runs = std::stoi(next("--runs"));
         else if (a == "--warmup") warmup = std::stoi(next("--warmup"));
+        else if (a == "--threads") n_threads = std::stoi(next("--threads"));
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 2; }
     }
@@ -119,6 +121,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to load model\n");
         return 1;
     }
+    supertonic_set_n_threads(model, n_threads);
 
     auto vit = model.voices.find(voice);
     if (vit == model.voices.end()) {
@@ -172,8 +175,8 @@ int main(int argc, char ** argv) {
         auto t1 = clk::now();
 
         float duration_raw = 0;
-        if (!supertonic_duration_forward_cpu(model, text_ids.data(), (int) text_ids.size(),
-                                             style_dp.data(), duration_raw, &error)) {
+        if (!supertonic_duration_forward_ggml(model, text_ids.data(), (int) text_ids.size(),
+                                              style_dp.data(), duration_raw, &error)) {
             fprintf(stderr, "duration failed: %s\n", error.c_str());
             free_supertonic_model(model); return 1;
         }
@@ -247,6 +250,7 @@ int main(int argc, char ** argv) {
     printf("  text length: %zu chars\n", text.size());
     printf("  voice: %s, language: %s, steps: %d, speed: %.2f\n",
            voice.c_str(), language.c_str(), steps, speed);
+    printf("  threads: %d\n", model.n_threads);
     printf("  audio per run: %.3fs @ %d Hz\n", last_audio_s, model.hparams.sample_rate);
     printf("  runs: %d (warmup discarded: %d)\n", runs, warmup);
     printf("\n");

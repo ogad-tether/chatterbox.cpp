@@ -488,7 +488,7 @@ bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vocoder_bn_scale"), bn_scale.data(), 0, bn_scale.size() * sizeof(float));
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vocoder_bn_shift"), bn_shift.data(), 0, bn_shift.size() * sizeof(float));
 
-        ggml_backend_graph_compute(model.backend, gf);
+        supertonic_graph_compute(model, gf);
         ggml_tensor * out = ggml_graph_get_tensor(gf, "wav");
         wav_out = ggml_tensor_to_time_channel(out);
         ggml_gallocr_free(allocr);
@@ -706,7 +706,7 @@ bool supertonic_vocoder_trace_ggml(const supertonic_model & model,
         }
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "trace_bn_scale"), bn_scale_host.data(), 0, bn_scale_host.size() * sizeof(float));
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "trace_bn_shift"), bn_shift_host.data(), 0, bn_shift_host.size() * sizeof(float));
-        ggml_backend_graph_compute(model.backend, gf);
+        supertonic_graph_compute(model, gf);
 
         trace_out.push_back({"unpack", {T0, C_latent}, unpack_latent_scalar(model, latent, latent_len)});
         trace_out.push_back({"denorm", {T0, C_latent}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "denorm"))});

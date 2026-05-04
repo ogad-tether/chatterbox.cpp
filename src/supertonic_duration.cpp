@@ -410,7 +410,8 @@ bool supertonic_duration_trace_ggml(const supertonic_model & model,
                                     int text_len,
                                     std::vector<supertonic_trace_tensor> & scalar_trace,
                                     std::vector<supertonic_trace_tensor> & ggml_trace,
-                                    std::string * error) {
+                                    std::string * error,
+                                    bool include_scalar_trace) {
     try {
         scalar_trace.clear();
         ggml_trace.clear();
@@ -426,6 +427,7 @@ bool supertonic_duration_trace_ggml(const supertonic_model & model,
             if (id < 0 || id >= emb.ne[1]) throw std::runtime_error("text id out of range");
             for (int c = 0; c < C; ++c) x[(size_t)(t + 1)*C + c] = emb.data[(size_t)id*C + c];
         }
+        if (include_scalar_trace) {
         push_trace(scalar_trace, "duration_embed", L, C, x);
 
         std::vector<float> cur = x;
@@ -506,6 +508,7 @@ bool supertonic_duration_trace_ggml(const supertonic_model & model,
               read_f32(model, "duration:tts.dp.predictor.layers.0.bias"),
               192, 128, h);
         push_trace(scalar_trace, "duration_pred0_no_style", 1, 128, h);
+        }
 
         constexpr int MAX_NODES = 512;
         static size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
@@ -544,7 +547,7 @@ bool supertonic_duration_trace_ggml(const supertonic_model & model,
         ggml_gallocr_alloc_graph(allocr, gf);
         std::vector<float> x_raw = pack_time_channel_for_ggml(x, L, C);
         ggml_backend_tensor_set(in, x_raw.data(), 0, x_raw.size()*sizeof(float));
-        ggml_backend_graph_compute(model.backend, gf);
+        supertonic_graph_compute(model, gf);
 
         ggml_trace.push_back({"duration_embed", {L, C}, x});
         for (int i = 0; i < 6; ++i) {
@@ -682,7 +685,7 @@ bool supertonic_duration_forward_ggml(const supertonic_model & model,
     try {
         std::vector<supertonic_trace_tensor> scalar;
         std::vector<supertonic_trace_tensor> ggml;
-        if (!supertonic_duration_trace_ggml(model, text_ids, text_len, scalar, ggml, error)) return false;
+        if (!supertonic_duration_trace_ggml(model, text_ids, text_len, scalar, ggml, error, false)) return false;
         const supertonic_trace_tensor * proj = nullptr;
         for (const auto & t : ggml) {
             if (t.name == "duration_sentence_proj") { proj = &t; break; }

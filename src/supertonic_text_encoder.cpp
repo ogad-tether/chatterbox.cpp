@@ -488,7 +488,7 @@ bool supertonic_text_encoder_forward_ggml(const supertonic_model & model,
         ggml_gallocr_alloc_graph(allocr, gf);
         std::vector<float> raw = pack_time_channel_for_ggml(x, L, C);
         ggml_backend_tensor_set(in, raw.data(), 0, raw.size()*sizeof(float));
-        ggml_backend_graph_compute(model.backend, gf);
+        supertonic_graph_compute(model, gf);
         x = tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_convnext5"));
         ggml_gallocr_free(allocr);
 
@@ -608,7 +608,7 @@ bool supertonic_text_encoder_trace_ggml(const supertonic_model & model,
         ggml_gallocr_alloc_graph(allocr, gf);
         std::vector<float> raw = pack_time_channel_for_ggml(x, L, C);
         ggml_backend_tensor_set(in, raw.data(), 0, raw.size()*sizeof(float));
-        ggml_backend_graph_compute(model.backend, gf);
+        supertonic_graph_compute(model, gf);
         ggml_trace.push_back({"text_encoder_embed", {L, C}, x});
         for (int i = 0; i < 6; ++i) {
             const std::string name = "text_encoder_convnext" + std::to_string(i);

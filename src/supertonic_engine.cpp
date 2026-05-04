@@ -105,6 +105,7 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
     if (!load_supertonic_gguf(opts.model_gguf_path, model, opts.n_gpu_layers, false)) {
         throw std::runtime_error("failed to load Supertonic GGUF: " + opts.model_gguf_path);
     }
+    supertonic_set_n_threads(model, opts.n_threads);
     if (model.hparams.ftype != "f32") {
         free_supertonic_model(model);
         throw std::runtime_error("Supertonic scalar runtime currently requires f32 GGUF; "
