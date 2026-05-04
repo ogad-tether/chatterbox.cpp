@@ -116,8 +116,14 @@ Current status:
 - All four stages pass numerical parity against the ONNX reference
   (preprocess, duration, text encoder, vector estimator, vocoder), and the
   full pipeline (`test-supertonic-pipeline`) reproduces the ONNX reference
-  waveform to `max_abs ≈ 6.5e-5` in float / `≈ 7.4e-5` after 16-bit PCM
-  round-trip when fed the same initial noise tensor.
+  waveform when fed the same initial noise tensor.
+- The production path is GGML-backed for duration, vocoder, vector estimator,
+  text ConvNeXt, and speech-prompted text attention.  Text encoder
+  relative-position self-attention is still a scalar continuation because it
+  needs relative key and value terms inside the attention softmax; plain
+  `ggml_flash_attn_ext` cannot express that bias/value path.
+- CPU thread count is controlled by `--threads`; the default caps at 4 threads
+  because the current small-graph Supertonic path regresses when oversubscribed.
 
 Example:
 
@@ -166,6 +172,24 @@ cmake --build build --target supertonic-cli
   --voice M1 --language en --steps 5 --speed 1.05 \
   --noise-npy artifacts/supertonic-ref-quick/noise.npy \
   --out /tmp/supertonic.wav
+
+# Matched GGML benchmark with machine-readable metrics.
+./build/supertonic-bench \
+  --model models/supertonic2.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice F1 --language en --steps 5 --speed 1.05 \
+  --threads 4 --runs 5 --warmup 1 \
+  --json-out artifacts/supertonic-bench.json
+
+# Matched ONNX Runtime benchmark.  Use open_close wrapping for Supertonic 2.
+python scripts/bench-supertonic-onnx.py \
+  --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
+  --assets-dir /path/to/supertonic-pytorch/assets \
+  --voice-style /path/to/supertonic-pytorch/assets/voice_styles/F1.json \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --lang en --language-wrap-mode open_close \
+  --steps 5 --speed 1.05 --threads 1 --runs 5 --warmup 1 \
+  --json-out artifacts/supertonic-onnx-bench.json
 ```
 
 ## Prerequisites

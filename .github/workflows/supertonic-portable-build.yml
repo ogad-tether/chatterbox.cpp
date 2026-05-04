@@ -9,6 +9,7 @@ on:
       - "src/supertonic_internal.h"
       - "scripts/convert-supertonic2-to-gguf.py"
       - "scripts/dump-supertonic-reference.py"
+      - "scripts/bench-supertonic-onnx.py"
       - ".github/workflows/supertonic-portable-build.yml"
   push:
     branches:
@@ -42,4 +43,10 @@ jobs:
       - name: Build Supertonic targets
         run: >
           cmake --build build --config ${{ matrix.build_type }}
-          --target supertonic-cli test-supertonic-preprocess test-supertonic-vocoder
+          --target supertonic-cli supertonic-bench
+          test-supertonic-preprocess
+          test-supertonic-duration
+          test-supertonic-text-encoder
+          test-supertonic-vector
+          test-supertonic-vocoder
+          test-supertonic-pipeline
