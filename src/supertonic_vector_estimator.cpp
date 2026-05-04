@@ -313,6 +313,43 @@ void cached_style_layouts(const supertonic_model & model,
     kctx_raw = &cache.kctx_raw;
 }
 
+struct attention_dlh_pack {
+    std::vector<float> q;
+    std::vector<float> k;
+    std::vector<float> v;
+};
+
+attention_dlh_pack & pack_attention_dlh(const std::vector<float> & q_tc,
+                                        const std::vector<float> & k_tc,
+                                        const std::vector<float> & v_tc,
+                                        int q_len,
+                                        int kv_len,
+                                        int n_heads,
+                                        int head_dim) {
+    thread_local attention_dlh_pack pack;
+    pack.q.assign((size_t)head_dim * q_len * n_heads, 0.0f);
+    pack.k.assign((size_t)head_dim * kv_len * n_heads, 0.0f);
+    pack.v.assign((size_t)head_dim * kv_len * n_heads, 0.0f);
+    const int width = n_heads * head_dim;
+    for (int h = 0; h < n_heads; ++h) {
+        for (int t = 0; t < q_len; ++t) {
+            for (int d = 0; d < head_dim; ++d) {
+                pack.q[(size_t)d + (size_t)head_dim*((size_t)t + (size_t)q_len*h)] =
+                    q_tc[(size_t)t*width + h*head_dim + d];
+            }
+        }
+        for (int t = 0; t < kv_len; ++t) {
+            for (int d = 0; d < head_dim; ++d) {
+                pack.k[(size_t)d + (size_t)head_dim*((size_t)t + (size_t)kv_len*h)] =
+                    k_tc[(size_t)t*width + h*head_dim + d];
+                pack.v[(size_t)d + (size_t)head_dim*((size_t)t + (size_t)kv_len*h)] =
+                    v_tc[(size_t)t*width + h*head_dim + d];
+            }
+        }
+    }
+    return pack;
+}
+
 void push_trace(std::vector<supertonic_trace_tensor> & trace,
                 const std::string & name,
                 int L,
@@ -1127,16 +1164,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         f32_tensor theta = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
         apply_rope(theta.data.data(), q_out, L, 4, 64);
         apply_rope(theta.data.data(), k_out, text_len, 4, 64);
-        std::vector<float> q_dlh((size_t)64*L*4), k_dlh((size_t)64*text_len*4), v_dlh((size_t)64*text_len*4);
-        for (int h = 0; h < 4; ++h) {
-            for (int t = 0; t < L; ++t) for (int d = 0; d < 64; ++d) {
-                q_dlh[(size_t)d + 64*((size_t)t + (size_t)L*h)] = q_out[(size_t)t*256 + h*64 + d];
-            }
-            for (int t = 0; t < text_len; ++t) for (int d = 0; d < 64; ++d) {
-                k_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = k_out[(size_t)t*256 + h*64 + d];
-                v_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = v_out[(size_t)t*256 + h*64 + d];
-            }
-        }
+        attention_dlh_pack & att0_pack = pack_attention_dlh(q_out, k_out, v_out, L, text_len, 4, 64);
         constexpr int ATT0_NODES = 256;
         static size_t att0_buf_size = ggml_tensor_overhead() * ATT0_NODES +
                                       ggml_graph_overhead_custom(ATT0_NODES, false);
@@ -1168,9 +1196,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             throw std::runtime_error("ggml_gallocr_reserve attn0 failed");
         }
         ggml_gallocr_alloc_graph(att0allocr, att0gf);
-        ggml_backend_tensor_set(q_rope_in, q_dlh.data(), 0, q_dlh.size() * sizeof(float));
-        ggml_backend_tensor_set(k_rope_in, k_dlh.data(), 0, k_dlh.size() * sizeof(float));
-        ggml_backend_tensor_set(v_rope_in, v_dlh.data(), 0, v_dlh.size() * sizeof(float));
+        ggml_backend_tensor_set(q_rope_in, att0_pack.q.data(), 0, att0_pack.q.size() * sizeof(float));
+        ggml_backend_tensor_set(k_rope_in, att0_pack.k.data(), 0, att0_pack.k.size() * sizeof(float));
+        ggml_backend_tensor_set(v_rope_in, att0_pack.v.data(), 0, att0_pack.v.size() * sizeof(float));
         profile_vector_compute(model, att0gf, current_step, "attn0_flash");
         PUSH_GGML_TRACE({"ve_attn0_q_rope", {L, 256}, q_out});
         PUSH_GGML_TRACE({"ve_attn0_k_rope", {text_len, 256}, k_out});
@@ -1270,16 +1298,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_style0_q", {L, 256}, sq_out});
         PUSH_GGML_TRACE({"ve_style0_k_tanh", {50, 256}, sk_out});
         PUSH_GGML_TRACE({"ve_style0_v", {50, 256}, sv_out});
-        std::vector<float> sq_dlh((size_t)128*L*2), sk_dlh((size_t)128*50*2), sv_dlh((size_t)128*50*2);
-        for (int h = 0; h < 2; ++h) {
-            for (int t = 0; t < L; ++t) for (int d = 0; d < 128; ++d) {
-                sq_dlh[(size_t)d + 128*((size_t)t + (size_t)L*h)] = sq_out[(size_t)t*256 + h*128 + d];
-            }
-            for (int t = 0; t < 50; ++t) for (int d = 0; d < 128; ++d) {
-                sk_dlh[(size_t)d + 128*((size_t)t + 50ULL*h)] = sk_out[(size_t)t*256 + h*128 + d];
-                sv_dlh[(size_t)d + 128*((size_t)t + 50ULL*h)] = sv_out[(size_t)t*256 + h*128 + d];
-            }
-        }
+        attention_dlh_pack & style0_pack = pack_attention_dlh(sq_out, sk_out, sv_out, L, 50, 2, 128);
         constexpr int STYLE0_ATTN_NODES = 256;
         static size_t style0_attn_buf_size = ggml_tensor_overhead() * STYLE0_ATTN_NODES +
                                              ggml_graph_overhead_custom(STYLE0_ATTN_NODES, false);
@@ -1310,9 +1329,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             throw std::runtime_error("ggml_gallocr_reserve style0 attention-only failed");
         }
         ggml_gallocr_alloc_graph(style0aallocr, style0agf);
-        ggml_backend_tensor_set(style_q_dlh, sq_dlh.data(), 0, sq_dlh.size() * sizeof(float));
-        ggml_backend_tensor_set(style_k_dlh, sk_dlh.data(), 0, sk_dlh.size() * sizeof(float));
-        ggml_backend_tensor_set(style_v_dlh, sv_dlh.data(), 0, sv_dlh.size() * sizeof(float));
+        ggml_backend_tensor_set(style_q_dlh, style0_pack.q.data(), 0, style0_pack.q.size() * sizeof(float));
+        ggml_backend_tensor_set(style_k_dlh, style0_pack.k.data(), 0, style0_pack.k.size() * sizeof(float));
+        ggml_backend_tensor_set(style_v_dlh, style0_pack.v.data(), 0, style0_pack.v.size() * sizeof(float));
         profile_vector_compute(model, style0agf, current_step, "style0_flash");
         PUSH_GGML_TRACE({"ve_style0_ctx", {L, 256}, tensor_to_time_channel(ggml_graph_get_tensor(style0agf, "ve_style0_ctx"))});
         std::vector<float> style_out_ggml = tensor_to_time_channel(ggml_graph_get_tensor(style0agf, "ve_style0_out"));
@@ -1452,14 +1471,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         f32_tensor theta_g1 = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
         apply_rope(theta_g1.data.data(), g1q_out, L, 4, 64);
         apply_rope(theta_g1.data.data(), g1k_out, text_len, 4, 64);
-        std::vector<float> g1q_dlh((size_t)64*L*4), g1k_dlh((size_t)64*text_len*4), g1v_dlh((size_t)64*text_len*4);
-        for (int h = 0; h < 4; ++h) {
-            for (int t = 0; t < L; ++t) for (int d = 0; d < 64; ++d) g1q_dlh[(size_t)d + 64*((size_t)t + (size_t)L*h)] = g1q_out[(size_t)t*256 + h*64 + d];
-            for (int t = 0; t < text_len; ++t) for (int d = 0; d < 64; ++d) {
-                g1k_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = g1k_out[(size_t)t*256 + h*64 + d];
-                g1v_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = g1v_out[(size_t)t*256 + h*64 + d];
-            }
-        }
+        attention_dlh_pack & g1_attn_pack = pack_attention_dlh(g1q_out, g1k_out, g1v_out, L, text_len, 4, 64);
         constexpr int G1_ATTN_ONLY_NODES = 256;
         static size_t g1_attn_only_buf_size = ggml_tensor_overhead() * G1_ATTN_ONLY_NODES +
                                               ggml_graph_overhead_custom(G1_ATTN_ONLY_NODES, false);
@@ -1488,9 +1500,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             throw std::runtime_error("ggml_gallocr_reserve group1 attn-only failed");
         }
         ggml_gallocr_alloc_graph(g1aoallocr, g1aogf);
-        ggml_backend_tensor_set(g1a_q_rope, g1q_dlh.data(), 0, g1q_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g1a_k_rope, g1k_dlh.data(), 0, g1k_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g1a_v_rope, g1v_dlh.data(), 0, g1v_dlh.size()*sizeof(float));
+        ggml_backend_tensor_set(g1a_q_rope, g1_attn_pack.q.data(), 0, g1_attn_pack.q.size()*sizeof(float));
+        ggml_backend_tensor_set(g1a_k_rope, g1_attn_pack.k.data(), 0, g1_attn_pack.k.size()*sizeof(float));
+        ggml_backend_tensor_set(g1a_v_rope, g1_attn_pack.v.data(), 0, g1_attn_pack.v.size()*sizeof(float));
         profile_vector_compute(model, g1aogf, current_step, "g1_attn_flash");
         PUSH_GGML_TRACE({"ve_g1_attn_q_rope", {L, 256}, g1q_out});
         PUSH_GGML_TRACE({"ve_g1_attn_k_rope", {text_len, 256}, g1k_out});
@@ -1586,14 +1598,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g1_style_q", {L, 256}, g1sq_out});
         PUSH_GGML_TRACE({"ve_g1_style_k_tanh", {50, 256}, g1sk_out});
         PUSH_GGML_TRACE({"ve_g1_style_v", {50, 256}, g1sv_out});
-        std::vector<float> g1sq_dlh((size_t)128*L*2), g1sk_dlh((size_t)128*50*2), g1sv_dlh((size_t)128*50*2);
-        for (int h = 0; h < 2; ++h) {
-            for (int t = 0; t < L; ++t) for (int d = 0; d < 128; ++d) g1sq_dlh[(size_t)d + 128*((size_t)t + (size_t)L*h)] = g1sq_out[(size_t)t*256 + h*128 + d];
-            for (int t = 0; t < 50; ++t) for (int d = 0; d < 128; ++d) {
-                g1sk_dlh[(size_t)d + 128*((size_t)t + 50ULL*h)] = g1sk_out[(size_t)t*256 + h*128 + d];
-                g1sv_dlh[(size_t)d + 128*((size_t)t + 50ULL*h)] = g1sv_out[(size_t)t*256 + h*128 + d];
-            }
-        }
+        attention_dlh_pack & g1_style_pack = pack_attention_dlh(g1sq_out, g1sk_out, g1sv_out, L, 50, 2, 128);
         constexpr int G1_STYLE_ATTN_NODES = 256;
         static size_t g1_style_attn_buf_size = ggml_tensor_overhead() * G1_STYLE_ATTN_NODES +
                                                ggml_graph_overhead_custom(G1_STYLE_ATTN_NODES, false);
@@ -1622,9 +1627,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             throw std::runtime_error("ggml_gallocr_reserve group1 style attention-only failed");
         }
         ggml_gallocr_alloc_graph(g1saallocr, g1sagf);
-        ggml_backend_tensor_set(g1_style_q_dlh, g1sq_dlh.data(), 0, g1sq_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g1_style_k_dlh, g1sk_dlh.data(), 0, g1sk_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g1_style_v_dlh, g1sv_dlh.data(), 0, g1sv_dlh.size()*sizeof(float));
+        ggml_backend_tensor_set(g1_style_q_dlh, g1_style_pack.q.data(), 0, g1_style_pack.q.size()*sizeof(float));
+        ggml_backend_tensor_set(g1_style_k_dlh, g1_style_pack.k.data(), 0, g1_style_pack.k.size()*sizeof(float));
+        ggml_backend_tensor_set(g1_style_v_dlh, g1_style_pack.v.data(), 0, g1_style_pack.v.size()*sizeof(float));
         profile_vector_compute(model, g1sagf, current_step, "g1_style_flash");
         PUSH_GGML_TRACE({"ve_g1_style_ctx", {L, 256}, tensor_to_time_channel(ggml_graph_get_tensor(g1sagf, "ve_g1_style_ctx"))});
         std::vector<float> g1_style_out = tensor_to_time_channel(ggml_graph_get_tensor(g1sagf, "ve_g1_style_out"));
@@ -1766,14 +1771,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         f32_tensor theta_g2 = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
         apply_rope(theta_g2.data.data(), g2q_out, L, 4, 64);
         apply_rope(theta_g2.data.data(), g2k_out, text_len, 4, 64);
-        std::vector<float> g2q_dlh((size_t)64*L*4), g2k_dlh((size_t)64*text_len*4), g2v_dlh((size_t)64*text_len*4);
-        for (int h = 0; h < 4; ++h) {
-            for (int t = 0; t < L; ++t) for (int d = 0; d < 64; ++d) g2q_dlh[(size_t)d + 64*((size_t)t + (size_t)L*h)] = g2q_out[(size_t)t*256 + h*64 + d];
-            for (int t = 0; t < text_len; ++t) for (int d = 0; d < 64; ++d) {
-                g2k_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = g2k_out[(size_t)t*256 + h*64 + d];
-                g2v_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = g2v_out[(size_t)t*256 + h*64 + d];
-            }
-        }
+        attention_dlh_pack & g2_attn_pack = pack_attention_dlh(g2q_out, g2k_out, g2v_out, L, text_len, 4, 64);
         constexpr int G2_ATTN_ONLY_NODES = 256;
         static size_t g2_attn_only_buf_size = ggml_tensor_overhead() * G2_ATTN_ONLY_NODES +
                                               ggml_graph_overhead_custom(G2_ATTN_ONLY_NODES, false);
@@ -1802,9 +1800,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             throw std::runtime_error("ggml_gallocr_reserve group2 attn-only failed");
         }
         ggml_gallocr_alloc_graph(g2aoallocr, g2aogf);
-        ggml_backend_tensor_set(g2a_q_rope, g2q_dlh.data(), 0, g2q_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g2a_k_rope, g2k_dlh.data(), 0, g2k_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g2a_v_rope, g2v_dlh.data(), 0, g2v_dlh.size()*sizeof(float));
+        ggml_backend_tensor_set(g2a_q_rope, g2_attn_pack.q.data(), 0, g2_attn_pack.q.size()*sizeof(float));
+        ggml_backend_tensor_set(g2a_k_rope, g2_attn_pack.k.data(), 0, g2_attn_pack.k.size()*sizeof(float));
+        ggml_backend_tensor_set(g2a_v_rope, g2_attn_pack.v.data(), 0, g2_attn_pack.v.size()*sizeof(float));
         profile_vector_compute(model, g2aogf, current_step, "g2_attn_flash");
         PUSH_GGML_TRACE({"ve_g2_attn_q_rope", {L, 256}, g2q_out});
         PUSH_GGML_TRACE({"ve_g2_attn_k_rope", {text_len, 256}, g2k_out});
@@ -1900,14 +1898,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g2_style_q", {L, 256}, g2sq_out});
         PUSH_GGML_TRACE({"ve_g2_style_k_tanh", {50, 256}, g2sk_out});
         PUSH_GGML_TRACE({"ve_g2_style_v", {50, 256}, g2sv_out});
-        std::vector<float> g2sq_dlh((size_t)128*L*2), g2sk_dlh((size_t)128*50*2), g2sv_dlh((size_t)128*50*2);
-        for (int h = 0; h < 2; ++h) {
-            for (int t = 0; t < L; ++t) for (int d = 0; d < 128; ++d) g2sq_dlh[(size_t)d + 128*((size_t)t + (size_t)L*h)] = g2sq_out[(size_t)t*256 + h*128 + d];
-            for (int t = 0; t < 50; ++t) for (int d = 0; d < 128; ++d) {
-                g2sk_dlh[(size_t)d + 128*((size_t)t + 50ULL*h)] = g2sk_out[(size_t)t*256 + h*128 + d];
-                g2sv_dlh[(size_t)d + 128*((size_t)t + 50ULL*h)] = g2sv_out[(size_t)t*256 + h*128 + d];
-            }
-        }
+        attention_dlh_pack & g2_style_pack = pack_attention_dlh(g2sq_out, g2sk_out, g2sv_out, L, 50, 2, 128);
         constexpr int G2_STYLE_ATTN_NODES = 256;
         static size_t g2_style_attn_buf_size = ggml_tensor_overhead() * G2_STYLE_ATTN_NODES +
                                                ggml_graph_overhead_custom(G2_STYLE_ATTN_NODES, false);
@@ -1936,9 +1927,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             throw std::runtime_error("ggml_gallocr_reserve group2 style attention-only failed");
         }
         ggml_gallocr_alloc_graph(g2saallocr, g2sagf);
-        ggml_backend_tensor_set(g2_style_q_dlh, g2sq_dlh.data(), 0, g2sq_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g2_style_k_dlh, g2sk_dlh.data(), 0, g2sk_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g2_style_v_dlh, g2sv_dlh.data(), 0, g2sv_dlh.size()*sizeof(float));
+        ggml_backend_tensor_set(g2_style_q_dlh, g2_style_pack.q.data(), 0, g2_style_pack.q.size()*sizeof(float));
+        ggml_backend_tensor_set(g2_style_k_dlh, g2_style_pack.k.data(), 0, g2_style_pack.k.size()*sizeof(float));
+        ggml_backend_tensor_set(g2_style_v_dlh, g2_style_pack.v.data(), 0, g2_style_pack.v.size()*sizeof(float));
         profile_vector_compute(model, g2sagf, current_step, "g2_style_flash");
         PUSH_GGML_TRACE({"ve_g2_style_ctx", {L, 256}, tensor_to_time_channel(ggml_graph_get_tensor(g2sagf, "ve_g2_style_ctx"))});
         std::vector<float> g2_style_out = tensor_to_time_channel(ggml_graph_get_tensor(g2sagf, "ve_g2_style_out"));
@@ -2080,14 +2071,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         f32_tensor theta_g3 = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
         apply_rope(theta_g3.data.data(), g3q_out, L, 4, 64);
         apply_rope(theta_g3.data.data(), g3k_out, text_len, 4, 64);
-        std::vector<float> g3q_dlh((size_t)64*L*4), g3k_dlh((size_t)64*text_len*4), g3v_dlh((size_t)64*text_len*4);
-        for (int h = 0; h < 4; ++h) {
-            for (int t = 0; t < L; ++t) for (int d = 0; d < 64; ++d) g3q_dlh[(size_t)d + 64*((size_t)t + (size_t)L*h)] = g3q_out[(size_t)t*256 + h*64 + d];
-            for (int t = 0; t < text_len; ++t) for (int d = 0; d < 64; ++d) {
-                g3k_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = g3k_out[(size_t)t*256 + h*64 + d];
-                g3v_dlh[(size_t)d + 64*((size_t)t + (size_t)text_len*h)] = g3v_out[(size_t)t*256 + h*64 + d];
-            }
-        }
+        attention_dlh_pack & g3_attn_pack = pack_attention_dlh(g3q_out, g3k_out, g3v_out, L, text_len, 4, 64);
         constexpr int G3_ATTN_ONLY_NODES = 256;
         static size_t g3_attn_only_buf_size = ggml_tensor_overhead() * G3_ATTN_ONLY_NODES +
                                               ggml_graph_overhead_custom(G3_ATTN_ONLY_NODES, false);
@@ -2116,9 +2100,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             throw std::runtime_error("ggml_gallocr_reserve group3 attn-only failed");
         }
         ggml_gallocr_alloc_graph(g3aoallocr, g3aogf);
-        ggml_backend_tensor_set(g3a_q_rope, g3q_dlh.data(), 0, g3q_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g3a_k_rope, g3k_dlh.data(), 0, g3k_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g3a_v_rope, g3v_dlh.data(), 0, g3v_dlh.size()*sizeof(float));
+        ggml_backend_tensor_set(g3a_q_rope, g3_attn_pack.q.data(), 0, g3_attn_pack.q.size()*sizeof(float));
+        ggml_backend_tensor_set(g3a_k_rope, g3_attn_pack.k.data(), 0, g3_attn_pack.k.size()*sizeof(float));
+        ggml_backend_tensor_set(g3a_v_rope, g3_attn_pack.v.data(), 0, g3_attn_pack.v.size()*sizeof(float));
         profile_vector_compute(model, g3aogf, current_step, "g3_attn_flash");
         PUSH_GGML_TRACE({"ve_g3_attn_q_rope", {L, 256}, g3q_out});
         PUSH_GGML_TRACE({"ve_g3_attn_k_rope", {text_len, 256}, g3k_out});
@@ -2214,14 +2198,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g3_style_q", {L, 256}, g3sq_out});
         PUSH_GGML_TRACE({"ve_g3_style_k_tanh", {50, 256}, g3sk_out});
         PUSH_GGML_TRACE({"ve_g3_style_v", {50, 256}, g3sv_out});
-        std::vector<float> g3sq_dlh((size_t)128*L*2), g3sk_dlh((size_t)128*50*2), g3sv_dlh((size_t)128*50*2);
-        for (int h = 0; h < 2; ++h) {
-            for (int t = 0; t < L; ++t) for (int d = 0; d < 128; ++d) g3sq_dlh[(size_t)d + 128*((size_t)t + (size_t)L*h)] = g3sq_out[(size_t)t*256 + h*128 + d];
-            for (int t = 0; t < 50; ++t) for (int d = 0; d < 128; ++d) {
-                g3sk_dlh[(size_t)d + 128*((size_t)t + 50ULL*h)] = g3sk_out[(size_t)t*256 + h*128 + d];
-                g3sv_dlh[(size_t)d + 128*((size_t)t + 50ULL*h)] = g3sv_out[(size_t)t*256 + h*128 + d];
-            }
-        }
+        attention_dlh_pack & g3_style_pack = pack_attention_dlh(g3sq_out, g3sk_out, g3sv_out, L, 50, 2, 128);
         constexpr int G3_STYLE_ATTN_NODES = 256;
         static size_t g3_style_attn_buf_size = ggml_tensor_overhead() * G3_STYLE_ATTN_NODES +
                                                ggml_graph_overhead_custom(G3_STYLE_ATTN_NODES, false);
@@ -2250,9 +2227,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             throw std::runtime_error("ggml_gallocr_reserve group3 style attention-only failed");
         }
         ggml_gallocr_alloc_graph(g3saallocr, g3sagf);
-        ggml_backend_tensor_set(g3_style_q_dlh, g3sq_dlh.data(), 0, g3sq_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g3_style_k_dlh, g3sk_dlh.data(), 0, g3sk_dlh.size()*sizeof(float));
-        ggml_backend_tensor_set(g3_style_v_dlh, g3sv_dlh.data(), 0, g3sv_dlh.size()*sizeof(float));
+        ggml_backend_tensor_set(g3_style_q_dlh, g3_style_pack.q.data(), 0, g3_style_pack.q.size()*sizeof(float));
+        ggml_backend_tensor_set(g3_style_k_dlh, g3_style_pack.k.data(), 0, g3_style_pack.k.size()*sizeof(float));
+        ggml_backend_tensor_set(g3_style_v_dlh, g3_style_pack.v.data(), 0, g3_style_pack.v.size()*sizeof(float));
         profile_vector_compute(model, g3sagf, current_step, "g3_style_flash");
         PUSH_GGML_TRACE({"ve_g3_style_ctx", {L, 256}, tensor_to_time_channel(ggml_graph_get_tensor(g3sagf, "ve_g3_style_ctx"))});
         std::vector<float> g3_style_out = tensor_to_time_channel(ggml_graph_get_tensor(g3sagf, "ve_g3_style_out"));
