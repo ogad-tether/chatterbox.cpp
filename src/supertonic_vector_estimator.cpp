@@ -1,5 +1,7 @@
 #include "supertonic_internal.h"
 
+#include "ggml-alloc.h"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -66,6 +68,122 @@ void conv1x1(const std::vector<float> & x, int L, int IC,
             y[(size_t)t*OC + oc] = sum;
         }
     }
+}
+
+ggml_tensor * repeat_like(ggml_context * ctx, ggml_tensor * v, ggml_tensor * like) {
+    if (ggml_n_dims(v) == 1 && ggml_n_dims(like) >= 2) {
+        if (like->ne[0] == v->ne[0]) v = ggml_reshape_2d(ctx, v, v->ne[0], 1);
+        else if (like->ne[1] == v->ne[0]) v = ggml_reshape_2d(ctx, v, 1, v->ne[0]);
+    }
+    if (!ggml_can_repeat(v, like)) {
+        throw std::runtime_error(
+            "cannot repeat tensor [" + std::to_string(v->ne[0]) + "," + std::to_string(v->ne[1]) + "," +
+            std::to_string(v->ne[2]) + "," + std::to_string(v->ne[3]) + "] to [" +
+            std::to_string(like->ne[0]) + "," + std::to_string(like->ne[1]) + "," +
+            std::to_string(like->ne[2]) + "," + std::to_string(like->ne[3]) + "]");
+    }
+    return ggml_repeat(ctx, v, like);
+}
+
+ggml_tensor * conv1d_f32(ggml_context * ctx,
+                         ggml_tensor * kernel,
+                         ggml_tensor * input,
+                         int stride,
+                         int padding,
+                         int dilation) {
+    ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * result = ggml_mul_mat(ctx,
+        ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+        ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));
+    return ggml_reshape_3d(ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);
+}
+
+ggml_tensor * edge_clamp_pad_1d(ggml_context * ctx, ggml_tensor * x, int pad_left, int pad_right) {
+    const int64_t L = x->ne[0];
+    const int64_t C = x->ne[1];
+    ggml_tensor * out = x;
+    if (pad_left > 0) {
+        ggml_tensor * first = ggml_view_2d(ctx, x, 1, C, x->nb[1], 0);
+        ggml_tensor * rep = ggml_repeat_4d(ctx, first, pad_left, C, 1, 1);
+        out = ggml_concat(ctx, rep, out, 0);
+    }
+    if (pad_right > 0) {
+        ggml_tensor * last = ggml_view_2d(ctx, x, 1, C, x->nb[1], (size_t)(L - 1) * x->nb[0]);
+        ggml_tensor * rep = ggml_repeat_4d(ctx, last, pad_right, C, 1, 1);
+        out = ggml_concat(ctx, out, rep, 0);
+    }
+    return out;
+}
+
+ggml_tensor * depthwise_same_ggml(ggml_context * ctx,
+                                  ggml_tensor * x,
+                                  ggml_tensor * w,
+                                  ggml_tensor * b,
+                                  int dilation) {
+    const int K = (int) w->ne[0];
+    const int pad_left = ((K - 1) * dilation) / 2;
+    const int pad_right = (K - 1) * dilation - pad_left;
+    ggml_tensor * padded = edge_clamp_pad_1d(ctx, x, pad_left, pad_right);
+    ggml_tensor * new_b = ggml_reshape_4d(ctx, padded, padded->ne[0], 1, padded->ne[1], padded->ne[2]);
+    ggml_tensor * im2col = ggml_im2col(ctx, w, new_b, 1, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * y = ggml_mul_mat(ctx, im2col, w);
+    y = ggml_reshape_3d(ctx, y, y->ne[0], y->ne[2], 1);
+    return ggml_add(ctx, y, repeat_like(ctx, b, y));
+}
+
+ggml_tensor * layer_norm_ggml(ggml_context * ctx,
+                              ggml_tensor * x,
+                              ggml_tensor * g,
+                              ggml_tensor * b) {
+    ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
+    xt = ggml_norm(ctx, xt, 1e-6f);
+    xt = ggml_mul(ctx, xt, repeat_like(ctx, g, xt));
+    xt = ggml_add(ctx, xt, repeat_like(ctx, b, xt));
+    return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
+}
+
+ggml_tensor * vector_convnext_ggml(ggml_context * ctx,
+                                   const supertonic_model & model,
+                                   const std::string & p,
+                                   ggml_tensor * x,
+                                   int dilation) {
+    ggml_tensor * residual = x;
+    ggml_tensor * y = depthwise_same_ggml(ctx, x,
+        require_source_tensor(model, p + ".dwconv.weight"),
+        require_source_tensor(model, p + ".dwconv.bias"),
+        dilation);
+    y = layer_norm_ggml(ctx, y,
+        require_source_tensor(model, p + ".norm.norm.weight"),
+        require_source_tensor(model, p + ".norm.norm.bias"));
+    y = conv1d_f32(ctx, require_source_tensor(model, p + ".pwconv1.weight"), y, 1, 0, 1);
+    y = ggml_add(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".pwconv1.bias"), y));
+    y = ggml_gelu_erf(ctx, y);
+    y = conv1d_f32(ctx, require_source_tensor(model, p + ".pwconv2.weight"), y, 1, 0, 1);
+    y = ggml_add(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".pwconv2.bias"), y));
+    y = ggml_mul(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".gamma"), y));
+    return ggml_add(ctx, residual, y);
+}
+
+std::vector<float> tensor_to_time_channel(ggml_tensor * t) {
+    const int L = (int) t->ne[0];
+    const int C = (int) t->ne[1];
+    std::vector<float> raw((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, ggml_nbytes(t));
+    std::vector<float> out((size_t) L * C);
+    for (int c = 0; c < C; ++c) {
+        for (int i = 0; i < L; ++i) {
+            out[(size_t) i * C + c] = raw[(size_t) c * L + i];
+        }
+    }
+    return out;
+}
+
+void push_trace(std::vector<supertonic_trace_tensor> & trace,
+                const std::string & name,
+                int L,
+                int C,
+                const std::vector<float> & data) {
+    trace.push_back({name, {L, C}, data});
 }
 
 void depthwise_same(const std::vector<float> & x, int L, int C, const f32_tensor & w,
@@ -227,6 +345,145 @@ bool supertonic_vector_step_cpu(const supertonic_model & model, const float * no
         }
         if(error) error->clear(); return true;
     } catch(const std::exception &e){ if(error)*error=e.what(); return false; }
+}
+
+bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
+                                       const float * noisy_latent,
+                                       const float * latent_mask,
+                                       int latent_len,
+                                       std::vector<supertonic_trace_tensor> & scalar_trace,
+                                       std::vector<supertonic_trace_tensor> & ggml_trace,
+                                       std::string * error) {
+    try {
+        scalar_trace.clear();
+        ggml_trace.clear();
+        const int L = latent_len;
+        const int Cin = model.hparams.latent_channels;
+        const int C = 512;
+
+        std::vector<float> in((size_t) L * Cin);
+        for (int t = 0; t < L; ++t) {
+            for (int c = 0; c < Cin; ++c) {
+                in[(size_t) t * Cin + c] = noisy_latent[(size_t) c * L + t];
+            }
+        }
+        push_trace(scalar_trace, "ve_latent_tc", L, Cin, in);
+
+        std::vector<float> proj;
+        f32_tensor proj_w = read_f32(model, "vector_estimator:tts.ttl.vector_field.proj_in.net.weight");
+        conv1x1(in, L, Cin, proj_w, nullptr, C, proj);
+        for (int t = 0; t < L; ++t) {
+            for (int c = 0; c < C; ++c) {
+                proj[(size_t) t * C + c] *= latent_mask[t];
+            }
+        }
+        push_trace(scalar_trace, "ve_masked", L, C, proj);
+
+        std::vector<float> block = proj;
+        int dils[4] = {1, 2, 4, 8};
+        for (int j = 0; j < 4; ++j) {
+            convnext(model, "vector_estimator:tts.ttl.vector_field.main_blocks.0.convnext." + std::to_string(j),
+                     block, L, C, dils[j]);
+            push_trace(scalar_trace, "ve_block0_convnext" + std::to_string(j), L, C, block);
+        }
+
+        std::vector<float> te = time_embedding(model, 0, 5);
+        std::vector<float> tb;
+        dense_matmul_vec(te, read_f32(model, "vector_estimator:onnx::MatMul_3095"),
+                         read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.1.linear.linear.bias"),
+                         64, C, tb);
+        for (int t = 0; t < L; ++t) {
+            for (int c = 0; c < C; ++c) block[(size_t)t*C+c] += tb[c];
+        }
+        push_trace(scalar_trace, "ve_time_add0", L, C, block);
+        convnext(model, "vector_estimator:tts.ttl.vector_field.main_blocks.2.convnext.0", block, L, C, 1);
+        push_trace(scalar_trace, "ve_block2_convnext0", L, C, block);
+
+        constexpr int MAX_NODES = 256;
+        static size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
+                                 ggml_graph_overhead_custom(MAX_NODES, false);
+        thread_local std::vector<uint8_t> buf(buf_size);
+        ggml_init_params p = { buf_size, buf.data(), true };
+        ggml_context * ctx = ggml_init(p);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, Cin);
+        ggml_set_name(x, "ve_latent_tc");
+        ggml_set_input(x);
+        ggml_tensor * mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, L);
+        ggml_set_name(mask, "ve_latent_mask");
+        ggml_set_input(mask);
+        ggml_tensor * t_emb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        ggml_set_name(t_emb, "ve_time_emb");
+        ggml_set_input(t_emb);
+
+        ggml_tensor * y = conv1d_f32(ctx, require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.proj_in.net.weight"), x, 1, 0, 1);
+        ggml_tensor * masked = ggml_mul(ctx, y, repeat_like(ctx, mask, y));
+        ggml_set_name(masked, "ve_masked");
+        ggml_set_output(masked);
+        ggml_build_forward_expand(gf, masked);
+
+        ggml_tensor * cur = masked;
+        int dils_ggml[4] = {1, 2, 4, 8};
+        for (int j = 0; j < 4; ++j) {
+            cur = vector_convnext_ggml(ctx, model,
+                "vector_estimator:tts.ttl.vector_field.main_blocks.0.convnext." + std::to_string(j),
+                cur, dils_ggml[j]);
+            const std::string name = "ve_block0_convnext" + std::to_string(j);
+            ggml_set_name(cur, name.c_str());
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
+
+        ggml_tensor * t_proj = ggml_mul_mat(ctx,
+            ggml_cont(ctx, ggml_transpose(ctx, require_source_tensor(model, "vector_estimator:onnx::MatMul_3095"))),
+            ggml_reshape_2d(ctx, t_emb, 64, 1));
+        t_proj = ggml_add(ctx, t_proj,
+            ggml_reshape_2d(ctx,
+                require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.1.linear.linear.bias"),
+                C, 1));
+        cur = ggml_add(ctx, cur, repeat_like(ctx, t_proj, cur));
+        ggml_set_name(cur, "ve_time_add0");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+
+        cur = vector_convnext_ggml(ctx, model,
+            "vector_estimator:tts.ttl.vector_field.main_blocks.2.convnext.0",
+            cur, 1);
+        ggml_set_name(cur, "ve_block2_convnext0");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!allocr) throw std::runtime_error("ggml_gallocr_new failed");
+        if (!ggml_gallocr_reserve(allocr, gf)) {
+            ggml_gallocr_free(allocr);
+            throw std::runtime_error("ggml_gallocr_reserve failed");
+        }
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        ggml_backend_tensor_set(x, noisy_latent, 0, (size_t) L * Cin * sizeof(float));
+        ggml_backend_tensor_set(mask, latent_mask, 0, (size_t) L * sizeof(float));
+        std::vector<float> te_host = time_embedding(model, 0, 5);
+        ggml_backend_tensor_set(t_emb, te_host.data(), 0, te_host.size() * sizeof(float));
+        ggml_backend_graph_compute(model.backend, gf);
+
+        ggml_trace.push_back({"ve_latent_tc", {L, Cin}, in});
+        ggml_trace.push_back({"ve_masked", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_masked"))});
+        for (int j = 0; j < 4; ++j) {
+            const std::string name = "ve_block0_convnext" + std::to_string(j);
+            ggml_trace.push_back({name, {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, name.c_str()))});
+        }
+        ggml_trace.push_back({"ve_time_add0", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_time_add0"))});
+        ggml_trace.push_back({"ve_block2_convnext0", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "ve_block2_convnext0"))});
+
+        ggml_gallocr_free(allocr);
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
 }
 
 } // namespace tts_cpp::supertonic::detail

@@ -12,8 +12,10 @@ namespace {
 void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s --model supertonic2.gguf --text TEXT --out out.wav\n"
-        "          [--language en] [--voice F1] [--steps 5] [--speed 1.05]\n"
-        "          [--seed 42] [--noise-npy /path/to/noise.npy]\n",
+        "          [--language en] [--voice NAME] [--steps N] [--speed X]\n"
+        "          (voice/steps/speed default to GGUF metadata when omitted)\n"
+        "          [--seed 42] [--threads N] [--n-gpu-layers N]\n"
+        "          [--noise-npy /path/to/noise.npy]\n",
         argv0);
 }
 
@@ -61,6 +63,8 @@ int main(int argc, char ** argv) {
         else if (arg == "--steps") opts.steps = std::stoi(next("--steps"));
         else if (arg == "--speed") opts.speed = std::stof(next("--speed"));
         else if (arg == "--seed") opts.seed = std::stoi(next("--seed"));
+        else if (arg == "--threads") opts.n_threads = std::stoi(next("--threads"));
+        else if (arg == "--n-gpu-layers") opts.n_gpu_layers = std::stoi(next("--n-gpu-layers"));
         else if (arg == "--noise-npy") opts.noise_npy_path = next("--noise-npy");
         else if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", arg.c_str()); usage(argv[0]); return 2; }

@@ -48,6 +48,13 @@ def parse_args() -> argparse.Namespace:
                    help="HF repo/source metadata. Defaults from --arch.")
     p.add_argument("--default-voice", default=None,
                    help="Default voice metadata. Defaults to F1 when present, otherwise first voice.")
+    p.add_argument("--default-steps", type=int, default=None,
+                   help="Default denoising steps metadata. Defaults to 5 for supertonic and 10 for supertonic2.")
+    p.add_argument("--default-speed", type=float, default=1.05,
+                   help="Default speed metadata.")
+    p.add_argument("--ftype", choices=("f32", "f16", "q8_0"), default="f32",
+                   help="Weight storage type. f32 is required by the current scalar reference backend; "
+                        "f16/q8_0 are intended for the GGML graph backend.")
     p.add_argument("--language-wrap-mode", choices=("none", "prefix", "open_close"), default=None,
                    help="Text wrapping metadata. Defaults to none for --arch supertonic and open_close for supertonic2.")
     p.add_argument("--no-language-wrap", action="store_true",
@@ -95,6 +102,25 @@ def as_contiguous(arr: np.ndarray) -> np.ndarray:
 def tensor_sha256(arr: np.ndarray) -> str:
     data = np.ascontiguousarray(arr).view(np.uint8)
     return hashlib.sha256(data).hexdigest()
+
+
+def prepare_weight_tensor(arr: np.ndarray, ftype: str) -> tuple[np.ndarray, tuple[int, ...] | None, "gguf.GGMLQuantizationType | None"]:
+    if ftype == "f32" or not np.issubdtype(arr.dtype, np.floating):
+        return arr, None, None
+    if ftype == "f16":
+        return np.ascontiguousarray(arr.astype(np.float16)), None, None
+    if ftype == "q8_0":
+        # Keep small/vector tensors in F32. Quantizing bias/norm/scalar tensors
+        # hurts parity and gives little size/speed benefit.
+        if arr.ndim < 2 or arr.size < 256:
+            return arr, None, None
+        qtype = gguf.GGMLQuantizationType.Q8_0
+        try:
+            q = gguf.quantize(np.ascontiguousarray(arr.astype(np.float32)), qtype)
+        except gguf.QuantError:
+            return arr, None, None
+        return q, None, qtype
+    raise ValueError(f"unsupported ftype: {ftype}")
 
 
 def tensor_from_attribute(attr: onnx.AttributeProto) -> np.ndarray | None:
@@ -160,6 +186,7 @@ def main() -> int:
     writer.add_description(f"{reference_repo} ONNX weights/assets converted for a model-specific ggml runtime.")
     writer.add_string("supertonic.arch", args.arch)
     writer.add_string("supertonic.reference_repo", reference_repo)
+    writer.add_string("supertonic.ftype", args.ftype)
     writer.add_string("supertonic.tts_version", str(cfg.get("tts_version", "")))
     writer.add_string("supertonic.split", str(cfg.get("split", "")))
     writer.add_uint32("supertonic.sample_rate", int(cfg["ae"]["sample_rate"]))
@@ -171,9 +198,10 @@ def main() -> int:
         int(cfg["ttl"]["latent_dim"]) * int(cfg["ttl"]["chunk_compress_factor"]),
     )
     wrap_mode = "none" if args.no_language_wrap else (args.language_wrap_mode or ("none" if args.arch == "supertonic" else "open_close"))
+    default_steps = args.default_steps if args.default_steps is not None else (5 if args.arch == "supertonic" else 10)
 
-    writer.add_uint32("supertonic.default_steps", 5)
-    writer.add_float32("supertonic.default_speed", 1.05)
+    writer.add_uint32("supertonic.default_steps", default_steps)
+    writer.add_float32("supertonic.default_speed", args.default_speed)
     writer.add_uint32("supertonic.language_wrap", 0 if wrap_mode == "none" else 1)
     writer.add_string("supertonic.language_wrap_mode", wrap_mode)
     writer.add_array("supertonic.languages", ["en", "ko", "es", "pt", "fr"])
@@ -209,13 +237,14 @@ def main() -> int:
         for source_name, arr in iter_onnx_tensors(args.onnx_dir / filename):
             short_name = f"supertonic/{stage}/t{count:04d}"
             source_key = f"{stage}:{source_name}"
-            writer.add_tensor(short_name, arr)
+            stored, raw_shape, raw_dtype = prepare_weight_tensor(arr, args.ftype)
+            writer.add_tensor(short_name, stored, raw_shape=raw_shape, raw_dtype=raw_dtype)
             tensor_names.append(short_name)
             source_names.append(source_key)
             tensor_shapes.append(json.dumps(list(arr.shape), separators=(",", ":")))
-            tensor_dtypes.append(str(arr.dtype))
-            tensor_hashes.append(tensor_sha256(arr))
-            total_bytes += arr.nbytes
+            tensor_dtypes.append(str(raw_dtype.name if raw_dtype is not None else stored.dtype))
+            tensor_hashes.append(tensor_sha256(stored))
+            total_bytes += stored.nbytes
             count += 1
         per_stage_counts[stage] = count
         print(f"{stage:16s} {count:5d} tensors")

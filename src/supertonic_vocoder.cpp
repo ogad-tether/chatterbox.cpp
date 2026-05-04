@@ -1,5 +1,7 @@
 #include "supertonic_internal.h"
 
+#include "ggml-alloc.h"
+
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -12,8 +14,7 @@ struct f32_tensor {
     int64_t ne[4] = {1, 1, 1, 1}; // ggml order; ONNX row-major is reversed
 };
 
-f32_tensor read_f32(const supertonic_model & m, const std::string & source_name) {
-    ggml_tensor * t = require_source_tensor(m, source_name);
+f32_tensor read_f32_tensor(ggml_tensor * t) {
     f32_tensor out;
     for (int i = 0; i < 4; ++i) out.ne[i] = t->ne[i];
     out.data.resize((size_t) ggml_nelements(t));
@@ -21,14 +22,163 @@ f32_tensor read_f32(const supertonic_model & m, const std::string & source_name)
     return out;
 }
 
-float scalar_f32(const supertonic_model & m, const std::string & source_name) {
-    f32_tensor t = read_f32(m, source_name);
-    if (t.data.empty()) throw std::runtime_error("empty scalar tensor: " + source_name);
+f32_tensor read_f32(const supertonic_model & m, const std::string & source_name) {
+    return read_f32_tensor(require_source_tensor(m, source_name));
+}
+
+float scalar_f32_tensor(ggml_tensor * tensor) {
+    f32_tensor t = read_f32_tensor(tensor);
+    if (t.data.empty()) throw std::runtime_error("empty scalar tensor");
     return t.data[0];
+}
+
+float scalar_f32(const supertonic_model & m, const std::string & source_name) {
+    return scalar_f32_tensor(require_source_tensor(m, source_name));
 }
 
 inline float gelu(float x) {
     return 0.5f * x * (1.0f + std::erff(x * 0.7071067811865475f));
+}
+
+ggml_tensor * repeat_like(ggml_context * ctx, ggml_tensor * v, ggml_tensor * like) {
+    if (ggml_n_dims(v) == 1 && ggml_n_dims(like) >= 2) {
+        if (like->ne[0] == v->ne[0]) v = ggml_reshape_2d(ctx, v, v->ne[0], 1);
+        else if (like->ne[1] == v->ne[0]) v = ggml_reshape_2d(ctx, v, 1, v->ne[0]);
+    } else if (v->ne[0] == 1 && v->ne[1] > 1 && v->ne[2] == 1) {
+        if (like->ne[0] == v->ne[1]) v = ggml_reshape_2d(ctx, v, v->ne[1], 1);
+        else if (like->ne[1] == v->ne[1]) v = ggml_reshape_2d(ctx, v, 1, v->ne[1]);
+    }
+    if (!ggml_can_repeat(v, like)) {
+        throw std::runtime_error(
+            "cannot repeat tensor [" + std::to_string(v->ne[0]) + "," + std::to_string(v->ne[1]) + "," +
+            std::to_string(v->ne[2]) + "," + std::to_string(v->ne[3]) + "] to [" +
+            std::to_string(like->ne[0]) + "," + std::to_string(like->ne[1]) + "," +
+            std::to_string(like->ne[2]) + "," + std::to_string(like->ne[3]) + "]");
+    }
+    return ggml_repeat(ctx, v, like);
+}
+
+ggml_tensor * causal_replicate_pad_1d(ggml_context * ctx, ggml_tensor * x, int pad_left) {
+    if (pad_left <= 0) return x;
+    const int64_t C = x->ne[1];
+    ggml_tensor * first = ggml_view_2d(ctx, x, 1, C, x->nb[1], 0);
+    ggml_tensor * rep = ggml_repeat_4d(ctx, first, pad_left, C, 1, 1);
+    return ggml_concat(ctx, rep, x, 0);
+}
+
+ggml_tensor * conv1d_causal_ggml(ggml_context * ctx,
+                                 ggml_tensor * x,
+                                 ggml_tensor * w,
+                                 ggml_tensor * b,
+                                 int dilation = 1) {
+    const int K = (int) w->ne[0];
+    ggml_tensor * padded = causal_replicate_pad_1d(ctx, x, (K - 1) * dilation);
+    ggml_tensor * im2col = ggml_im2col(ctx, w, padded, 1, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * y = ggml_mul_mat(ctx,
+        ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+        ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));
+    y = ggml_reshape_3d(ctx, y, im2col->ne[1], w->ne[2], im2col->ne[2]);
+    if (b) y = ggml_add(ctx, y, repeat_like(ctx, b, y));
+    return y;
+}
+
+ggml_tensor * depthwise_conv1d_causal_ggml(ggml_context * ctx,
+                                           ggml_tensor * x,
+                                           ggml_tensor * w,
+                                           ggml_tensor * b,
+                                           int dilation) {
+    const int K = (int) w->ne[0];
+    ggml_tensor * padded = causal_replicate_pad_1d(ctx, x, (K - 1) * dilation);
+    ggml_tensor * new_b = ggml_reshape_4d(ctx, padded, padded->ne[0], 1, padded->ne[1], padded->ne[2]);
+    ggml_tensor * im2col = ggml_im2col(ctx, w, new_b, 1, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * y = ggml_mul_mat(ctx, im2col, w);
+    y = ggml_reshape_3d(ctx, y, y->ne[0], y->ne[2], 1);
+    return ggml_add(ctx, y, repeat_like(ctx, b, y));
+}
+
+ggml_tensor * layer_norm_channel_ggml(ggml_context * ctx,
+                                      ggml_tensor * x,
+                                      ggml_tensor * gamma,
+                                      ggml_tensor * beta,
+                                      float eps = 1e-6f) {
+    ggml_tensor * y = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
+    y = ggml_norm(ctx, y, eps);
+    y = ggml_mul(ctx, y, repeat_like(ctx, gamma, y));
+    y = ggml_add(ctx, y, repeat_like(ctx, beta, y));
+    return ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
+}
+
+ggml_tensor * convnext_block_ggml(ggml_context * ctx,
+                                  const supertonic_vocoder_convnext_weights & w,
+                                  ggml_tensor * x,
+                                  int idx) {
+    static const int dilations[10] = {1, 2, 4, 1, 2, 4, 1, 1, 1, 1};
+    ggml_tensor * residual = x;
+    ggml_tensor * y = depthwise_conv1d_causal_ggml(ctx, x, w.dw_w, w.dw_b, dilations[idx]);
+    y = layer_norm_channel_ggml(ctx, y, w.norm_g, w.norm_b);
+    y = conv1d_causal_ggml(ctx, y, w.pw1_w, w.pw1_b);
+    y = ggml_gelu_erf(ctx, y);
+    y = conv1d_causal_ggml(ctx, y, w.pw2_w, w.pw2_b);
+    y = ggml_mul(ctx, y, repeat_like(ctx, w.gamma, y));
+    return ggml_add(ctx, residual, y);
+}
+
+ggml_cgraph * build_supertonic_vocoder_graph(const supertonic_model & model,
+                                             int latent_len) {
+    const int C_latent = model.hparams.latent_dim;
+    const int T0 = latent_len * model.hparams.ttl_chunk_compress_factor;
+    constexpr int MAX_NODES = 4096;
+    static size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
+                             ggml_graph_overhead_custom(MAX_NODES, false);
+    thread_local std::vector<uint8_t> buf(buf_size);
+    ggml_init_params p = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T0, C_latent);
+    ggml_set_name(x, "vocoder_in");
+    ggml_set_input(x);
+
+    ggml_tensor * bn_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+    ggml_set_name(bn_scale, "vocoder_bn_scale");
+    ggml_set_input(bn_scale);
+    ggml_tensor * bn_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+    ggml_set_name(bn_shift, "vocoder_bn_shift");
+    ggml_set_input(bn_shift);
+
+    const float normalizer_scale = scalar_f32_tensor(model.vocoder.normalizer_scale);
+    x = ggml_scale(ctx, x, 1.0f / normalizer_scale);
+    x = ggml_mul(ctx, x, repeat_like(ctx, model.vocoder.latent_std, x));
+    x = ggml_add(ctx, x, repeat_like(ctx, model.vocoder.latent_mean, x));
+    ggml_set_name(x, "vocoder_denorm");
+    ggml_set_output(x);
+
+    x = conv1d_causal_ggml(ctx, x, model.vocoder.embed_w, model.vocoder.embed_b);
+    ggml_set_name(x, "vocoder_embed");
+    ggml_set_output(x);
+    for (int i = 0; i < 10; ++i) {
+        x = convnext_block_ggml(ctx, model.vocoder.convnext[(size_t) i], x, i);
+        ggml_set_name(x, ("vocoder_convnext_" + std::to_string(i)).c_str());
+        ggml_set_output(x);
+    }
+
+    x = ggml_mul(ctx, x, repeat_like(ctx, bn_scale, x));
+    x = ggml_add(ctx, x, repeat_like(ctx, bn_shift, x));
+    ggml_set_name(x, "vocoder_final_norm");
+    ggml_set_output(x);
+
+    x = conv1d_causal_ggml(ctx, x, model.vocoder.head1_w, model.vocoder.head1_b);
+    ggml_set_name(x, "vocoder_head1");
+    ggml_set_output(x);
+    const float prelu = scalar_f32_tensor(model.vocoder.head_prelu);
+    x = ggml_leaky_relu(ctx, x, prelu, false);
+    ggml_set_name(x, "vocoder_prelu");
+    ggml_set_output(x);
+    x = conv1d_causal_ggml(ctx, x, model.vocoder.head2_w, nullptr);
+    ggml_set_name(x, "wav");
+    ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+    return gf;
 }
 
 void linear1x1(const std::vector<float> & x, int L, int IC,
@@ -122,18 +272,78 @@ void batch_norm_channel(std::vector<float> & x, int L, int C,
     }
 }
 
+void push_trace(std::vector<supertonic_trace_tensor> & trace,
+                const std::string & name,
+                int L,
+                int C,
+                const std::vector<float> & data) {
+    trace.push_back({name, {L, C}, data});
+}
+
+std::vector<float> unpack_latent_scalar(const supertonic_model & model,
+                                        const float * latent,
+                                        int latent_len) {
+    const int C_latent = model.hparams.latent_dim;
+    const int factor = model.hparams.ttl_chunk_compress_factor;
+    const int T0 = latent_len * factor;
+    std::vector<float> x((size_t) T0 * C_latent);
+    for (int c = 0; c < C_latent; ++c) {
+        for (int t = 0; t < latent_len; ++t) {
+            for (int r = 0; r < factor; ++r) {
+                int src_c = c * factor + r;
+                x[(size_t) (t * factor + r) * C_latent + c] =
+                    latent[(size_t) src_c * latent_len + t];
+            }
+        }
+    }
+    return x;
+}
+
+std::vector<float> unpack_latent_ggml_layout(const supertonic_model & model,
+                                             const float * latent,
+                                             int latent_len) {
+    const int C_latent = model.hparams.latent_dim;
+    const int factor = model.hparams.ttl_chunk_compress_factor;
+    const int T0 = latent_len * factor;
+    std::vector<float> x((size_t) T0 * C_latent);
+    for (int c = 0; c < C_latent; ++c) {
+        for (int t = 0; t < latent_len; ++t) {
+            for (int r = 0; r < factor; ++r) {
+                int src_c = c * factor + r;
+                x[(size_t) c * T0 + (t * factor + r)] =
+                    latent[(size_t) src_c * latent_len + t];
+            }
+        }
+    }
+    return x;
+}
+
+std::vector<float> ggml_tensor_to_time_channel(ggml_tensor * t) {
+    const int L = (int) t->ne[0];
+    const int C = (int) t->ne[1];
+    std::vector<float> raw((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, ggml_nbytes(t));
+    std::vector<float> out((size_t) L * C);
+    for (int c = 0; c < C; ++c) {
+        for (int i = 0; i < L; ++i) {
+            out[(size_t) i * C + c] = raw[(size_t) c * L + i];
+        }
+    }
+    return out;
+}
+
 void convnext_block(const supertonic_model & m, int idx,
                     std::vector<float> & x, int L, int C) {
-    const std::string p = "vocoder:tts.ae.decoder.convnext." + std::to_string(idx);
-    f32_tensor dw_w = read_f32(m, p + ".dwconv.net.weight");
-    f32_tensor dw_b = read_f32(m, p + ".dwconv.net.bias");
-    f32_tensor ln_g = read_f32(m, p + ".norm.norm.weight");
-    f32_tensor ln_b = read_f32(m, p + ".norm.norm.bias");
-    f32_tensor pw1_w = read_f32(m, p + ".pwconv1.weight");
-    f32_tensor pw1_b = read_f32(m, p + ".pwconv1.bias");
-    f32_tensor pw2_w = read_f32(m, p + ".pwconv2.weight");
-    f32_tensor pw2_b = read_f32(m, p + ".pwconv2.bias");
-    f32_tensor gamma = read_f32(m, p + ".gamma");
+    const auto & cw = m.vocoder.convnext[(size_t) idx];
+    f32_tensor dw_w = read_f32_tensor(cw.dw_w);
+    f32_tensor dw_b = read_f32_tensor(cw.dw_b);
+    f32_tensor ln_g = read_f32_tensor(cw.norm_g);
+    f32_tensor ln_b = read_f32_tensor(cw.norm_b);
+    f32_tensor pw1_w = read_f32_tensor(cw.pw1_w);
+    f32_tensor pw1_b = read_f32_tensor(cw.pw1_b);
+    f32_tensor pw2_w = read_f32_tensor(cw.pw2_w);
+    f32_tensor pw2_b = read_f32_tensor(cw.pw2_b);
+    f32_tensor gamma = read_f32_tensor(cw.gamma);
 
     std::vector<float> residual = x;
     std::vector<float> y;
@@ -183,9 +393,9 @@ bool supertonic_vocoder_forward_cpu(const supertonic_model & model,
             }
         }
 
-        float normalizer_scale = scalar_f32(model, "vocoder:tts.ttl.normalizer.scale");
-        f32_tensor mean = read_f32(model, "vocoder:tts.ae.latent_mean");
-        f32_tensor std = read_f32(model, "vocoder:tts.ae.latent_std");
+        float normalizer_scale = scalar_f32_tensor(model.vocoder.normalizer_scale);
+        f32_tensor mean = read_f32_tensor(model.vocoder.latent_mean);
+        f32_tensor std = read_f32_tensor(model.vocoder.latent_std);
         for (int t = 0; t < T0; ++t) {
             for (int c = 0; c < C_latent; ++c) {
                 float v = x[(size_t) t * C_latent + c] / normalizer_scale;
@@ -193,8 +403,8 @@ bool supertonic_vocoder_forward_cpu(const supertonic_model & model,
             }
         }
 
-        f32_tensor embed_w = read_f32(model, "vocoder:onnx::Conv_1440");
-        f32_tensor embed_b = read_f32(model, "vocoder:onnx::Conv_1441");
+        f32_tensor embed_w = read_f32_tensor(model.vocoder.embed_w);
+        f32_tensor embed_b = read_f32_tensor(model.vocoder.embed_b);
         std::vector<float> y;
         conv1d_causal(x, T0, C_latent, embed_w, &embed_b,
                       (int) embed_w.ne[0], (int) embed_w.ne[2], y);
@@ -207,24 +417,315 @@ bool supertonic_vocoder_forward_cpu(const supertonic_model & model,
 
         batch_norm_channel(
             x, T0, C,
-            read_f32(model, "vocoder:tts.ae.decoder.final_norm.norm.weight"),
-            read_f32(model, "vocoder:tts.ae.decoder.final_norm.norm.bias"),
-            read_f32(model, "vocoder:tts.ae.decoder.final_norm.norm.running_mean"),
-            read_f32(model, "vocoder:tts.ae.decoder.final_norm.norm.running_var"));
+            read_f32_tensor(model.vocoder.final_norm_g),
+            read_f32_tensor(model.vocoder.final_norm_b),
+            read_f32_tensor(model.vocoder.final_norm_running_mean),
+            read_f32_tensor(model.vocoder.final_norm_running_var));
 
-        f32_tensor h1_w = read_f32(model, "vocoder:tts.ae.decoder.head.layer1.net.weight");
-        f32_tensor h1_b = read_f32(model, "vocoder:tts.ae.decoder.head.layer1.net.bias");
+        f32_tensor h1_w = read_f32_tensor(model.vocoder.head1_w);
+        f32_tensor h1_b = read_f32_tensor(model.vocoder.head1_b);
         conv1d_causal(x, T0, C, h1_w, &h1_b, (int) h1_w.ne[0], (int) h1_w.ne[2], y);
-        float prelu = scalar_f32(model, "vocoder:onnx::PRelu_1505");
+        float prelu = scalar_f32_tensor(model.vocoder.head_prelu);
         for (float & v : y) {
             if (v < 0.0f) v *= prelu;
         }
 
-        f32_tensor h2_w = read_f32(model, "vocoder:tts.ae.decoder.head.layer2.weight");
+        f32_tensor h2_w = read_f32_tensor(model.vocoder.head2_w);
         std::vector<float> z;
         linear1x1(y, T0, (int) h1_w.ne[2], h2_w, nullptr, (int) h2_w.ne[2], z);
 
         wav_out = std::move(z);
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
+                                     const float * latent,
+                                     int latent_len,
+                                     std::vector<float> & wav_out,
+                                     std::string * error) {
+    try {
+        const int C_latent = model.hparams.latent_dim;
+        const int factor = model.hparams.ttl_chunk_compress_factor;
+        const int T0 = latent_len * factor;
+        if (latent_len <= 0) throw std::runtime_error("latent_len must be positive");
+
+        std::vector<float> x_in((size_t) T0 * C_latent);
+        for (int c = 0; c < C_latent; ++c) {
+            for (int t = 0; t < latent_len; ++t) {
+                for (int r = 0; r < factor; ++r) {
+                    int src_c = c * factor + r;
+                    x_in[(size_t) c * T0 + (t * factor + r)] =
+                        latent[(size_t) src_c * latent_len + t];
+                }
+            }
+        }
+
+        f32_tensor gamma = read_f32_tensor(model.vocoder.final_norm_g);
+        f32_tensor beta = read_f32_tensor(model.vocoder.final_norm_b);
+        f32_tensor mean = read_f32_tensor(model.vocoder.final_norm_running_mean);
+        f32_tensor var = read_f32_tensor(model.vocoder.final_norm_running_var);
+        std::vector<float> bn_scale(512), bn_shift(512);
+        for (int c = 0; c < 512; ++c) {
+            bn_scale[c] = gamma.data[c] / std::sqrt(var.data[c] + 1e-5f);
+            bn_shift[c] = beta.data[c] - mean.data[c] * bn_scale[c];
+        }
+
+        ggml_cgraph * gf = build_supertonic_vocoder_graph(model, latent_len);
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!allocr) throw std::runtime_error("ggml_gallocr_new failed");
+        if (!ggml_gallocr_reserve(allocr, gf)) {
+            ggml_gallocr_free(allocr);
+            throw std::runtime_error("ggml_gallocr_reserve failed");
+        }
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vocoder_in"), x_in.data(), 0, x_in.size() * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vocoder_bn_scale"), bn_scale.data(), 0, bn_scale.size() * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vocoder_bn_shift"), bn_shift.data(), 0, bn_shift.size() * sizeof(float));
+
+        ggml_backend_graph_compute(model.backend, gf);
+        ggml_tensor * out = ggml_graph_get_tensor(gf, "wav");
+        wav_out = ggml_tensor_to_time_channel(out);
+        ggml_gallocr_free(allocr);
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool supertonic_vocoder_trace_scalar(const supertonic_model & model,
+                                     const float * latent,
+                                     int latent_len,
+                                     std::vector<supertonic_trace_tensor> & trace_out,
+                                     std::string * error) {
+    try {
+        trace_out.clear();
+        const int C_latent = model.hparams.latent_dim;
+        const int factor = model.hparams.ttl_chunk_compress_factor;
+        const int T0 = latent_len * factor;
+        std::vector<float> x = unpack_latent_scalar(model, latent, latent_len);
+        push_trace(trace_out, "unpack", T0, C_latent, x);
+
+        float normalizer_scale = scalar_f32_tensor(model.vocoder.normalizer_scale);
+        f32_tensor mean = read_f32_tensor(model.vocoder.latent_mean);
+        f32_tensor std = read_f32_tensor(model.vocoder.latent_std);
+        for (int t = 0; t < T0; ++t) {
+            for (int c = 0; c < C_latent; ++c) {
+                float v = x[(size_t) t * C_latent + c] / normalizer_scale;
+                x[(size_t) t * C_latent + c] = v * std.data[c] + mean.data[c];
+            }
+        }
+        push_trace(trace_out, "denorm", T0, C_latent, x);
+
+        f32_tensor embed_w = read_f32_tensor(model.vocoder.embed_w);
+        f32_tensor embed_b = read_f32_tensor(model.vocoder.embed_b);
+        std::vector<float> y;
+        conv1d_causal(x, T0, C_latent, embed_w, &embed_b,
+                      (int) embed_w.ne[0], (int) embed_w.ne[2], y);
+        push_trace(trace_out, "embed", T0, (int) embed_w.ne[2], y);
+
+        const int C = (int) embed_w.ne[2];
+        const auto & cw = model.vocoder.convnext[0];
+        f32_tensor dw_w = read_f32_tensor(cw.dw_w);
+        f32_tensor dw_b = read_f32_tensor(cw.dw_b);
+        f32_tensor ln_g = read_f32_tensor(cw.norm_g);
+        f32_tensor ln_b = read_f32_tensor(cw.norm_b);
+        f32_tensor pw1_w = read_f32_tensor(cw.pw1_w);
+        f32_tensor pw1_b = read_f32_tensor(cw.pw1_b);
+        f32_tensor pw2_w = read_f32_tensor(cw.pw2_w);
+        f32_tensor pw2_b = read_f32_tensor(cw.pw2_b);
+        f32_tensor gamma = read_f32_tensor(cw.gamma);
+        std::vector<float> residual = y;
+        std::vector<float> z;
+        depthwise_conv1d_causal(y, T0, C, dw_w, dw_b, (int) dw_w.ne[0], 1, z);
+        push_trace(trace_out, "block0_dw", T0, C, z);
+        layer_norm_channel(z, T0, C, ln_g, ln_b);
+        push_trace(trace_out, "block0_norm", T0, C, z);
+        std::vector<float> h;
+        linear1x1(z, T0, C, pw1_w, &pw1_b, (int) pw1_w.ne[2], h);
+        push_trace(trace_out, "block0_pw1", T0, (int) pw1_w.ne[2], h);
+        for (float & v : h) v = gelu(v);
+        push_trace(trace_out, "block0_gelu", T0, (int) pw1_w.ne[2], h);
+        linear1x1(h, T0, (int) pw1_w.ne[2], pw2_w, &pw2_b, C, z);
+        push_trace(trace_out, "block0_pw2", T0, C, z);
+        for (size_t i = 0; i < z.size(); ++i) {
+            int c = (int)(i % (size_t) C);
+            z[i] = residual[i] + gamma.data[c] * z[i];
+        }
+        push_trace(trace_out, "block0_out", T0, C, z);
+
+        for (int i = 1; i < 10; ++i) {
+            convnext_block(model, i, z, T0, C);
+            push_trace(trace_out, "block" + std::to_string(i) + "_out", T0, C, z);
+        }
+
+        batch_norm_channel(
+            z, T0, C,
+            read_f32_tensor(model.vocoder.final_norm_g),
+            read_f32_tensor(model.vocoder.final_norm_b),
+            read_f32_tensor(model.vocoder.final_norm_running_mean),
+            read_f32_tensor(model.vocoder.final_norm_running_var));
+        push_trace(trace_out, "final_norm", T0, C, z);
+
+        f32_tensor h1_w = read_f32_tensor(model.vocoder.head1_w);
+        f32_tensor h1_b = read_f32_tensor(model.vocoder.head1_b);
+        conv1d_causal(z, T0, C, h1_w, &h1_b, (int) h1_w.ne[0], (int) h1_w.ne[2], h);
+        push_trace(trace_out, "head1", T0, (int) h1_w.ne[2], h);
+        float prelu = scalar_f32_tensor(model.vocoder.head_prelu);
+        for (float & v : h) if (v < 0.0f) v *= prelu;
+        push_trace(trace_out, "prelu", T0, (int) h1_w.ne[2], h);
+        f32_tensor h2_w = read_f32_tensor(model.vocoder.head2_w);
+        linear1x1(h, T0, (int) h1_w.ne[2], h2_w, nullptr, (int) h2_w.ne[2], z);
+        push_trace(trace_out, "wav", T0, (int) h2_w.ne[2], z);
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool supertonic_vocoder_trace_ggml(const supertonic_model & model,
+                                   const float * latent,
+                                   int latent_len,
+                                   std::vector<supertonic_trace_tensor> & trace_out,
+                                   std::string * error) {
+    try {
+        trace_out.clear();
+        const int C_latent = model.hparams.latent_dim;
+        const int factor = model.hparams.ttl_chunk_compress_factor;
+        const int T0 = latent_len * factor;
+        constexpr int MAX_NODES = 512;
+        static size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
+                                 ggml_graph_overhead_custom(MAX_NODES, false);
+        thread_local std::vector<uint8_t> buf(buf_size);
+        ggml_init_params p = { buf_size, buf.data(), true };
+        ggml_context * ctx = ggml_init(p);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+
+        ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T0, C_latent);
+        ggml_set_name(x_in, "unpack");
+        ggml_set_input(x_in);
+
+        const float normalizer_scale = scalar_f32_tensor(model.vocoder.normalizer_scale);
+        ggml_tensor * x = ggml_scale(ctx, x_in, 1.0f / normalizer_scale);
+        x = ggml_mul(ctx, x, repeat_like(ctx, model.vocoder.latent_std, x));
+        x = ggml_add(ctx, x, repeat_like(ctx, model.vocoder.latent_mean, x));
+        ggml_set_name(x, "denorm");
+        ggml_set_output(x);
+        ggml_build_forward_expand(gf, x);
+
+        ggml_tensor * embed = conv1d_causal_ggml(ctx, x, model.vocoder.embed_w, model.vocoder.embed_b);
+        ggml_set_name(embed, "embed");
+        ggml_set_output(embed);
+        ggml_build_forward_expand(gf, embed);
+
+        const auto & cw = model.vocoder.convnext[0];
+        ggml_tensor * dw = depthwise_conv1d_causal_ggml(ctx, embed, cw.dw_w, cw.dw_b, 1);
+        ggml_set_name(dw, "block0_dw");
+        ggml_set_output(dw);
+        ggml_build_forward_expand(gf, dw);
+        ggml_tensor * norm = layer_norm_channel_ggml(ctx, dw, cw.norm_g, cw.norm_b);
+        ggml_set_name(norm, "block0_norm");
+        ggml_set_output(norm);
+        ggml_build_forward_expand(gf, norm);
+        ggml_tensor * pw1 = conv1d_causal_ggml(ctx, norm, cw.pw1_w, cw.pw1_b);
+        ggml_set_name(pw1, "block0_pw1");
+        ggml_set_output(pw1);
+        ggml_build_forward_expand(gf, pw1);
+        ggml_tensor * gelu0 = ggml_gelu_erf(ctx, pw1);
+        ggml_set_name(gelu0, "block0_gelu");
+        ggml_set_output(gelu0);
+        ggml_build_forward_expand(gf, gelu0);
+        ggml_tensor * pw2 = conv1d_causal_ggml(ctx, gelu0, cw.pw2_w, cw.pw2_b);
+        ggml_set_name(pw2, "block0_pw2");
+        ggml_set_output(pw2);
+        ggml_build_forward_expand(gf, pw2);
+        ggml_tensor * out0 = ggml_add(ctx, embed, ggml_mul(ctx, pw2, repeat_like(ctx, cw.gamma, pw2)));
+        ggml_set_name(out0, "block0_out");
+        ggml_set_output(out0);
+        ggml_build_forward_expand(gf, out0);
+
+        ggml_tensor * cur = out0;
+        for (int i = 1; i < 10; ++i) {
+            cur = convnext_block_ggml(ctx, model.vocoder.convnext[(size_t) i], cur, i);
+            ggml_set_name(cur, ("block" + std::to_string(i) + "_out").c_str());
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
+
+        ggml_tensor * bn_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+        ggml_set_name(bn_scale, "trace_bn_scale");
+        ggml_set_input(bn_scale);
+        ggml_tensor * bn_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+        ggml_set_name(bn_shift, "trace_bn_shift");
+        ggml_set_input(bn_shift);
+        cur = ggml_mul(ctx, cur, repeat_like(ctx, bn_scale, cur));
+        cur = ggml_add(ctx, cur, repeat_like(ctx, bn_shift, cur));
+        ggml_set_name(cur, "final_norm");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+        cur = conv1d_causal_ggml(ctx, cur, model.vocoder.head1_w, model.vocoder.head1_b);
+        ggml_set_name(cur, "head1");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+        cur = ggml_leaky_relu(ctx, cur, scalar_f32_tensor(model.vocoder.head_prelu), false);
+        ggml_set_name(cur, "prelu");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+        cur = conv1d_causal_ggml(ctx, cur, model.vocoder.head2_w, nullptr);
+        ggml_set_name(cur, "wav");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!allocr) throw std::runtime_error("ggml_gallocr_new failed");
+        if (!ggml_gallocr_reserve(allocr, gf)) {
+            ggml_gallocr_free(allocr);
+            throw std::runtime_error("ggml_gallocr_reserve failed");
+        }
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        std::vector<float> x_host = unpack_latent_ggml_layout(model, latent, latent_len);
+        ggml_backend_tensor_set(x_in, x_host.data(), 0, x_host.size() * sizeof(float));
+        f32_tensor gamma = read_f32_tensor(model.vocoder.final_norm_g);
+        f32_tensor beta = read_f32_tensor(model.vocoder.final_norm_b);
+        f32_tensor mean = read_f32_tensor(model.vocoder.final_norm_running_mean);
+        f32_tensor var = read_f32_tensor(model.vocoder.final_norm_running_var);
+        std::vector<float> bn_scale_host(512), bn_shift_host(512);
+        for (int c = 0; c < 512; ++c) {
+            bn_scale_host[c] = gamma.data[c] / std::sqrt(var.data[c] + 1e-5f);
+            bn_shift_host[c] = beta.data[c] - mean.data[c] * bn_scale_host[c];
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "trace_bn_scale"), bn_scale_host.data(), 0, bn_scale_host.size() * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "trace_bn_shift"), bn_shift_host.data(), 0, bn_shift_host.size() * sizeof(float));
+        ggml_backend_graph_compute(model.backend, gf);
+
+        trace_out.push_back({"unpack", {T0, C_latent}, unpack_latent_scalar(model, latent, latent_len)});
+        trace_out.push_back({"denorm", {T0, C_latent}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "denorm"))});
+        trace_out.push_back({"embed", {T0, (int) model.vocoder.embed_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "embed"))});
+        trace_out.push_back({"block0_dw", {T0, (int) model.vocoder.embed_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "block0_dw"))});
+        trace_out.push_back({"block0_norm", {T0, (int) model.vocoder.embed_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "block0_norm"))});
+        trace_out.push_back({"block0_pw1", {T0, (int) model.vocoder.convnext[0].pw1_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "block0_pw1"))});
+        trace_out.push_back({"block0_gelu", {T0, (int) model.vocoder.convnext[0].pw1_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "block0_gelu"))});
+        trace_out.push_back({"block0_pw2", {T0, (int) model.vocoder.embed_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "block0_pw2"))});
+        trace_out.push_back({"block0_out", {T0, (int) model.vocoder.embed_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "block0_out"))});
+        for (int i = 1; i < 10; ++i) {
+            trace_out.push_back({"block" + std::to_string(i) + "_out", {T0, (int) model.vocoder.embed_w->ne[2]},
+                                 ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, ("block" + std::to_string(i) + "_out").c_str()))});
+        }
+        trace_out.push_back({"final_norm", {T0, (int) model.vocoder.embed_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "final_norm"))});
+        trace_out.push_back({"head1", {T0, (int) model.vocoder.head1_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "head1"))});
+        trace_out.push_back({"prelu", {T0, (int) model.vocoder.head1_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "prelu"))});
+        trace_out.push_back({"wav", {T0, (int) model.vocoder.head2_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "wav"))});
+        ggml_gallocr_free(allocr);
         if (error) error->clear();
         return true;
     } catch (const std::exception & e) {

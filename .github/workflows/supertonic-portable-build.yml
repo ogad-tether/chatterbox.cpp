@@ -1,0 +1,45 @@
+name: Supertonic portable CPU build
+
+on:
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "include/**"
+      - "src/supertonic_*.cpp"
+      - "src/supertonic_internal.h"
+      - "scripts/convert-supertonic2-to-gguf.py"
+      - "scripts/dump-supertonic-reference.py"
+      - ".github/workflows/supertonic-portable-build.yml"
+  push:
+    branches:
+      - main
+      - multilingual_merged
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        build_type: [Release]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DTTS_CPP_BUILD_LIBRARY=ON
+          -DTTS_CPP_BUILD_EXECUTABLES=ON
+          -DTTS_CPP_BUILD_TESTS=ON
+          -DTTS_CPP_USE_SYSTEM_GGML=OFF
+
+      - name: Build Supertonic targets
+        run: >
+          cmake --build build --config ${{ matrix.build_type }}
+          --target supertonic-cli test-supertonic-preprocess test-supertonic-vocoder

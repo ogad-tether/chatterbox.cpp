@@ -220,6 +220,13 @@ if (TTS_CPP_BUILD_TESTS)
     target_link_libraries(test-supertonic-vocoder PRIVATE ggml)
     target_include_directories(test-supertonic-vocoder PRIVATE ggml/include src)
 
+    add_executable(test-supertonic-vocoder-trace
+        src/test_supertonic_vocoder_trace.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_vocoder.cpp)
+    target_link_libraries(test-supertonic-vocoder-trace PRIVATE ggml)
+    target_include_directories(test-supertonic-vocoder-trace PRIVATE ggml/include src)
+
     add_executable(test-supertonic-duration
         src/test_supertonic_duration.cpp
         src/supertonic_gguf.cpp
@@ -240,6 +247,13 @@ if (TTS_CPP_BUILD_TESTS)
         src/supertonic_vector_estimator.cpp)
     target_link_libraries(test-supertonic-vector PRIVATE ggml)
     target_include_directories(test-supertonic-vector PRIVATE ggml/include src)
+
+    add_executable(test-supertonic-vector-trace
+        src/test_supertonic_vector_trace.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_vector_estimator.cpp)
+    target_link_libraries(test-supertonic-vector-trace PRIVATE ggml)
+    target_include_directories(test-supertonic-vector-trace PRIVATE ggml/include src)
 
     add_executable(test-supertonic-pipeline
         src/test_supertonic_pipeline.cpp

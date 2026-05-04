@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -12,6 +13,8 @@
 namespace tts_cpp::supertonic::detail {
 
 struct supertonic_hparams {
+    std::string arch = "supertonic2";
+    std::string ftype = "f32";
     int sample_rate = 44100;
     int base_chunk_size = 512;
     int ttl_chunk_compress_factor = 6;
@@ -29,8 +32,44 @@ struct supertonic_voice_style {
     ggml_tensor * dp  = nullptr; // (16, 8, 1) in ggml axis order for JSON (1, 8, 16)
 };
 
+struct supertonic_vocoder_convnext_weights {
+    ggml_tensor * dw_w = nullptr;
+    ggml_tensor * dw_b = nullptr;
+    ggml_tensor * norm_g = nullptr;
+    ggml_tensor * norm_b = nullptr;
+    ggml_tensor * pw1_w = nullptr;
+    ggml_tensor * pw1_b = nullptr;
+    ggml_tensor * pw2_w = nullptr;
+    ggml_tensor * pw2_b = nullptr;
+    ggml_tensor * gamma = nullptr;
+};
+
+struct supertonic_vocoder_weights {
+    ggml_tensor * normalizer_scale = nullptr;
+    ggml_tensor * latent_mean = nullptr;
+    ggml_tensor * latent_std = nullptr;
+    ggml_tensor * embed_w = nullptr;
+    ggml_tensor * embed_b = nullptr;
+    std::array<supertonic_vocoder_convnext_weights, 10> convnext{};
+    ggml_tensor * final_norm_g = nullptr;
+    ggml_tensor * final_norm_b = nullptr;
+    ggml_tensor * final_norm_running_mean = nullptr;
+    ggml_tensor * final_norm_running_var = nullptr;
+    ggml_tensor * head1_w = nullptr;
+    ggml_tensor * head1_b = nullptr;
+    ggml_tensor * head_prelu = nullptr;
+    ggml_tensor * head2_w = nullptr;
+};
+
+struct supertonic_trace_tensor {
+    std::string name;
+    std::vector<int64_t> shape;
+    std::vector<float> data;
+};
+
 struct supertonic_model {
     supertonic_hparams hparams;
+    supertonic_vocoder_weights vocoder;
 
     ggml_backend_t backend = nullptr;
     ggml_context * ctx_w = nullptr;
@@ -45,7 +84,10 @@ struct supertonic_model {
     std::string tts_json;
 };
 
-bool load_supertonic_gguf(const std::string & path, supertonic_model & model);
+bool load_supertonic_gguf(const std::string & path,
+                          supertonic_model & model,
+                          int n_gpu_layers = 0,
+                          bool verbose = false);
 void free_supertonic_model(supertonic_model & model);
 
 ggml_tensor * require_tensor(const supertonic_model & model, const std::string & name);
@@ -66,6 +108,24 @@ bool supertonic_vocoder_forward_cpu(const supertonic_model & model,
                                     int latent_len,
                                     std::vector<float> & wav_out,
                                     std::string * error = nullptr);
+
+bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
+                                     const float * latent,
+                                     int latent_len,
+                                     std::vector<float> & wav_out,
+                                     std::string * error = nullptr);
+
+bool supertonic_vocoder_trace_scalar(const supertonic_model & model,
+                                     const float * latent,
+                                     int latent_len,
+                                     std::vector<supertonic_trace_tensor> & trace_out,
+                                     std::string * error = nullptr);
+
+bool supertonic_vocoder_trace_ggml(const supertonic_model & model,
+                                   const float * latent,
+                                   int latent_len,
+                                   std::vector<supertonic_trace_tensor> & trace_out,
+                                   std::string * error = nullptr);
 
 bool supertonic_duration_forward_cpu(const supertonic_model & model,
                                      const int64_t * text_ids,
@@ -92,5 +152,13 @@ bool supertonic_vector_step_cpu(const supertonic_model & model,
                                 int total_steps,
                                 std::vector<float> & next_latent_out,
                                 std::string * error = nullptr);
+
+bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
+                                       const float * noisy_latent,
+                                       const float * latent_mask,
+                                       int latent_len,
+                                       std::vector<supertonic_trace_tensor> & scalar_trace,
+                                       std::vector<supertonic_trace_tensor> & ggml_trace,
+                                       std::string * error = nullptr);
 
 } // namespace tts_cpp::supertonic::detail

@@ -7,11 +7,14 @@ namespace tts_cpp::supertonic {
 
 struct EngineOptions {
     std::string model_gguf_path;
-    std::string voice = "F1";
+    // Empty / zero values use the defaults stored in the GGUF metadata.
+    std::string voice;
     std::string language = "en";
-    int steps = 5;
-    float speed = 1.05f;
+    int steps = 0;
+    float speed = 0.0f;
     int seed = 42;
+    int n_threads = 0;
+    int n_gpu_layers = 0;
     // Optional path to a .npy file containing the initial noise tensor of shape
     // [1, latent_channels, latent_len] (float32).  When provided, latent_len is
     // taken from the npy file (overriding the duration-predicted length) and

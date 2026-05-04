@@ -3,6 +3,19 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+#ifdef GGML_USE_OPENCL
+#include "ggml-opencl.h"
+#endif
+
 #include <stdexcept>
 
 namespace tts_cpp::supertonic::detail {
@@ -50,6 +63,43 @@ ggml_tensor * get_tensor_or_null(const supertonic_model & model, const std::stri
     return it == model.tensors.end() ? nullptr : it->second;
 }
 
+ggml_backend_t init_supertonic_backend(int n_gpu_layers, bool verbose) {
+#ifdef GGML_USE_CUDA
+    if (n_gpu_layers > 0) {
+        ggml_backend_t b = ggml_backend_cuda_init(0);
+        if (b) { if (verbose) fprintf(stderr, "supertonic: using CUDA backend\n"); return b; }
+    }
+#endif
+#ifdef GGML_USE_METAL
+    if (n_gpu_layers > 0) {
+        ggml_backend_t b = ggml_backend_metal_init();
+        if (b) { if (verbose) fprintf(stderr, "supertonic: using Metal backend\n"); return b; }
+    }
+#endif
+#ifdef GGML_USE_VULKAN
+    if (n_gpu_layers > 0) {
+        ggml_backend_t b = ggml_backend_vk_init(0);
+        if (b) {
+            if (verbose) fprintf(stderr, "supertonic: using Vulkan backend\n");
+            return b;
+        }
+    }
+#endif
+#ifdef GGML_USE_OPENCL
+    if (n_gpu_layers > 0) {
+        ggml_backend_reg_t reg = ggml_backend_opencl_reg();
+        if (reg && ggml_backend_reg_dev_count(reg) > 0) {
+            ggml_backend_t b = ggml_backend_opencl_init();
+            if (b) { if (verbose) fprintf(stderr, "supertonic: using OpenCL backend\n"); return b; }
+        }
+    }
+#endif
+    ggml_backend_t b = ggml_backend_cpu_init();
+    if (!b) throw std::runtime_error("ggml_backend_cpu_init failed");
+    if (verbose) fprintf(stderr, "supertonic: using CPU backend\n");
+    return b;
+}
+
 } // namespace
 
 ggml_tensor * require_tensor(const supertonic_model & model, const std::string & name) {
@@ -66,7 +116,40 @@ ggml_tensor * require_source_tensor(const supertonic_model & model, const std::s
     return it->second;
 }
 
-bool load_supertonic_gguf(const std::string & path, supertonic_model & model) {
+static void bind_vocoder_weights(supertonic_model & model) {
+    auto & v = model.vocoder;
+    v.normalizer_scale = require_source_tensor(model, "vocoder:tts.ttl.normalizer.scale");
+    v.latent_mean = require_source_tensor(model, "vocoder:tts.ae.latent_mean");
+    v.latent_std = require_source_tensor(model, "vocoder:tts.ae.latent_std");
+    v.embed_w = require_source_tensor(model, "vocoder:onnx::Conv_1440");
+    v.embed_b = require_source_tensor(model, "vocoder:onnx::Conv_1441");
+    for (int i = 0; i < 10; ++i) {
+        const std::string p = "vocoder:tts.ae.decoder.convnext." + std::to_string(i);
+        auto & c = v.convnext[(size_t) i];
+        c.dw_w = require_source_tensor(model, p + ".dwconv.net.weight");
+        c.dw_b = require_source_tensor(model, p + ".dwconv.net.bias");
+        c.norm_g = require_source_tensor(model, p + ".norm.norm.weight");
+        c.norm_b = require_source_tensor(model, p + ".norm.norm.bias");
+        c.pw1_w = require_source_tensor(model, p + ".pwconv1.weight");
+        c.pw1_b = require_source_tensor(model, p + ".pwconv1.bias");
+        c.pw2_w = require_source_tensor(model, p + ".pwconv2.weight");
+        c.pw2_b = require_source_tensor(model, p + ".pwconv2.bias");
+        c.gamma = require_source_tensor(model, p + ".gamma");
+    }
+    v.final_norm_g = require_source_tensor(model, "vocoder:tts.ae.decoder.final_norm.norm.weight");
+    v.final_norm_b = require_source_tensor(model, "vocoder:tts.ae.decoder.final_norm.norm.bias");
+    v.final_norm_running_mean = require_source_tensor(model, "vocoder:tts.ae.decoder.final_norm.norm.running_mean");
+    v.final_norm_running_var = require_source_tensor(model, "vocoder:tts.ae.decoder.final_norm.norm.running_var");
+    v.head1_w = require_source_tensor(model, "vocoder:tts.ae.decoder.head.layer1.net.weight");
+    v.head1_b = require_source_tensor(model, "vocoder:tts.ae.decoder.head.layer1.net.bias");
+    v.head_prelu = require_source_tensor(model, "vocoder:onnx::PRelu_1505");
+    v.head2_w = require_source_tensor(model, "vocoder:tts.ae.decoder.head.layer2.weight");
+}
+
+bool load_supertonic_gguf(const std::string & path,
+                          supertonic_model & model,
+                          int n_gpu_layers,
+                          bool verbose) {
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gp);
@@ -81,6 +164,8 @@ bool load_supertonic_gguf(const std::string & path, supertonic_model & model) {
             throw std::runtime_error("unexpected supertonic.arch: " + arch);
         }
 
+        model.hparams.arch = arch;
+        model.hparams.ftype = get_string(gguf_ctx, "supertonic.ftype", "f32");
         model.hparams.sample_rate = (int) get_u32(gguf_ctx, "supertonic.sample_rate");
         model.hparams.base_chunk_size = (int) get_u32(gguf_ctx, "supertonic.base_chunk_size");
         model.hparams.ttl_chunk_compress_factor =
@@ -98,8 +183,7 @@ bool load_supertonic_gguf(const std::string & path, supertonic_model & model) {
         model.languages = get_string_array(gguf_ctx, "supertonic.languages");
         model.tts_json = get_string(gguf_ctx, "supertonic.tts_json");
 
-        model.backend = ggml_backend_cpu_init();
-        if (!model.backend) throw std::runtime_error("ggml_backend_cpu_init failed");
+        model.backend = init_supertonic_backend(n_gpu_layers, verbose);
 
         const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);
         ggml_init_params params = {
@@ -152,6 +236,8 @@ bool load_supertonic_gguf(const std::string & path, supertonic_model & model) {
             voice.dp  = require_tensor(model, "supertonic/voices/" + voice_name + "/dp");
             model.voices[voice_name] = voice;
         }
+
+        bind_vocoder_weights(model);
     } catch (const std::exception & e) {
         fprintf(stderr, "load_supertonic_gguf: %s\n", e.what());
         gguf_free(gguf_ctx);
@@ -180,6 +266,7 @@ void free_supertonic_model(supertonic_model & model) {
     }
     model.tensors.clear();
     model.source_tensors.clear();
+    model.vocoder = {};
     model.voices.clear();
     model.unicode_indexer.clear();
     model.languages.clear();

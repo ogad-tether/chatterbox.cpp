@@ -47,6 +47,23 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "supertonic vocoder parity PASS\n");
             }
         }
+        std::vector<float> wav_ggml;
+        if (!supertonic_vocoder_forward_ggml(model, npy_as_f32(latent_npy), latent_len, wav_ggml, &error)) {
+            throw std::runtime_error("vocoder ggml failed: " + error);
+        }
+        if (wav_ggml.size() != wav_npy.n_elements()) {
+            fprintf(stderr, "wav ggml size mismatch: got %zu ref %zu\n", wav_ggml.size(), wav_npy.n_elements());
+            rc = 1;
+        } else {
+            compare_stats s = compare_f32(wav_ggml.data(), npy_as_f32(wav_npy), wav_ggml.size());
+            print_compare("supertonic_vocoder_ggml", s);
+            if (s.max_abs_err > 2e-3) {
+                fprintf(stderr, "supertonic vocoder GGML parity FAILED\n");
+                rc = 1;
+            } else {
+                fprintf(stderr, "supertonic vocoder GGML parity PASS\n");
+            }
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "test failed: %s\n", e.what());
         rc = 1;

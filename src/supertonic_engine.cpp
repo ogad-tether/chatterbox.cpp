@@ -25,17 +25,26 @@ std::vector<float> read_tensor_f32(ggml_tensor * t) {
 SynthesisResult synthesize(const EngineOptions & opts, const std::string & text) {
     if (opts.model_gguf_path.empty()) throw std::runtime_error("Supertonic model_gguf_path is required");
     if (text.empty()) throw std::runtime_error("Supertonic text is empty");
-    if (opts.steps <= 0) throw std::runtime_error("Supertonic steps must be positive");
-    if (opts.speed <= 0.0f) throw std::runtime_error("Supertonic speed must be positive");
 
     supertonic_model model;
-    if (!load_supertonic_gguf(opts.model_gguf_path, model)) {
+    if (!load_supertonic_gguf(opts.model_gguf_path, model, opts.n_gpu_layers, false)) {
         throw std::runtime_error("failed to load Supertonic GGUF: " + opts.model_gguf_path);
+    }
+    if (model.hparams.ftype != "f32") {
+        free_supertonic_model(model);
+        throw std::runtime_error("Supertonic scalar runtime currently requires f32 GGUF; "
+                                 "use f16/q8_0 only with the GGML graph backend once enabled");
     }
 
     try {
-        auto vit = model.voices.find(opts.voice);
-        if (vit == model.voices.end()) throw std::runtime_error("unknown Supertonic voice: " + opts.voice);
+        const std::string voice = opts.voice.empty() ? model.hparams.default_voice : opts.voice;
+        const int steps = opts.steps > 0 ? opts.steps : model.hparams.default_steps;
+        const float speed = opts.speed > 0.0f ? opts.speed : model.hparams.default_speed;
+        if (steps <= 0) throw std::runtime_error("Supertonic steps must be positive");
+        if (speed <= 0.0f) throw std::runtime_error("Supertonic speed must be positive");
+
+        auto vit = model.voices.find(voice);
+        if (vit == model.voices.end()) throw std::runtime_error("unknown Supertonic voice: " + voice);
         std::vector<float> style_ttl = read_tensor_f32(vit->second.ttl);
         std::vector<float> style_dp  = read_tensor_f32(vit->second.dp);
 
@@ -52,7 +61,7 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
                                              style_dp.data(), duration_raw, &error)) {
             throw std::runtime_error("duration failed: " + error);
         }
-        const float duration_s = duration_raw / opts.speed;
+        const float duration_s = duration_raw / speed;
         const int sample_rate = model.hparams.sample_rate;
         const int chunk = model.hparams.base_chunk_size * model.hparams.ttl_chunk_compress_factor;
         int wav_len = (int) (duration_s * sample_rate);
@@ -85,18 +94,18 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
         std::vector<float> latent_mask((size_t) latent_len, 1.0f);
 
         std::vector<float> next;
-        for (int step = 0; step < opts.steps; ++step) {
+        for (int step = 0; step < steps; ++step) {
             if (!supertonic_vector_step_cpu(model, latent.data(), latent_len,
                                             text_emb.data(), (int) text_ids.size(),
                                             style_ttl.data(), latent_mask.data(),
-                                            step, opts.steps, next, &error)) {
+                                            step, steps, next, &error)) {
                 throw std::runtime_error("vector estimator failed: " + error);
             }
             latent.swap(next);
         }
 
         std::vector<float> wav_full;
-        if (!supertonic_vocoder_forward_cpu(model, latent.data(), latent_len, wav_full, &error)) {
+        if (!supertonic_vocoder_forward_ggml(model, latent.data(), latent_len, wav_full, &error)) {
             throw std::runtime_error("vocoder failed: " + error);
         }
 
