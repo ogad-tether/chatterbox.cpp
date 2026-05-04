@@ -523,6 +523,69 @@ void speech_prompted_attention(const supertonic_model & m, int idx,
     dense_time_matmul(merged, L, C, out_w, out_b, C, out_lc);
 }
 
+struct speech_attention_cache {
+    const supertonic_model * model = nullptr;
+    int idx = -1;
+    int L = 0;
+    int Lctx = 0;
+    std::string out_w_source;
+    std::string out_b_source;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * q = nullptr;
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
+};
+
+void free_speech_attention_cache(speech_attention_cache & cache) {
+    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void build_speech_attention_cache(speech_attention_cache & cache,
+                                  const supertonic_model & m,
+                                  int idx,
+                                  int L,
+                                  int Lctx,
+                                  const std::string & out_w_source,
+                                  const std::string & out_b_source) {
+    free_speech_attention_cache(cache);
+    cache.model = &m;
+    cache.idx = idx;
+    cache.L = L;
+    cache.Lctx = Lctx;
+    cache.out_w_source = out_w_source;
+    cache.out_b_source = out_b_source;
+    constexpr int NODES = 256;
+    const size_t buf_size = ggml_tensor_overhead() * NODES + ggml_graph_overhead_custom(NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params gp = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, NODES, false);
+    cache.q = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, 128, L, 2);
+    ggml_set_name(cache.q, "speech_attn_q_dlh"); ggml_set_input(cache.q);
+    cache.k = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, 128, Lctx, 2);
+    ggml_set_name(cache.k, "speech_attn_k_dlh"); ggml_set_input(cache.k);
+    cache.v = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, 128, Lctx, 2);
+    ggml_set_name(cache.v, "speech_attn_v_dlh"); ggml_set_input(cache.v);
+    ggml_tensor * attn = ggml_flash_attn_ext(cache.ctx, cache.q, cache.k, cache.v, nullptr, 1.0f / 16.0f, 0.0f, 0.0f);
+    attn = ggml_reshape_2d(cache.ctx, attn, 256, L);
+    ggml_tensor * ctx_tc = ggml_cont(cache.ctx, ggml_transpose(cache.ctx, attn));
+    ggml_tensor * out = dense_matmul_time_ggml(cache.ctx, ctx_tc,
+        require_source_tensor(m, out_w_source),
+        require_source_tensor(m, out_b_source));
+    ggml_set_name(out, "speech_attn_out"); ggml_set_output(out); ggml_build_forward_expand(cache.gf, out);
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new speech attention cache failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve speech attention cache failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+}
+
 void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
                                     const std::vector<float> & x_lc, int L,
                                     const float * style_ttl,
@@ -547,13 +610,6 @@ void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
     ggml_set_name(x_in, "speech_attn_x"); ggml_set_input(x_in);
     ggml_tensor * style_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Lctx, C);
     ggml_set_name(style_in, "speech_attn_style"); ggml_set_input(style_in);
-    ggml_tensor * q_dlh = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, half, L, 2);
-    ggml_set_name(q_dlh, "speech_attn_q_dlh"); ggml_set_input(q_dlh);
-    ggml_tensor * k_dlh = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, half, Lctx, 2);
-    ggml_set_name(k_dlh, "speech_attn_k_dlh"); ggml_set_input(k_dlh);
-    ggml_tensor * v_dlh = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, half, Lctx, 2);
-    ggml_set_name(v_dlh, "speech_attn_v_dlh"); ggml_set_input(v_dlh);
-
     ggml_tensor * q = dense_matmul_time_ggml(ctx, x_in,
         require_source_tensor(m, q_w),
         require_source_tensor(m, p + ".W_query.linear.bias"));
@@ -562,13 +618,6 @@ void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
         require_source_tensor(m, v_w),
         require_source_tensor(m, p + ".W_value.linear.bias"));
     ggml_set_name(v, "speech_attn_v"); ggml_set_output(v); ggml_build_forward_expand(gf, v);
-    ggml_tensor * attn = ggml_flash_attn_ext(ctx, q_dlh, k_dlh, v_dlh, nullptr, 1.0f / 16.0f, 0.0f, 0.0f);
-    attn = ggml_reshape_2d(ctx, attn, C, L);
-    ggml_tensor * ctx_tc = ggml_cont(ctx, ggml_transpose(ctx, attn));
-    ggml_tensor * out = dense_matmul_time_ggml(ctx, ctx_tc,
-        require_source_tensor(m, o_w),
-        require_source_tensor(m, p + ".out_fc.linear.bias"));
-    ggml_set_name(out, "speech_attn_out"); ggml_set_output(out); ggml_build_forward_expand(gf, out);
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     if (!allocr) throw std::runtime_error("ggml_gallocr_new speech text attention failed");
@@ -601,11 +650,17 @@ void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
             }
         }
     }
-    ggml_backend_tensor_set(q_dlh, q_pack.data(), 0, q_pack.size()*sizeof(float));
-    ggml_backend_tensor_set(k_dlh, k_pack.data(), 0, k_pack.size()*sizeof(float));
-    ggml_backend_tensor_set(v_dlh, v_pack.data(), 0, v_pack.size()*sizeof(float));
-    supertonic_graph_compute(m, gf);
-    out_lc = tensor_to_time_channel(ggml_graph_get_tensor(gf, "speech_attn_out"));
+    thread_local speech_attention_cache caches[2];
+    speech_attention_cache & cache = caches[idx];
+    if (cache.model != &m || cache.idx != idx || cache.L != L || cache.Lctx != Lctx ||
+        cache.out_w_source != o_w || cache.out_b_source != p + ".out_fc.linear.bias") {
+        build_speech_attention_cache(cache, m, idx, L, Lctx, o_w, p + ".out_fc.linear.bias");
+    }
+    ggml_backend_tensor_set(cache.q, q_pack.data(), 0, q_pack.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.k, k_pack.data(), 0, k_pack.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.v, v_pack.data(), 0, v_pack.size()*sizeof(float));
+    supertonic_graph_compute(m, cache.gf);
+    out_lc = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "speech_attn_out"));
     ggml_gallocr_free(allocr);
 }
 
