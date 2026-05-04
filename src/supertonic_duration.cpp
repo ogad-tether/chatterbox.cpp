@@ -408,18 +408,18 @@ bool supertonic_duration_forward_cpu(const supertonic_model & model,
 static bool duration_sentence_proj_ggml_impl(const supertonic_model & model,
                                              const int64_t * text_ids,
                                              int text_len,
-                                             std::vector<supertonic_trace_tensor> & scalar_trace,
-                                             std::vector<supertonic_trace_tensor> & ggml_trace,
+                                             std::vector<supertonic_trace_tensor> * scalar_trace,
+                                             std::vector<supertonic_trace_tensor> * ggml_trace,
                                              std::string * error,
                                              bool include_scalar_trace,
                                              bool include_ggml_trace,
                                              std::vector<float> * sentence_proj_out) {
     try {
-        scalar_trace.clear();
-        ggml_trace.clear();
+        if (scalar_trace) scalar_trace->clear();
+        if (ggml_trace) ggml_trace->clear();
         const int C = 64;
         const int L = text_len + 1;
-#define PUSH_DURATION_GGML(...) do { if (include_ggml_trace) ggml_trace.push_back(supertonic_trace_tensor __VA_ARGS__); } while (0)
+#define PUSH_DURATION_GGML(...) do { if (include_ggml_trace && ggml_trace) ggml_trace->push_back(supertonic_trace_tensor __VA_ARGS__); } while (0)
         f32_tensor emb = read_f32(model, "duration:tts.dp.sentence_encoder.text_embedder.char_embedder.weight");
         f32_tensor sentence = read_f32(model, "duration:tts.dp.sentence_encoder.sentence_token");
 
@@ -430,14 +430,14 @@ static bool duration_sentence_proj_ggml_impl(const supertonic_model & model,
             if (id < 0 || id >= emb.ne[1]) throw std::runtime_error("text id out of range");
             for (int c = 0; c < C; ++c) x[(size_t)(t + 1)*C + c] = emb.data[(size_t)id*C + c];
         }
-        if (include_scalar_trace) {
-        push_trace(scalar_trace, "duration_embed", L, C, x);
+        if (include_scalar_trace && scalar_trace) {
+        push_trace(*scalar_trace, "duration_embed", L, C, x);
 
         std::vector<float> cur = x;
         for (int i = 0; i < 6; ++i) {
             const std::string p = "duration:tts.dp.sentence_encoder.convnext.convnext." + std::to_string(i);
             convnext_block(model, p, cur, L, C);
-            push_trace(scalar_trace, "duration_convnext" + std::to_string(i), L, C, cur);
+            push_trace(*scalar_trace, "duration_convnext" + std::to_string(i), L, C, cur);
         }
         std::vector<float> q0, k0, v0;
         f32_tensor q0_w = read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.attn_layers.0.conv_q.weight");
@@ -449,59 +449,59 @@ static bool duration_sentence_proj_ggml_impl(const supertonic_model & model,
         linear1x1(cur, L, C, q0_w, &q0_b, C, q0);
         linear1x1(cur, L, C, k0_w, &k0_b, C, k0);
         linear1x1(cur, L, C, v0_w, &v0_b, C, v0);
-        push_trace(scalar_trace, "duration_attn0_q", L, C, q0);
-        push_trace(scalar_trace, "duration_attn0_k", L, C, k0);
-        push_trace(scalar_trace, "duration_attn0_v", L, C, v0);
+        push_trace(*scalar_trace, "duration_attn0_q", L, C, q0);
+        push_trace(*scalar_trace, "duration_attn0_k", L, C, k0);
+        push_trace(*scalar_trace, "duration_attn0_v", L, C, v0);
         std::vector<float> attn0_out = cur;
         self_attention(model, 0, attn0_out, L, C);
-        push_trace(scalar_trace, "duration_attn0_out", L, C, attn0_out);
+        push_trace(*scalar_trace, "duration_attn0_out", L, C, attn0_out);
         for (size_t i = 0; i < attn0_out.size(); ++i) attn0_out[i] += cur[i];
-        push_trace(scalar_trace, "duration_attn0_residual", L, C, attn0_out);
+        push_trace(*scalar_trace, "duration_attn0_residual", L, C, attn0_out);
         layer_norm_channel(
             attn0_out, L, C,
             read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.norm_layers_1.0.norm.weight"),
             read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.norm_layers_1.0.norm.bias"));
-        push_trace(scalar_trace, "duration_attn0_norm", L, C, attn0_out);
+        push_trace(*scalar_trace, "duration_attn0_norm", L, C, attn0_out);
         std::vector<float> ffn0 = attn0_out;
         ffn_block(model, 0, ffn0, L, C);
-        push_trace(scalar_trace, "duration_ffn0_out", L, C, ffn0);
+        push_trace(*scalar_trace, "duration_ffn0_out", L, C, ffn0);
         for (size_t i = 0; i < ffn0.size(); ++i) ffn0[i] += attn0_out[i];
-        push_trace(scalar_trace, "duration_ffn0_residual", L, C, ffn0);
+        push_trace(*scalar_trace, "duration_ffn0_residual", L, C, ffn0);
         layer_norm_channel(
             ffn0, L, C,
             read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.norm_layers_2.0.norm.weight"),
             read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.norm_layers_2.0.norm.bias"));
-        push_trace(scalar_trace, "duration_ffn0_norm", L, C, ffn0);
+        push_trace(*scalar_trace, "duration_ffn0_norm", L, C, ffn0);
 
         std::vector<float> attn1_out = ffn0;
         self_attention(model, 1, attn1_out, L, C);
-        push_trace(scalar_trace, "duration_attn1_out", L, C, attn1_out);
+        push_trace(*scalar_trace, "duration_attn1_out", L, C, attn1_out);
         for (size_t i = 0; i < attn1_out.size(); ++i) attn1_out[i] += ffn0[i];
-        push_trace(scalar_trace, "duration_attn1_residual", L, C, attn1_out);
+        push_trace(*scalar_trace, "duration_attn1_residual", L, C, attn1_out);
         layer_norm_channel(
             attn1_out, L, C,
             read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.norm_layers_1.1.norm.weight"),
             read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.norm_layers_1.1.norm.bias"));
-        push_trace(scalar_trace, "duration_attn1_norm", L, C, attn1_out);
+        push_trace(*scalar_trace, "duration_attn1_norm", L, C, attn1_out);
         std::vector<float> ffn1 = attn1_out;
         ffn_block(model, 1, ffn1, L, C);
-        push_trace(scalar_trace, "duration_ffn1_out", L, C, ffn1);
+        push_trace(*scalar_trace, "duration_ffn1_out", L, C, ffn1);
         for (size_t i = 0; i < ffn1.size(); ++i) ffn1[i] += attn1_out[i];
-        push_trace(scalar_trace, "duration_ffn1_residual", L, C, ffn1);
+        push_trace(*scalar_trace, "duration_ffn1_residual", L, C, ffn1);
         layer_norm_channel(
             ffn1, L, C,
             read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.norm_layers_2.1.norm.weight"),
             read_f32(model, "duration:tts.dp.sentence_encoder.attn_encoder.norm_layers_2.1.norm.bias"));
-        push_trace(scalar_trace, "duration_ffn1_norm", L, C, ffn1);
+        push_trace(*scalar_trace, "duration_ffn1_norm", L, C, ffn1);
         for (size_t i = 0; i < ffn1.size(); ++i) ffn1[i] += cur[i];
-        push_trace(scalar_trace, "duration_encoder_out", L, C, ffn1);
+        push_trace(*scalar_trace, "duration_encoder_out", L, C, ffn1);
         std::vector<float> sentence_repr(C);
         for (int c = 0; c < C; ++c) sentence_repr[c] = ffn1[c];
         std::vector<float> projected;
         linear1x1(sentence_repr, 1, C,
                   read_f32(model, "duration:tts.dp.sentence_encoder.proj_out.net.weight"),
                   nullptr, C, projected);
-        push_trace(scalar_trace, "duration_sentence_proj", 1, C, projected);
+        push_trace(*scalar_trace, "duration_sentence_proj", 1, C, projected);
         std::vector<float> combined(192);
         for (int c = 0; c < C; ++c) combined[c] = projected[c];
         for (int i = 0; i < 128; ++i) combined[C + i] = 0.0f;
@@ -510,7 +510,7 @@ static bool duration_sentence_proj_ggml_impl(const supertonic_model & model,
               read_f32(model, "duration:tts.dp.predictor.layers.0.weight"),
               read_f32(model, "duration:tts.dp.predictor.layers.0.bias"),
               192, 128, h);
-        push_trace(scalar_trace, "duration_pred0_no_style", 1, 128, h);
+        push_trace(*scalar_trace, "duration_pred0_no_style", 1, 128, h);
         }
 
         constexpr int MAX_NODES = 512;
@@ -690,7 +690,7 @@ bool supertonic_duration_trace_ggml(const supertonic_model & model,
                                     bool include_scalar_trace,
                                     bool include_ggml_trace,
                                     std::vector<float> * sentence_proj_out) {
-    return duration_sentence_proj_ggml_impl(model, text_ids, text_len, scalar_trace, ggml_trace,
+    return duration_sentence_proj_ggml_impl(model, text_ids, text_len, &scalar_trace, &ggml_trace,
                                            error, include_scalar_trace, include_ggml_trace,
                                            sentence_proj_out);
 }
@@ -705,7 +705,7 @@ bool supertonic_duration_forward_ggml(const supertonic_model & model,
         std::vector<supertonic_trace_tensor> scalar;
         std::vector<supertonic_trace_tensor> ggml;
         std::vector<float> projected;
-        if (!duration_sentence_proj_ggml_impl(model, text_ids, text_len, scalar, ggml, error,
+        if (!duration_sentence_proj_ggml_impl(model, text_ids, text_len, nullptr, nullptr, error,
                                               false, false, &projected)) return false;
         if (projected.size() != 64) throw std::runtime_error("missing duration sentence projection");
         std::vector<float> combined(192);
