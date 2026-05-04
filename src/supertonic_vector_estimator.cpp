@@ -544,7 +544,6 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_set_name(cur, "ve_block2_convnext0");
         ggml_set_output(cur);
         ggml_build_forward_expand(gf, cur);
-
         ggml_tensor * q_t = dense_matmul_time_ggml(ctx, cur,
             require_source_tensor(model, "vector_estimator:onnx::MatMul_3101"),
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.W_query.linear.bias"));
@@ -577,18 +576,6 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_set_name(attn_out_t, "ve_attn0_out");
         ggml_set_output(attn_out_t);
         ggml_build_forward_expand(gf, attn_out_t);
-        ggml_tensor * cur2 = ggml_cont(ctx, ggml_reshape_2d(ctx, cur, L, C));
-        ggml_tensor * attn2 = ggml_cont(ctx, ggml_reshape_2d(ctx, attn_out_t, L, C));
-        ggml_tensor * attn_res = ggml_cont(ctx, ggml_add(ctx, attn2, cur2));
-        ggml_set_name(attn_res, "ve_attn0_residual");
-        ggml_set_output(attn_res);
-        ggml_build_forward_expand(gf, attn_res);
-        ggml_tensor * attn_norm = layer_norm_ggml(ctx, attn_res,
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.weight"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.bias"));
-        ggml_set_name(attn_norm, "ve_attn0_norm");
-        ggml_set_output(attn_norm);
-        ggml_build_forward_expand(gf, attn_norm);
 
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) throw std::runtime_error("ggml_gallocr_new failed");
