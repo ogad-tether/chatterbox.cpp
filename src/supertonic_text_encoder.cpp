@@ -100,6 +100,17 @@ ggml_tensor * layer_norm_ggml(ggml_context * ctx, ggml_tensor * x, ggml_tensor *
     return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
 }
 
+ggml_tensor * dense_matmul_time_ggml(ggml_context * ctx,
+                                     ggml_tensor * x,
+                                     ggml_tensor * w,
+                                     ggml_tensor * b) {
+    ggml_tensor * wt = ggml_cont(ctx, ggml_transpose(ctx, w));
+    ggml_tensor * kernel = ggml_reshape_3d(ctx, wt, 1, w->ne[1], w->ne[0]);
+    ggml_tensor * y = conv1d_f32(ctx, kernel, x, 1, 0, 1);
+    if (b) y = ggml_add(ctx, y, repeat_like(ctx, b, y));
+    return y;
+}
+
 ggml_tensor * text_convnext_ggml(ggml_context * ctx,
                                 const supertonic_model & model,
                                 const std::string & p,
@@ -381,6 +392,92 @@ void speech_prompted_attention(const supertonic_model & m, int idx,
     dense_time_matmul(merged, L, C, out_w, out_b, C, out_lc);
 }
 
+void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
+                                    const std::vector<float> & x_lc, int L,
+                                    const float * style_ttl,
+                                    std::vector<float> & out_lc) {
+    const int C = 256;
+    const int half = 128;
+    const int Lctx = 50;
+    const int attn_num = idx + 1;
+    const std::string p = "text_encoder:tts.ttl.speech_prompted_text_encoder.attention" + std::to_string(attn_num);
+    const std::string q_w = "text_encoder:" + std::string(idx == 0 ? "onnx::MatMul_3678" : "onnx::MatMul_3682");
+    const std::string v_w = "text_encoder:" + std::string(idx == 0 ? "onnx::MatMul_3680" : "onnx::MatMul_3684");
+    const std::string o_w = "text_encoder:" + std::string(idx == 0 ? "onnx::MatMul_3681" : "onnx::MatMul_3685");
+
+    constexpr int MAX_NODES = 256;
+    static size_t buf_size = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+    thread_local std::vector<uint8_t> buf(buf_size);
+    ggml_init_params gp = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+
+    ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(x_in, "speech_attn_x"); ggml_set_input(x_in);
+    ggml_tensor * style_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Lctx, C);
+    ggml_set_name(style_in, "speech_attn_style"); ggml_set_input(style_in);
+    ggml_tensor * q_dlh = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, half, L, 2);
+    ggml_set_name(q_dlh, "speech_attn_q_dlh"); ggml_set_input(q_dlh);
+    ggml_tensor * k_dlh = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, half, Lctx, 2);
+    ggml_set_name(k_dlh, "speech_attn_k_dlh"); ggml_set_input(k_dlh);
+    ggml_tensor * v_dlh = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, half, Lctx, 2);
+    ggml_set_name(v_dlh, "speech_attn_v_dlh"); ggml_set_input(v_dlh);
+
+    ggml_tensor * q = dense_matmul_time_ggml(ctx, x_in,
+        require_source_tensor(m, q_w),
+        require_source_tensor(m, p + ".W_query.linear.bias"));
+    ggml_set_name(q, "speech_attn_q"); ggml_set_output(q); ggml_build_forward_expand(gf, q);
+    ggml_tensor * v = dense_matmul_time_ggml(ctx, style_in,
+        require_source_tensor(m, v_w),
+        require_source_tensor(m, p + ".W_value.linear.bias"));
+    ggml_set_name(v, "speech_attn_v"); ggml_set_output(v); ggml_build_forward_expand(gf, v);
+    ggml_tensor * attn = ggml_flash_attn_ext(ctx, q_dlh, k_dlh, v_dlh, nullptr, 1.0f / 16.0f, 0.0f, 0.0f);
+    attn = ggml_reshape_2d(ctx, attn, C, L);
+    ggml_tensor * ctx_tc = ggml_cont(ctx, ggml_transpose(ctx, attn));
+    ggml_tensor * out = dense_matmul_time_ggml(ctx, ctx_tc,
+        require_source_tensor(m, o_w),
+        require_source_tensor(m, p + ".out_fc.linear.bias"));
+    ggml_set_name(out, "speech_attn_out"); ggml_set_output(out); ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    if (!allocr) throw std::runtime_error("ggml_gallocr_new speech text attention failed");
+    if (!ggml_gallocr_reserve(allocr, gf)) {
+        ggml_gallocr_free(allocr);
+        throw std::runtime_error("ggml_gallocr_reserve speech text attention failed");
+    }
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    std::vector<float> x_raw = pack_time_channel_for_ggml(x_lc, L, C);
+    std::vector<float> style_tc((size_t)Lctx*C);
+    for (int t = 0; t < Lctx; ++t) for (int c = 0; c < C; ++c) style_tc[(size_t)t*C+c] = style_ttl[(size_t)t*C+c];
+    std::vector<float> style_raw = pack_time_channel_for_ggml(style_tc, Lctx, C);
+    ggml_backend_tensor_set(x_in, x_raw.data(), 0, x_raw.size()*sizeof(float));
+    ggml_backend_tensor_set(style_in, style_raw.data(), 0, style_raw.size()*sizeof(float));
+    supertonic_graph_compute(m, gf);
+
+    std::vector<float> q_out = tensor_to_time_channel(ggml_graph_get_tensor(gf, "speech_attn_q"));
+    std::vector<float> v_out = tensor_to_time_channel(ggml_graph_get_tensor(gf, "speech_attn_v"));
+    f32_tensor tanh_k = read_f32(m, "text_encoder:/speech_prompted_text_encoder/attention" + std::to_string(attn_num) + "/tanh/Tanh_output_0");
+    std::vector<float> q_pack((size_t)half*L*2), k_pack((size_t)half*Lctx*2), v_pack((size_t)half*Lctx*2);
+    for (int h = 0; h < 2; ++h) {
+        for (int t = 0; t < L; ++t) {
+            for (int d = 0; d < half; ++d) q_pack[(size_t)d + (size_t)half*((size_t)t + (size_t)L*h)] = q_out[(size_t)t*C + h*half + d];
+        }
+        for (int t = 0; t < Lctx; ++t) {
+            for (int d = 0; d < half; ++d) {
+                k_pack[(size_t)d + (size_t)half*((size_t)t + (size_t)Lctx*h)] = tanh_k.data[((size_t)h*half + d)*Lctx + t];
+                v_pack[(size_t)d + (size_t)half*((size_t)t + (size_t)Lctx*h)] = v_out[(size_t)t*C + h*half + d];
+            }
+        }
+    }
+    ggml_backend_tensor_set(q_dlh, q_pack.data(), 0, q_pack.size()*sizeof(float));
+    ggml_backend_tensor_set(k_dlh, k_pack.data(), 0, k_pack.size()*sizeof(float));
+    ggml_backend_tensor_set(v_dlh, v_pack.data(), 0, v_pack.size()*sizeof(float));
+    supertonic_graph_compute(m, gf);
+    out_lc = tensor_to_time_channel(ggml_graph_get_tensor(gf, "speech_attn_out"));
+    ggml_gallocr_free(allocr);
+}
+
 } // namespace
 
 bool supertonic_text_encoder_forward_cpu(const supertonic_model & model,
@@ -516,9 +613,9 @@ bool supertonic_text_encoder_forward_ggml(const supertonic_model & model,
 
         std::vector<float> shared_residual = x;
         std::vector<float> attn_out;
-        speech_prompted_attention(model, 0, x, L, style_ttl, attn_out);
+        speech_prompted_attention_ggml(model, 0, x, L, style_ttl, attn_out);
         for (size_t i = 0; i < x.size(); ++i) x[i] = shared_residual[i] + attn_out[i];
-        speech_prompted_attention(model, 1, x, L, style_ttl, attn_out);
+        speech_prompted_attention_ggml(model, 1, x, L, style_ttl, attn_out);
         for (size_t i = 0; i < x.size(); ++i) x[i] = shared_residual[i] + attn_out[i];
         layer_norm_channel(
             x, L, C,
@@ -618,6 +715,26 @@ bool supertonic_text_encoder_trace_ggml(const supertonic_model & model,
         ggml_trace.push_back({"text_encoder_attn0_k", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_attn0_k"))});
         ggml_trace.push_back({"text_encoder_attn0_v", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_attn0_v"))});
         ggml_gallocr_free(allocr);
+        auto vit = model.voices.find(model.hparams.default_voice);
+        if (vit != model.voices.end()) {
+            std::vector<float> style_ttl((size_t)ggml_nelements(vit->second.ttl));
+            ggml_backend_tensor_get(vit->second.ttl, style_ttl.data(), 0, ggml_nbytes(vit->second.ttl));
+            std::vector<float> scalar_final, ggml_final;
+            std::string nested_error;
+            if (supertonic_text_encoder_forward_cpu(model, text_ids, text_len, style_ttl.data(), scalar_final, &nested_error) &&
+                supertonic_text_encoder_forward_ggml(model, text_ids, text_len, style_ttl.data(), ggml_final, &nested_error) &&
+                scalar_final.size() == (size_t)C*L && ggml_final.size() == (size_t)C*L) {
+                std::vector<float> scalar_lc((size_t)L*C), ggml_lc((size_t)L*C);
+                for (int c = 0; c < C; ++c) {
+                    for (int t = 0; t < L; ++t) {
+                        scalar_lc[(size_t)t*C+c] = scalar_final[(size_t)c*L+t];
+                        ggml_lc[(size_t)t*C+c] = ggml_final[(size_t)c*L+t];
+                    }
+                }
+                scalar_trace.push_back({"text_encoder_final", {L, C}, scalar_lc});
+                ggml_trace.push_back({"text_encoder_final", {L, C}, ggml_lc});
+            }
+        }
         if (error) error->clear();
         return true;
     } catch (const std::exception & e) {
