@@ -197,8 +197,8 @@ int main(int argc, char ** argv) {
         }
 
         std::vector<float> text_emb;
-        if (!supertonic_text_encoder_forward_cpu(model, text_ids.data(), (int) text_ids.size(),
-                                                 style_ttl.data(), text_emb, &error)) {
+        if (!supertonic_text_encoder_forward_ggml(model, text_ids.data(), (int) text_ids.size(),
+                                                  style_ttl.data(), text_emb, &error)) {
             fprintf(stderr, "text encoder failed: %s\n", error.c_str());
             free_supertonic_model(model); return 1;
         }
@@ -207,10 +207,10 @@ int main(int argc, char ** argv) {
         std::vector<float> latent_mask((size_t) latent_len, 1.0f);
         std::vector<float> next;
         for (int s = 0; s < steps; ++s) {
-            if (!supertonic_vector_step_cpu(model, latent.data(), latent_len,
-                                            text_emb.data(), (int) text_ids.size(),
-                                            style_ttl.data(), latent_mask.data(),
-                                            s, steps, next, &error)) {
+            if (!supertonic_vector_step_ggml(model, latent.data(), latent_len,
+                                             text_emb.data(), (int) text_ids.size(),
+                                             style_ttl.data(), latent_mask.data(),
+                                             s, steps, next, &error)) {
                 fprintf(stderr, "vector step %d failed: %s\n", s, error.c_str());
                 free_supertonic_model(model); return 1;
             }
@@ -219,7 +219,7 @@ int main(int argc, char ** argv) {
         auto t4 = clk::now();
 
         std::vector<float> wav;
-        if (!supertonic_vocoder_forward_cpu(model, latent.data(), latent_len, wav, &error)) {
+        if (!supertonic_vocoder_forward_ggml(model, latent.data(), latent_len, wav, &error)) {
             fprintf(stderr, "vocoder failed: %s\n", error.c_str());
             free_supertonic_model(model); return 1;
         }

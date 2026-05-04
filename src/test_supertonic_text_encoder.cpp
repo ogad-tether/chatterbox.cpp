@@ -33,7 +33,7 @@ int main(int argc, char ** argv) {
 
         std::vector<float> got;
         std::string error;
-        if (!supertonic_text_encoder_forward_cpu(
+        if (!supertonic_text_encoder_forward_ggml(
                 model,
                 reinterpret_cast<const int64_t *>(text_ids.data.data()),
                 (int) text_ids.shape[1],

@@ -2184,7 +2184,8 @@ bool supertonic_vector_step_ggml(const supertonic_model & model,
         if (!supertonic_vector_trace_proj_ggml(model, noisy_latent, text_emb, text_len,
                                                style_ttl, latent_mask, latent_len,
                                                current_step, total_steps,
-                                               scalar_trace, ggml_trace, error)) {
+                                               scalar_trace, ggml_trace, error,
+                                               false, false)) {
             return false;
         }
         const supertonic_trace_tensor * next = nullptr;

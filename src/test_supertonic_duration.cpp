@@ -51,6 +51,25 @@ int main(int argc, char ** argv) {
         } else {
             fprintf(stderr, "supertonic duration parity PASS\n");
         }
+
+        float got_ggml = 0.0f;
+        if (!supertonic_duration_forward_ggml(
+                model,
+                reinterpret_cast<const int64_t *>(text_ids.data.data()),
+                (int) text_ids.shape[1],
+                npy_as_f32(style_dp),
+                got_ggml,
+                &error)) {
+            throw std::runtime_error("duration ggml failed: " + error);
+        }
+        const float abs_err_ggml = std::fabs(got_ggml - ref);
+        fprintf(stderr, "supertonic duration ggml: got=%.8f ref=%.8f abs=%.3e\n", got_ggml, ref, abs_err_ggml);
+        if (abs_err_ggml > 2e-4f) {
+            fprintf(stderr, "supertonic duration GGML parity FAILED\n");
+            rc = 1;
+        } else {
+            fprintf(stderr, "supertonic duration GGML parity PASS\n");
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "test failed: %s\n", e.what());
         rc = 1;

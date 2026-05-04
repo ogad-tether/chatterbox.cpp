@@ -41,8 +41,8 @@ int main(int argc, char ** argv) {
 
         std::vector<float> text_emb;
         std::string error;
-        if (!supertonic_text_encoder_forward_cpu(model, text_ids.data(), text_len,
-                                                 npy_as_f32(style_ttl), text_emb, &error)) {
+        if (!supertonic_text_encoder_forward_ggml(model, text_ids.data(), text_len,
+                                                  npy_as_f32(style_ttl), text_emb, &error)) {
             throw std::runtime_error("text encoder failed: " + error);
         }
 
@@ -53,17 +53,17 @@ int main(int argc, char ** argv) {
 
         std::vector<float> next;
         for (int step = 0; step < n_steps; ++step) {
-            if (!supertonic_vector_step_cpu(model, latent.data(), latent_len,
-                                            text_emb.data(), text_len,
-                                            npy_as_f32(style_ttl), npy_as_f32(latent_mask),
-                                            step, n_steps, next, &error)) {
+            if (!supertonic_vector_step_ggml(model, latent.data(), latent_len,
+                                             text_emb.data(), text_len,
+                                             npy_as_f32(style_ttl), npy_as_f32(latent_mask),
+                                             step, n_steps, next, &error)) {
                 throw std::runtime_error("vector step " + std::to_string(step) + " failed: " + error);
             }
             latent.swap(next);
         }
 
         std::vector<float> wav;
-        if (!supertonic_vocoder_forward_cpu(model, latent.data(), latent_len, wav, &error)) {
+        if (!supertonic_vocoder_forward_ggml(model, latent.data(), latent_len, wav, &error)) {
             throw std::runtime_error("vocoder failed: " + error);
         }
 

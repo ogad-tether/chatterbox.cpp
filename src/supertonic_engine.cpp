@@ -132,8 +132,8 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
         std::vector<int64_t> text_ids(text_ids_i32.begin(), text_ids_i32.end());
 
         float duration_raw = 0.0f;
-        if (!supertonic_duration_forward_cpu(model, text_ids.data(), (int) text_ids.size(),
-                                             style_dp.data(), duration_raw, &error)) {
+        if (!supertonic_duration_forward_ggml(model, text_ids.data(), (int) text_ids.size(),
+                                              style_dp.data(), duration_raw, &error)) {
             throw std::runtime_error("duration failed: " + error);
         }
         const float duration_s = duration_raw / speed;
@@ -160,8 +160,8 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
         }
 
         std::vector<float> text_emb;
-        if (!supertonic_text_encoder_forward_cpu(model, text_ids.data(), (int) text_ids.size(),
-                                                 style_ttl.data(), text_emb, &error)) {
+        if (!supertonic_text_encoder_forward_ggml(model, text_ids.data(), (int) text_ids.size(),
+                                                  style_ttl.data(), text_emb, &error)) {
             throw std::runtime_error("text encoder failed: " + error);
         }
 

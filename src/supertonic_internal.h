@@ -134,12 +134,40 @@ bool supertonic_duration_forward_cpu(const supertonic_model & model,
                                      float & duration_out,
                                      std::string * error = nullptr);
 
+bool supertonic_duration_forward_ggml(const supertonic_model & model,
+                                      const int64_t * text_ids,
+                                      int text_len,
+                                      const float * style_dp,
+                                      float & duration_out,
+                                      std::string * error = nullptr);
+
+bool supertonic_duration_trace_ggml(const supertonic_model & model,
+                                    const int64_t * text_ids,
+                                    int text_len,
+                                    std::vector<supertonic_trace_tensor> & scalar_trace,
+                                    std::vector<supertonic_trace_tensor> & ggml_trace,
+                                    std::string * error = nullptr);
+
 bool supertonic_text_encoder_forward_cpu(const supertonic_model & model,
                                          const int64_t * text_ids,
                                          int text_len,
                                          const float * style_ttl,
                                          std::vector<float> & text_emb_out,
                                          std::string * error = nullptr);
+
+bool supertonic_text_encoder_forward_ggml(const supertonic_model & model,
+                                          const int64_t * text_ids,
+                                          int text_len,
+                                          const float * style_ttl,
+                                          std::vector<float> & text_emb_out,
+                                          std::string * error = nullptr);
+
+bool supertonic_text_encoder_trace_ggml(const supertonic_model & model,
+                                        const int64_t * text_ids,
+                                        int text_len,
+                                        std::vector<supertonic_trace_tensor> & scalar_trace,
+                                        std::vector<supertonic_trace_tensor> & ggml_trace,
+                                        std::string * error = nullptr);
 
 bool supertonic_vector_step_cpu(const supertonic_model & model,
                                 const float * noisy_latent,

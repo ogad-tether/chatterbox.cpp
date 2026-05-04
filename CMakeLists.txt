@@ -234,12 +234,26 @@ if (TTS_CPP_BUILD_TESTS)
     target_link_libraries(test-supertonic-duration PRIVATE ggml)
     target_include_directories(test-supertonic-duration PRIVATE ggml/include src)
 
+    add_executable(test-supertonic-duration-trace
+        src/test_supertonic_duration_trace.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_duration.cpp)
+    target_link_libraries(test-supertonic-duration-trace PRIVATE ggml)
+    target_include_directories(test-supertonic-duration-trace PRIVATE ggml/include src)
+
     add_executable(test-supertonic-text-encoder
         src/test_supertonic_text_encoder.cpp
         src/supertonic_gguf.cpp
         src/supertonic_text_encoder.cpp)
     target_link_libraries(test-supertonic-text-encoder PRIVATE ggml)
     target_include_directories(test-supertonic-text-encoder PRIVATE ggml/include src)
+
+    add_executable(test-supertonic-text-encoder-trace
+        src/test_supertonic_text_encoder_trace.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_text_encoder.cpp)
+    target_link_libraries(test-supertonic-text-encoder-trace PRIVATE ggml)
+    target_include_directories(test-supertonic-text-encoder-trace PRIVATE ggml/include src)
 
     add_executable(test-supertonic-vector
         src/test_supertonic_vector.cpp
