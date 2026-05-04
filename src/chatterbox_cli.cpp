@@ -333,6 +333,11 @@ struct cli_params {
     float   top_p          = 0.95f;
     float   temp           = 0.8f;
     float   repeat_penalty = 1.2f;
+    // Experimental: route CFM flash-attn through the F32 Q + F16 K/V path
+    // so backends with `flash_attn_f32_f16` (Adreno OpenCL) dispatch the
+    // mixed-precision kernel.  Opt-in mobile latency knob.  See PROGRESS.md
+    // "OpenCL / Adreno bring-up".
+    bool    cfm_f16_kv_attn = false;
 
     // Multilingual-only knobs. Python ChatterboxMultilingualTTS.generate()
     // defaults: cfg_weight=0.5, temperature=0.8, repetition_penalty=2.0,
@@ -482,6 +487,8 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          speedup.  Turbo's meanflow defaults to 2 steps.\n");
     fprintf(stderr, "                          See PROGRESS.md §3.21 for the quality knee sweep.\n");
     fprintf(stderr, "                          (default: 0 = GGUF's n_timesteps)\n");
+    fprintf(stderr, "  --cfm-f16-kv-attn       Experimental: CFM flash-attn uses F32 Q + F16 K/V so\n");
+    fprintf(stderr, "                          OpenCL/Adreno can dispatch flash_attn_f32_f16.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --input-file PATH       Stream text from PATH as another process writes to it.\n");
     fprintf(stderr, "                          tail -f semantics: each complete sentence (ending in\n");
@@ -596,6 +603,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
             }
         }
         else if (arg == "--language")       { auto v = next("--language");       if (!v) return false; params.language = v; }
+        else if (arg == "--cfm-f16-kv-attn") { params.cfm_f16_kv_attn = true; }
         else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
         else if (arg == "--crossfade-ms")   { if (!parse_int("--crossfade-ms",   params.crossfade_ms))   return false; }
@@ -834,6 +842,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
             opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1102,8 +1111,11 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
-            // Live-input streaming uses --stream-cfm-steps for chunks.
-            // --cfm-steps is a non-streaming knob; ignored here.
+            // Live-input streaming: --stream-cfm-steps takes precedence per
+            // chunk; --cfm-steps falls in as the per-chunk default below
+            // (`stream_cfm_steps > 0 ? stream_cfm_steps : cfm_steps`).
+            opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1409,7 +1421,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     std::vector<float> tail_out;
                     copts.hift_source_tail_out     = &tail_out;
                     copts.source_tail_samples      = 480;
-                    copts.cfm_steps                = params.stream_cfm_steps;
+                    copts.cfm_steps                = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
+                    copts.cfm_f16_kv_attn          = params.cfm_f16_kv_attn;
 
                     int rc = s3gen_synthesize_to_wav(toks, copts);
                     if (rc != 0) return rc;
@@ -1889,9 +1902,10 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
             // Non-streaming CFM Euler step count (0 = GGUF default).
-            // Streaming chunks honour --stream-cfm-steps instead and copy
-            // this opts struct via `copts` further below.
+            // Streaming chunks honour --stream-cfm-steps with --cfm-steps as
+            // fallback when copts is set up further below.
             opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -2089,7 +2103,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         std::vector<float> tail_out;
                         copts.hift_source_tail_out      = &tail_out;
                         copts.source_tail_samples       = 480;
-                        copts.cfm_steps                 = params.stream_cfm_steps;
+                        copts.cfm_steps                 = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
+                        copts.cfm_f16_kv_attn           = params.cfm_f16_kv_attn;
 
                         ++global_chunk_idx;
                         if (params.verbose) {

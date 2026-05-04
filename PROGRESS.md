@@ -70,7 +70,8 @@ chatterbox.cpp/
     ggml-metal-chatterbox-ops.patch   Metal op fixes: diag_mask_inf, pad_ext,
                                       faster conv_transpose_1d (applied to ggml/
                                       during setup; see patches/README.md)
-    ggml-opencl-chatterbox-ops.patch  OpenCL: HiFT ops (CONV_TRANSPOSE_1D, SIN, …)
+    ggml-opencl-chatterbox-ops.patch  OpenCL/Adreno fixes: missing HiFT/S3Gen
+                                      ops + conv_transpose_1d speedup
     README.md                         why each patch exists + how to drop it
   include/tts-cpp/                installed public headers (Engine API)
     tts-cpp.h                       library entry; declares tts_cpp_cli_main()
@@ -4052,3 +4053,118 @@ scp + run on any M4 / M3 / M2 box.
 - Run the script on an M4 Air (user action: `scp -r chatterbox.cpp m4:` + `scp models/*.gguf m4:.../models/` + `ssh m4 'bash chatterbox.cpp/scripts/bench-m4-validation.sh'` + `scp m4:.../artifacts/bench/m4-validation.json .`).
 - If M4 results confirm the prediction: update the §3.27 / §3.28 / §3.30 sections with the M4 numbers alongside M3U.
 - If M4 results contradict the prediction: file a follow-up to revisit the fusion costs on smaller Apple silicon.
+
+---
+
+## OpenCL / Adreno bring-up (April 2026)
+
+Target: **Termux on Snapdragon / Adreno 830** using `GGML_OPENCL=ON`, with
+`LD_LIBRARY_PATH` including `/data/data/com.termux/files/home/lib` so the
+OpenCL loader and ggml DSOs resolve.
+
+### What was missing
+
+The first OpenCL smoke runs only offloaded T3; S3Gen/HiFT still had to stay
+on CPU because ggml-opencl rejected missing ops during graph execution.  The
+sequence of blockers observed on-device was:
+
+1. `CONV_TRANSPOSE_1D` in HiFT.
+2. `SIN` / `COS` in HiFT's oscillator / phase path.
+3. `LEAKY_RELU` in the S3Gen encoder.
+4. `UNARY(ELU)` and `ABS` in the f0 predictor.
+
+### What landed
+
+- Added `GGML_USE_OPENCL` wiring to the C++ side (`init_backend` for T3 and
+  `s3gen_init_backend` for S3Gen/HiFT), so `--n-gpu-layers > 0` actually
+  attempts `ggml_backend_opencl_init()` before CPU fallback.
+- Added `patches/ggml-opencl-chatterbox-ops.patch` and updated
+  `scripts/setup-ggml.sh` so a fresh `ggml/` checkout is reset to the pinned
+  commit and receives **both** the Metal and OpenCL patches.
+- Extended ggml-opencl with the missing ops:
+  - `GGML_OP_CONV_TRANSPOSE_1D` (`f32` and `f16` kernel / `f32` input paths).
+  - `GGML_OP_SIN`, `GGML_OP_COS`.
+  - `GGML_OP_LEAKY_RELU`.
+  - `GGML_UNARY_OP_ABS`, `GGML_UNARY_OP_ELU` (`f32` paths used by f0).
+- Optimized the first `CONV_TRANSPOSE_1D` OpenCL kernel: instead of scanning
+  every input position and discarding almost all of them, each output sample
+  now computes the exact input index range that can contribute.
+- Exposed `--cfm-steps N` for normal batch synthesis (previously only the
+  streaming path had `--stream-cfm-steps`).  Default remains 2 for Python-like
+  meanflow quality; `--cfm-steps 1` is the lower-latency mode.
+
+### Validation
+
+Remote build:
+
+```bash
+cd /data/data/com.termux/files/home/qvac-chatterbox.cpp
+git pull --ff-only
+./scripts/setup-ggml.sh
+cmake -S . -B build-opencl -DCMAKE_BUILD_TYPE=Release -DGGML_OPENCL=ON
+cmake --build build-opencl -j$(nproc) --target tts-cli
+```
+
+Runtime command:
+
+```bash
+export LD_LIBRARY_PATH="/data/data/com.termux/files/home/lib:${LD_LIBRARY_PATH:-}"
+./build-opencl/tts-cli \
+  --model /data/data/com.termux/files/home/chatterbox.cpp/models/chatterbox-t3-turbo.gguf \
+  --s3gen-gguf /data/data/com.termux/files/home/chatterbox.cpp/models/chatterbox-s3gen.gguf \
+  --text "Hello" --n-gpu-layers 99 --verbose --out test-gpu.wav
+```
+
+OpenCL now runs end-to-end and writes a WAV:
+
+```text
+init_backend: using OpenCL backend
+[encoder]      ~167 ms
+[cfm_total]    ~921 ms   (2-step default)
+[f0_predictor] ~6 ms
+[hift_decode]  ~217-222 ms after conv_transpose_1d range tightening
+S3GEN_INFER_MS ~1396-1450 for 800 ms audio (RTF ~1.74-1.81)
+T3_INFER_MS    ~772-846
+```
+
+Full generated-audio RTF on the short "Hello" smoke test:
+
+| Mode | T3 infer | S3Gen+HiFT infer | Audio | Full RTF |
+|------|---------:|-----------------:|------:|---------:|
+| default 2-step CFM | ~772 ms | ~1396 ms | 800 ms | ~2.71 |
+| `--cfm-steps 1` | ~772 ms | ~887 ms | 800 ms | ~2.07 |
+
+The 1-step mode is deliberately opt-in because it trades some meanflow
+quality for latency; it is useful for interactive/mobile experiments where
+CFM dominates the wall clock.
+
+### OpenCL optimization log (Adreno 830)
+
+Baseline for this log: Termux phone held awake with `termux-wake-lock`,
+T3 `Q4_0` + S3Gen `Q4_0`, short `"Hello"` smoke test (800 ms audio),
+`--n-gpu-layers 99 --cfm-steps 1` unless otherwise noted.
+
+| Step | Change | Result |
+|------|--------|--------|
+| CFM attention precision | Added `--cfm-f16-kv-attn`: CFM flash attention uses F32 Q and F16 K/V so OpenCL dispatches `flash_attn_f32_f16`. | Best useful CFM win so far: attention kernel went from ~257 ms (`flash_attn_f32`) to ~102 ms; S3Gen dropped to ~726-740 ms; full RTF ~1.38-1.39 in best phone-awake samples. |
+| Model mix: S3Gen F16 | T3 Q4_0 + S3Gen full/F16-ish GGUF with `--cfm-f16-kv-attn`. | Not better overall: CFM ~346-354 ms, S3Gen ~743-749 ms. |
+| Model mix: S3Gen Q8_0 | Quantized S3Gen to Q8_0 and tested with T3 Q4_0. | Worse than S3Gen Q4_0: CFM ~391 ms, S3Gen ~789 ms. |
+| Q4_0 GEMV epilogue fusion | Added optional bias/residual epilogue operands to Adreno token GEMV and graph fusion for `MUL_MAT+ADD(+ADD)`. | Correct, but only a tiny T3/S3Gen movement on the short run; not a major bottleneck. |
+| Batched Q4_0 GEMM epilogue fusion | Added optional bias/residual epilogue to `kernel_mul_mm_q4_0_f32_l4_lm`, targeting CFM projection GEMMs. | Correct after arg-placement fix, but core GEMM time stayed ~138 ms in the CFM graph, so surrounding adds were not the real cost. |
+| Q4_0 GEMM tile BN=32 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BN=64 to BN=32 for the hot `256 x 540` CFM output shape. | Regression: CFM Q4_0 GEMM grew from ~138 ms to ~181 ms. Reverted to the original 64x64 tile. |
+| Q4_0 GEMM tile BK=64 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BK=32 to BK=64 while keeping BM=64/BN=64. | Regression: CFM Q4_0 GEMM again grew to ~180 ms and `cfm_total` ~436 ms. Revert to BK=32. |
+| Q4_0 GEMM tile BM=32 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BM=64 to BM=32 while keeping BN=64/BK=32. | Regression: CFM Q4_0 GEMM grew to ~213 ms and `cfm_total` ~445 ms. Revert to BM=64. |
+| Q4_0 GEMM thread tile TN=4 | Changed per-thread output from TM=4/TN=8 to TM=4/TN=4, keeping BM=64/BN=64/BK=32. | Mild regression: CFM Q4_0 GEMM rose to ~147 ms and `cfm_total` ~411 ms. Revert to TN=8. |
+| CFM attention F16 Q/K/V | Cast Q/K/V to F16 for `flash_attn_f16`, then copy output back to F32 before projection. | Not better than F16 K/V only: flash attention dropped to ~92 ms, but extra copies raised total CFM to ~369 ms vs ~355 ms. Remove the flag; keep `--cfm-f16-kv-attn`. |
+| Direct conv1d via `CONV_2D` | Tested an env-gated path that reshaped 1D convs to height-1 `ggml_conv_2d_direct`, bypassing explicit `im2col -> mul_mat`. | Rejected and removed. Profiling run improved HiFT (`hift_decode` ~169 ms), but a non-profile phone-awake sample regressed overall (`S3GEN_INFER_MS` ~845 ms, `cfm_total` ~404 ms), so the code path was deleted. |
+
+Current measured bottlenecks after the useful attention change:
+
+```text
+CFM graph (cl_profiling_0022.csv):
+kernel_mul_mm_q4_0_f32_l4_lm  ~138 ms
+flash_attn_f32_f16            ~102 ms
+```
+
+Next experiments should target the core Q4_0 batched GEMM math itself
+(`kernel_mul_mm_q4_0_f32_l4_lm`), not epilogue/add fusion.

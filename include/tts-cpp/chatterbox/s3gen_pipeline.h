@@ -156,6 +156,10 @@ struct s3gen_synthesize_opts {
     // to 2 for meanflow; setting this to 1 halves CFM cost at the price of
     // some extra high-frequency noise.  0 → use the default (2).
     int                  cfm_steps             = 0;
+
+    // Experimental OpenCL/mobile latency option: run CFM flash attention with
+    // F32 Q and F16 K/V.  This may trade a small amount of quality for speed.
+    bool                 cfm_f16_kv_attn       = false;
 };
 
 // Runs encoder + CFM + HiFT on the given T3 speech tokens and writes a WAV.
