@@ -12,6 +12,7 @@
 #include "chatterbox_t3_internal.h"
 #include "gpt2_bpe.h"
 #include "npy.h"
+#include "t3_mtl.h"
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "voice_encoder.h"
 #include "voice_features.h"
@@ -154,12 +155,24 @@ struct Engine::Impl {
     Impl & operator=(const Impl &) = delete;
 
     void free_model() {
+        // Pull (buffer_stack, ctx_stack) out of the process-wide t3_stack_registry
+        // BEFORE freeing them locally — otherwise the atexit hook installed
+        // by load_model_gguf_mtl on non-CPU backends would later double-free
+        // (or, worse, ggml_backend_buffer_free a buffer whose backend has
+        // already been destroyed below).  Mirrors the free_t3 lambda in
+        // src/chatterbox_cli.cpp.  No-op on CPU backends and on Turbo
+        // (those code paths never allocate buffer_stack / ctx_stack).
+        if (model.buffer_stack || model.ctx_stack) {
+            t3_stack_unregister(model.buffer_stack, model.ctx_stack);
+        }
         if (model.buffer_w)        { ggml_backend_buffer_free(model.buffer_w);        model.buffer_w        = nullptr; }
         if (model.buffer_kv)       { ggml_backend_buffer_free(model.buffer_kv);       model.buffer_kv       = nullptr; }
+        if (model.buffer_stack)    { ggml_backend_buffer_free(model.buffer_stack);    model.buffer_stack    = nullptr; }
         if (model.buffer_override) { ggml_backend_buffer_free(model.buffer_override); model.buffer_override = nullptr; }
         if (model.backend)         { ggml_backend_free(model.backend);                model.backend         = nullptr; }
         if (model.ctx_w)           { ggml_free(model.ctx_w);                          model.ctx_w           = nullptr; }
         if (model.ctx_kv)          { ggml_free(model.ctx_kv);                         model.ctx_kv          = nullptr; }
+        if (model.ctx_stack)       { ggml_free(model.ctx_stack);                      model.ctx_stack       = nullptr; }
         if (model.ctx_override)    { ggml_free(model.ctx_override);                   model.ctx_override    = nullptr; }
     }
 
