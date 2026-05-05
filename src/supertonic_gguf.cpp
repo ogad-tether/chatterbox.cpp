@@ -131,6 +131,15 @@ void configure_supertonic_blas_threads_once() {
 #endif
 }
 
+void print_supertonic_setup_hint() {
+    fprintf(stderr,
+            "Supertonic GGUFs are generated locally and intentionally ignored by git.\n"
+            "Create the multilingual Supertonic 2 GGUF with:\n"
+            "  bash scripts/setup-supertonic2.sh\n"
+            "or create the English-only Supertonic GGUF with:\n"
+            "  bash scripts/setup-supertonic2.sh --arch supertonic\n");
+}
+
 } // namespace
 
 ggml_tensor * require_tensor(const supertonic_model & model, const std::string & name) {
@@ -202,6 +211,7 @@ bool load_supertonic_gguf(const std::string & path,
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gp);
     if (!gguf_ctx) {
         fprintf(stderr, "load_supertonic_gguf: failed to open '%s'\n", path.c_str());
+        print_supertonic_setup_hint();
         return false;
     }
 

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <stdexcept>
 
 namespace tts_cpp::supertonic {
@@ -13,6 +14,15 @@ namespace tts_cpp::supertonic {
 using namespace detail;
 
 namespace {
+
+std::string supertonic_setup_hint(const std::string & path) {
+    return "Supertonic GGUF not found: " + path + "\n"
+           "Create the local model first, for example:\n"
+           "  bash scripts/setup-supertonic2.sh\n"
+           "or for the English-only bundle:\n"
+           "  bash scripts/setup-supertonic2.sh --arch supertonic\n"
+           "Model GGUFs live under models/ and are intentionally ignored by git.";
+}
 
 std::vector<float> read_tensor_f32(ggml_tensor * t) {
     std::vector<float> out((size_t) ggml_nelements(t));
@@ -100,6 +110,9 @@ private:
 SynthesisResult synthesize(const EngineOptions & opts, const std::string & text) {
     if (opts.model_gguf_path.empty()) throw std::runtime_error("Supertonic model_gguf_path is required");
     if (text.empty()) throw std::runtime_error("Supertonic text is empty");
+    if (!std::filesystem::exists(opts.model_gguf_path)) {
+        throw std::runtime_error(supertonic_setup_hint(opts.model_gguf_path));
+    }
 
     supertonic_model model;
     if (!load_supertonic_gguf(opts.model_gguf_path, model, opts.n_gpu_layers, false)) {

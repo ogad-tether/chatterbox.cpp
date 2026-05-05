@@ -110,8 +110,12 @@ There are two related upstream bundles:
 Current status:
 
 - `scripts/dump-supertonic-reference.py` dumps ONNX Runtime reference tensors.
+- `scripts/setup-supertonic2.sh` downloads the official Hugging Face bundle
+  through `huggingface_hub` and writes the local GGUF.
 - `scripts/convert-supertonic2-to-gguf.py` writes `models/supertonic.gguf`
   (English) or `models/supertonic2.gguf` (multilingual), depending on flags.
+  When `--onnx-dir` is omitted, it downloads the selected repo just like the
+  Chatterbox converters.
 - `build/supertonic-cli` can synthesize a 44.1 kHz wav on CPU.
 - All four stages pass numerical parity against the ONNX reference
   (preprocess, duration, text encoder, vector estimator, vocoder), and the
@@ -161,19 +165,7 @@ Example:
 
 ```bash
 # Stable English bundle: no language wrapping.
-python scripts/dump-supertonic-reference.py \
-  --onnx-dir /path/to/Supertone-supertonic/onnx \
-  --assets-dir /path/to/Supertone-supertonic \
-  --voice-style /path/to/Supertone-supertonic/voice_styles/F1.json \
-  --no-language-wrap \
-  --out artifacts/supertonic-ref-stable --write-wav
-
-python scripts/convert-supertonic2-to-gguf.py \
-  --onnx-dir /path/to/Supertone-supertonic/onnx \
-  --assets-dir /path/to/Supertone-supertonic \
-  --arch supertonic --reference-repo Supertone/supertonic \
-  --default-voice F1 --no-language-wrap \
-  --out models/supertonic.gguf --validate
+bash scripts/setup-supertonic2.sh --arch supertonic
 
 cmake --build build --target supertonic-cli
 ./build/supertonic-cli \
@@ -183,13 +175,7 @@ cmake --build build --target supertonic-cli
   --out /tmp/supertonic.wav
 
 # Multilingual bundle: uses the <lang>...</lang> wrapping path.
-python scripts/dump-supertonic-reference.py \
-  --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
-  --out artifacts/supertonic-ref-quick --write-wav
-
-python scripts/convert-supertonic2-to-gguf.py \
-  --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
-  --out models/supertonic2.gguf --validate
+bash scripts/setup-supertonic2.sh
 
 cmake --build build --target supertonic-cli
 ./build/supertonic-cli \
@@ -228,8 +214,8 @@ python scripts/bench-supertonic-onnx.py \
 
 - C++17 compiler (clang or gcc)
 - cmake ≥ 3.14
-- Python 3.10+ with `torch`, `numpy`, `gguf`, `safetensors`, `scipy`,
-  `librosa`, `resampy` — needed **once**, at setup time only, to run the
+- Python 3.10+ with `torch`, `numpy`, `onnx`, `gguf`, `huggingface_hub`,
+  `safetensors`, `scipy`, `librosa`, `resampy` — needed **once**, at setup time only, to run the
   weight converters (which bake the precomputed mel filterbanks into the
   GGUFs) and the optional reference-dump scripts. Once the GGUFs exist,
   the C++ binary has zero runtime dependency on Python.
@@ -241,7 +227,7 @@ git clone https://github.com/resemble-ai/chatterbox.git chatterbox-ref
 cd chatterbox-ref
 python -m venv .venv && . .venv/bin/activate
 pip install -e .
-pip install gguf safetensors scipy librosa resampy
+pip install onnx gguf huggingface_hub safetensors scipy librosa resampy
 cd -
 ```
 

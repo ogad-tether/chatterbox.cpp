@@ -32,18 +32,38 @@ STAGES = (
     ("vector_estimator", "vector_estimator.onnx"),
     ("vocoder", "vocoder.onnx"),
 )
+REQUIRED_ONNX = tuple(filename for _, filename in STAGES)
+HF_ALLOW_PATTERNS = (
+    "*.onnx",
+    "*.json",
+    "*.bin",
+    "*.data",
+    "**/*.onnx",
+    "**/*.json",
+    "**/*.bin",
+    "**/*.data",
+)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert Supertonic 2 ONNX/assets to GGUF.")
-    p.add_argument("--onnx-dir", type=Path, required=True,
-                   help="Directory containing the four Supertonic 2 ONNX files and tts.json.")
+    p.add_argument("--onnx-dir", type=Path, default=None,
+                   help="Directory containing the four Supertonic ONNX files and tts.json. "
+                        "If omitted, downloads --repo-id from Hugging Face first.")
     p.add_argument("--assets-dir", type=Path, default=None,
                    help="Directory containing unicode_indexer.json and voice_styles/. "
                         "Defaults to --onnx-dir if present, otherwise ../../assets relative to --onnx-dir.")
     p.add_argument("--out", type=Path, default=Path("models/supertonic2.gguf"))
     p.add_argument("--arch", default="supertonic2", choices=("supertonic", "supertonic2"),
                    help="Model family metadata. Use 'supertonic' for the English-only HF bundle.")
+    p.add_argument("--repo-id", default=None,
+                   help="Hugging Face repo to download when --onnx-dir is omitted. "
+                        "Defaults to Supertone/supertonic-2 or Supertone/supertonic based on --arch.")
+    p.add_argument("--download-dir", type=Path, default=None,
+                   help="Optional local directory for the Hugging Face snapshot download.")
+    p.add_argument("--hf-token", default=None, help="Optional Hugging Face token.")
+    p.add_argument("--local-files-only", action="store_true",
+                   help="Use only the local Hugging Face cache when downloading.")
     p.add_argument("--reference-repo", default=None,
                    help="HF repo/source metadata. Defaults from --arch.")
     p.add_argument("--default-voice", default=None,
@@ -65,23 +85,98 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def resolve_assets_dir(onnx_dir: Path, assets_dir: Path | None) -> Path:
+def default_repo_for_arch(arch: str) -> str:
+    return "Supertone/supertonic" if arch == "supertonic" else "Supertone/supertonic-2"
+
+
+def download_hf_snapshot(repo_id: str,
+                         token: str | None,
+                         download_dir: Path | None,
+                         local_files_only: bool) -> Path:
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:  # pragma: no cover - user environment guard
+        raise SystemExit(
+            "error: Python package 'huggingface_hub' is required for automatic download; "
+            "install with `pip install huggingface_hub` or pass --onnx-dir."
+        ) from exc
+
+    kwargs = {
+        "repo_id": repo_id,
+        "token": token,
+        "allow_patterns": list(HF_ALLOW_PATTERNS),
+        "local_files_only": local_files_only,
+    }
+    if download_dir is not None:
+        kwargs["local_dir"] = str(download_dir)
+    return Path(snapshot_download(**kwargs))
+
+
+def contains_required_onnx(path: Path) -> bool:
+    return all((path / filename).exists() for filename in REQUIRED_ONNX)
+
+
+def resolve_onnx_dir(repo_root: Path) -> Path:
+    candidates = [
+        repo_root / "onnx_models" / "onnx",
+        repo_root / "onnx",
+        repo_root / "onnx_models",
+        repo_root,
+    ]
+    for candidate in candidates:
+        if contains_required_onnx(candidate):
+            return candidate
+
+    for duration_path in repo_root.rglob("duration_predictor.onnx"):
+        candidate = duration_path.parent
+        if contains_required_onnx(candidate):
+            return candidate
+
+    required = ", ".join(REQUIRED_ONNX)
+    raise FileNotFoundError(f"could not find Supertonic ONNX directory under {repo_root}; required: {required}")
+
+
+def resolve_tts_json(onnx_dir: Path, repo_root: Path | None) -> Path:
+    candidates = [onnx_dir / "tts.json"]
+    if repo_root is not None:
+        candidates.extend([
+            repo_root / "tts.json",
+            repo_root / "onnx_models" / "onnx" / "tts.json",
+            repo_root / "onnx" / "tts.json",
+        ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"tts.json not found near {onnx_dir}")
+
+
+def resolve_assets_dir(onnx_dir: Path, assets_dir: Path | None, repo_root: Path | None = None) -> Path:
     if assets_dir is not None:
         return assets_dir
     if (onnx_dir / "unicode_indexer.json").exists():
         return onnx_dir
+    if repo_root is not None and (repo_root / "assets").exists():
+        return repo_root / "assets"
+    if (onnx_dir.parent / "assets").exists():
+        return onnx_dir.parent / "assets"
     return onnx_dir.parent.parent / "assets"
 
 
-def resolve_unicode_indexer(onnx_dir: Path, assets_dir: Path) -> Path:
-    for candidate in (assets_dir / "unicode_indexer.json", onnx_dir / "unicode_indexer.json"):
+def resolve_unicode_indexer(onnx_dir: Path, assets_dir: Path, repo_root: Path | None = None) -> Path:
+    candidates = [assets_dir / "unicode_indexer.json", onnx_dir / "unicode_indexer.json"]
+    if repo_root is not None:
+        candidates.extend([repo_root / "unicode_indexer.json", repo_root / "assets" / "unicode_indexer.json"])
+    for candidate in candidates:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(f"unicode_indexer.json not found under {assets_dir} or {onnx_dir}")
 
 
-def resolve_voice_styles_dir(onnx_dir: Path, assets_dir: Path) -> Path:
-    for candidate in (assets_dir / "voice_styles", onnx_dir / "voice_styles", onnx_dir.parent / "voice_styles"):
+def resolve_voice_styles_dir(onnx_dir: Path, assets_dir: Path, repo_root: Path | None = None) -> Path:
+    candidates = [assets_dir / "voice_styles", onnx_dir / "voice_styles", onnx_dir.parent / "voice_styles"]
+    if repo_root is not None:
+        candidates.extend([repo_root / "voice_styles", repo_root / "assets" / "voice_styles"])
+    for candidate in candidates:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(f"voice_styles/ not found under {assets_dir}, {onnx_dir}, or {onnx_dir.parent}")
@@ -172,15 +267,27 @@ def add_json_metadata(writer: "gguf.GGUFWriter", prefix: str, data: dict) -> Non
 
 def main() -> int:
     args = parse_args()
-    assets_dir = resolve_assets_dir(args.onnx_dir, args.assets_dir)
-    unicode_path = resolve_unicode_indexer(args.onnx_dir, assets_dir)
-    voice_styles_dir = resolve_voice_styles_dir(args.onnx_dir, assets_dir)
+    repo_root: Path | None = None
+    repo_id = args.repo_id or default_repo_for_arch(args.arch)
+    if args.onnx_dir is None:
+        print(f"Downloading {repo_id} from Hugging Face (cached by huggingface_hub)")
+        repo_root = download_hf_snapshot(repo_id, args.hf_token, args.download_dir, args.local_files_only)
+        args.onnx_dir = resolve_onnx_dir(repo_root)
+    else:
+        args.onnx_dir = args.onnx_dir.resolve()
+
+    assets_dir = resolve_assets_dir(args.onnx_dir, args.assets_dir, repo_root)
+    unicode_path = resolve_unicode_indexer(args.onnx_dir, assets_dir, repo_root)
+    voice_styles_dir = resolve_voice_styles_dir(args.onnx_dir, assets_dir, repo_root)
+    tts_json_path = resolve_tts_json(args.onnx_dir, repo_root)
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    cfg = json.loads((args.onnx_dir / "tts.json").read_text())
+    print(f"Using ONNX directory: {args.onnx_dir}")
+    print(f"Using assets directory: {assets_dir}")
+    cfg = json.loads(tts_json_path.read_text())
     unicode_indexer = np.asarray(json.loads(unicode_path.read_text()), dtype=np.int32)
 
-    reference_repo = args.reference_repo or ("Supertone/supertonic" if args.arch == "supertonic" else "Supertone/supertonic-2")
+    reference_repo = args.reference_repo or repo_id
     writer = gguf.GGUFWriter(str(args.out), args.arch)
     writer.add_name("Supertonic" if args.arch == "supertonic" else "Supertonic 2")
     writer.add_description(f"{reference_repo} ONNX weights/assets converted for a model-specific ggml runtime.")
