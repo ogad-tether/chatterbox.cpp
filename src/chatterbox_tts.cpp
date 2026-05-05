@@ -27,6 +27,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "npy.h"
+#include "chatterbox_tts_test_hooks.h"
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
@@ -179,6 +180,15 @@ static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
 static double                                g_s3gen_cache_last_load_ms = 0.0;
 }  // namespace
 
+// Forward declaration: clear all per-synth caches.  The persistent
+// graph caches (cfm_estimator + time_mlp scaffolding) and the CPU
+// weight mirrors are tied to the model's backend, so they must be
+// torn down BEFORE ggml_backend_free or the gallocators / backend
+// buffers freed there would be released against a dead device.
+//
+// Defined further down (after cfm_estimator_cache is in scope).
+static void s3gen_release_synth_caches();
+
 // Release any cached model_ctx (frees its backend buffer, ggml context and
 // backend).  Must run before the ggml-metal / ggml-cuda / ggml-vulkan dylib
 // tears down its static device list; otherwise their static destructors hit
@@ -186,6 +196,13 @@ static double                                g_s3gen_cache_last_load_ms = 0.0;
 // orphan backend buffer).  We register it with atexit() on first cache
 // insertion so it runs before process-exit dylib finalisers.
 static void s3gen_model_cache_release() {
+    // Tear down the per-synth caches first so any gallocrs they hold
+    // (cfm_estimator_cache::allocr) are freed against the still-alive
+    // backend, then drop the model.  Reverse order would crash on
+    // Vulkan/Metal/CUDA where ggml_gallocr_free against a freed
+    // backend asserts.
+    s3gen_release_synth_caches();
+
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     // QVAC-17872 round-HIFT + round 2: tear down every persistent host-side
     // cache BEFORE freeing the backend.  The graph caches own
@@ -206,16 +223,18 @@ static void s3gen_model_cache_release() {
 }
 
 static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_layers, bool verbose) {
-    std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
-    if (g_s3gen_cache_entry &&
-        g_s3gen_cache_entry->path == path &&
-        g_s3gen_cache_entry->gpu  == n_gpu_layers) {
-        if (verbose) {
-            fprintf(stderr, "  %zu tensors (cached — skip GGUF load)\n",
-                    g_s3gen_cache_entry->m->tensors.size());
+    {
+        std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
+        if (g_s3gen_cache_entry &&
+            g_s3gen_cache_entry->path == path &&
+            g_s3gen_cache_entry->gpu  == n_gpu_layers) {
+            if (verbose) {
+                fprintf(stderr, "  %zu tensors (cached — skip GGUF load)\n",
+                        g_s3gen_cache_entry->m->tensors.size());
+            }
+            g_s3gen_cache_last_load_ms = 0.0;
+            return g_s3gen_cache_entry->m.get();
         }
-        g_s3gen_cache_last_load_ms = 0.0;
-        return g_s3gen_cache_entry->m.get();
     }
     // QVAC-17872 round-HIFT + round 2: backend swap (different path or
     // n_gpu_layers).  Tear down every persistent cache against the OLD
@@ -1242,6 +1261,20 @@ static const float * cached_cpu_weights_f32(const ggml_tensor * t) {
         auto [it, inserted] = g_weight_cpu_mirror.emplace(t, std::move(data));
         return it->second.data();
     }
+}
+
+// QVAC-18422: bit-cast cache key helpers used by the test-hooks bridge
+// to query g_time_mlp_results / g_time_emb_results without re-deriving
+// the (uint32_t / uint64_t) keys that compute_time_mlp_cached and
+// compute_time_emb_cached compute inline above.  Defined here so the
+// test_hooks namespace at the bottom of the file can call them.
+static uint32_t g_float_bits(float t_val) {
+    uint32_t bits;
+    std::memcpy(&bits, &t_val, sizeof(bits));
+    return bits;
+}
+static uint64_t g_float_pair_bits(float t_val, float r_val) {
+    return ((uint64_t) g_float_bits(t_val) << 32) | (uint64_t) g_float_bits(r_val);
 }
 
 // QVAC-17872 round 2: definition of s3gen_release_synth_caches (forward-
@@ -2779,3 +2812,52 @@ int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
 void s3gen_unload() {
     s3gen_model_cache_release();
 }
+
+// ============================================================================
+// QVAC-18422 — internal test hooks
+// ============================================================================
+//
+// Implementations of the read-only cache-state queries declared in
+// chatterbox_tts_test_hooks.h.  Defined here so they sit in the same
+// translation unit as the caches themselves and don't need any extra
+// linkage gymnastics.
+
+namespace tts_cpp::chatterbox::test_hooks {
+
+size_t time_mlp_result_cache_size() {
+    std::lock_guard<std::mutex> lk(g_time_emb_results_mu);
+    return g_time_mlp_results.size();
+}
+size_t time_emb_result_cache_size() {
+    std::lock_guard<std::mutex> lk(g_time_emb_results_mu);
+    return g_time_emb_results.size();
+}
+size_t weight_mirror_cache_size() {
+    std::lock_guard<std::mutex> lk(g_weight_cpu_mirror_mu);
+    return g_weight_cpu_mirror.size();
+}
+bool cfm_estimator_cache_built() {
+    // g_cfm_estimator_cache is mutated only under s3gen_release_synth_caches
+    // (which holds g_synth_caches_mu around the round-2 caches but not this
+    // one) and during the per-synth fast-path inside cfm_estimator_forward.
+    // The single-pointer load below is atomic on x86/ARM; tests treat it
+    // as a snapshot.
+    return g_cfm_estimator_cache.ctx != nullptr;
+}
+bool cfm_estimator_cache_b2() {
+    return g_cfm_estimator_cache.b2;
+}
+uint32_t float_cache_key(float t_val) {
+    return g_float_bits(t_val);
+}
+uint64_t float_pair_cache_key(float t_val, float r_val) {
+    return g_float_pair_bits(t_val, r_val);
+}
+std::vector<float> peek_time_mlp_cached(float t_val) {
+    std::lock_guard<std::mutex> lk(g_time_emb_results_mu);
+    auto it = g_time_mlp_results.find(g_float_bits(t_val));
+    if (it == g_time_mlp_results.end()) return {};
+    return it->second;
+}
+
+}  // namespace tts_cpp::chatterbox::test_hooks

@@ -205,6 +205,17 @@ if (TTS_CPP_BUILD_TESTS)
     target_link_libraries(test-streaming PRIVATE ggml)
     target_include_directories(test-streaming PRIVATE ggml/include src include)
 
+    # CPU-side persistent-cache validation (QVAC-18422).
+    # Exercises the time_mlp / time_emb / cfm_estimator / weight_mirror
+    # caches that amortise per-synth overhead on the multilingual CPU
+    # path.  Links the chatterbox_tts.cpp directly so it can reach the
+    # internal test-hook entrypoints.
+    add_executable(test-cpu-caches
+        src/test_cpu_caches.cpp
+        src/chatterbox_tts.cpp)
+    target_link_libraries(test-cpu-caches PRIVATE ggml)
+    target_include_directories(test-cpu-caches PRIVATE ggml/include src include)
+
     add_executable(test-metal-ops src/test_metal_ops.cpp)
     target_link_libraries(test-metal-ops PRIVATE ggml)
     target_include_directories(test-metal-ops PRIVATE ggml/include src)

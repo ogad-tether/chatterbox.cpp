@@ -1,0 +1,66 @@
+// Internal test hooks for chatterbox_tts.cpp's CPU optimisation caches.
+//
+// These declarations let tests in src/test_*.cpp inspect cache state that is
+// otherwise file-static.  They are deliberately NOT included in
+// include/tts-cpp/chatterbox/s3gen_pipeline.h because production callers must
+// not depend on cache layout.
+//
+// The hooks are populated by the persistent-cache work landed for QVAC-18422
+// (CPU-side multilingual perf): see PROGRESS.md §3.32.
+//
+// Rules:
+//  - Read-only.  Tests must NOT mutate cache state via these hooks; use
+//    the public s3gen_unload() helper if a clean slate is required.
+//  - Locking is internal.  All hooks acquire the same mutex used by the
+//    cache writers, so concurrent calls during a synthesize() in another
+//    thread are safe but may briefly block.
+//  - Stable across the QVAC-18422 series.  Adding new caches must add new
+//    hooks rather than reshape existing ones.
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace tts_cpp::chatterbox::test_hooks {
+
+// Number of (t_val) entries in the time_mlp result cache populated lazily
+// by compute_time_mlp_cached().  Multilingual = up to n_timesteps + 1
+// distinct t-values per process; Turbo = up to 3 (t_span = [0, 0.5, 1]).
+size_t time_mlp_result_cache_size();
+
+// Number of ((t_val, r_val)) entries in the time_mixed result cache used
+// only by the Turbo meanflow path.  Multilingual never populates this.
+size_t time_emb_result_cache_size();
+
+// Number of ggml_tensor* entries in the CPU weight mirror cache.
+// Populated by cached_cpu_weights_f32(); covers flow/input_embedding +
+// spk_embed_affine/{w,b} + any other weight that synthesize() reads via
+// ggml_backend_tensor_get on the hot path.
+size_t weight_mirror_cache_size();
+
+// True iff the persistent (global) cfm_estimator_cache currently holds
+// a built graph.  Initially false; flips to true after the first call to
+// cfm_estimator_forward() and stays true until s3gen_unload().
+bool cfm_estimator_cache_built();
+
+// Returns true iff the persistent cfm_estimator_cache last built a B=2
+// (CFG cond+uncond batched) graph.  Always false on CPU because the
+// CPU code path keeps use_b2 = false; useful for verifying that future
+// edits don't accidentally flip CPU into the B=2 path.
+bool cfm_estimator_cache_b2();
+
+// Cache key generators — exposed so tests can verify the hashing rules
+// for floats (bit-cast into uint32_t / uint64_t).  Important because
+// std::hash<float> mishandles -0.0 / +0.0 and NaN inconsistently across
+// libstdc++/libc++.
+uint32_t float_cache_key(float t_val);
+uint64_t float_pair_cache_key(float t_val, float r_val);
+
+// Returns the cached time_mlp output for `t_val` if present, or an
+// empty vector if there's no entry.  Lets tests probe whether a given
+// t-value was actually warmed without re-entering compute_time_mlp.
+std::vector<float> peek_time_mlp_cached(float t_val);
+
+}  // namespace tts_cpp::chatterbox::test_hooks
