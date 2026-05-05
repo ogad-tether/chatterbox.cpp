@@ -216,6 +216,13 @@ if (TTS_CPP_BUILD_TESTS)
     target_link_libraries(test-cpu-caches PRIVATE ggml)
     target_include_directories(test-cpu-caches PRIVATE ggml/include src include)
 
+    # T3 step-graph cache validation (QVAC-18422 round 4).  Links
+    # against the full tts-cpp library so it gets t3_mtl.cpp's
+    # cached eval_step_mtl alongside the test-hook entrypoints.
+    add_executable(test-t3-caches src/test_t3_caches.cpp)
+    target_link_libraries(test-t3-caches PRIVATE tts-cpp ggml)
+    target_include_directories(test-t3-caches PRIVATE ggml/include src include)
+
     add_executable(test-metal-ops src/test_metal_ops.cpp)
     target_link_libraries(test-metal-ops PRIVATE ggml)
     target_include_directories(test-metal-ops PRIVATE ggml/include src)

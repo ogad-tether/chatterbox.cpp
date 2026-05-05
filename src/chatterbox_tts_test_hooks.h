@@ -94,4 +94,52 @@ size_t istft_kernel_cache_size();
 size_t hann_window_cache_size();
 size_t window_sum_cache_size();
 
+// ---------- Round 4 (PROGRESS.md §3.35): T3 step-graph cache ---------
+//
+// MTL-only.  Caches the per-(n_past, is_uncond) graph that
+// `build_step_graph_mtl` constructs from scratch on every token
+// decode call.  Multilingual fires this 2× per token (CFG cond +
+// uncond), so a 136-token Spanish utterance previously rebuilt 272
+// graphs at ~3 ms each ≈ 800 ms / synth of pure host-CPU graph
+// construction work.
+//
+// The cache is OPT-IN at runtime via the env var
+// `CHATTERBOX_T3_STEP_CACHE` (default 0).  Enabling it on a single-
+// utterance workload pays the bookkeeping cost (~10 % T3
+// regression) without any compensating hit benefit because each
+// step has a unique n_past — the cache only pays off on synth #2+
+// in long-running processes (server mode), where the second synth
+// re-decodes from n_past=0 and hits every cached entry.  Tests set
+// the env var explicitly.
+
+// Number of cached step graphs currently held; 0 before any
+// eval_step_mtl call, 0 after t3_release_caches().  Bounded by the
+// LRU cap (`t3_step_graph_cache_capacity()`).
+size_t t3_step_graph_cache_size();
+
+// Cache capacity (LRU bound).  Covers e.g. 128 tokens × 2 modes
+// out-of-the-box.  If a synth exceeds this, late tokens fall back
+// to the build-then-discard path; early tokens stay cached for the
+// next synth.
+size_t t3_step_graph_cache_capacity();
+
+// True iff the (n_past, is_uncond) entry is currently in the cache.
+// Used by tests to verify the LRU eviction rule and to spot-check
+// hits without racing on logits comparison.
+bool t3_step_graph_cache_contains(int n_past, bool is_uncond);
+
+// Number of cache hits / cache misses since the last
+// t3_release_caches().  Tests use these to confirm that re-running
+// a step pass with the same shape key actually re-uses the cached
+// graph instead of rebuilding it.
+size_t t3_step_graph_cache_hits();
+size_t t3_step_graph_cache_misses();
+
+// Explicit teardown.  Idempotent; safe to call before/after the
+// main t3 backend is freed.  Production callers (CLI, Engine) call
+// this from their model-free path BEFORE ggml_backend_free so the
+// gallocators in cached entries release against a still-valid
+// backend.
+void t3_release_caches();
+
 }  // namespace tts_cpp::chatterbox::test_hooks

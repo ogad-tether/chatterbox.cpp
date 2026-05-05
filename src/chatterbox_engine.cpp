@@ -165,6 +165,11 @@ struct Engine::Impl {
         if (model.buffer_stack || model.ctx_stack) {
             t3_stack_unregister(model.buffer_stack, model.ctx_stack);
         }
+        // QVAC-18422 round 4: drop the T3 step-graph cache BEFORE
+        // freeing the backend.  Cached gallocators carry backend
+        // references; freeing them against a dead backend asserts
+        // inside the GPU-backend dylib finalisers.
+        tts_cpp::chatterbox::detail::t3_release_caches();
         if (model.buffer_w)        { ggml_backend_buffer_free(model.buffer_w);        model.buffer_w        = nullptr; }
         if (model.buffer_kv)       { ggml_backend_buffer_free(model.buffer_kv);       model.buffer_kv       = nullptr; }
         if (model.buffer_stack)    { ggml_backend_buffer_free(model.buffer_stack);    model.buffer_stack    = nullptr; }

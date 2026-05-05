@@ -347,6 +347,16 @@ bool eval_step_mtl(
     std::vector<float> &     logits_cond_out,
     std::vector<float> &     logits_uncond_out);
 
+// Release every persistent T3-side cache held in this translation
+// unit (currently the round-4 step-graph cache).  Idempotent.
+//
+// Production callers (CLI free_t3 lambda, Engine::Impl::free_model)
+// MUST call this BEFORE `ggml_backend_free(model.backend)` because
+// the cached gallocators carry backend references; freeing them
+// against a freed backend would assert inside ggml-metal /
+// ggml-vulkan / ggml-cuda dylib finalisers.
+void t3_release_caches();
+
 // On a degenerate logits distribution (everything -inf after the sampling
 // cascade), returns `stop_token` so the caller's stop check fires cleanly
 // instead of emitting a pseudo-random in-vocab id.  Pass

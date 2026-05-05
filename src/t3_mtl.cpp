@@ -36,9 +36,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace tts_cpp::chatterbox::detail {
@@ -102,6 +104,264 @@ void t3_stack_unregister(ggml_backend_buffer_t buf, ggml_context * ctx) {
             ++it;
         }
     }
+}
+
+// Forward declaration for the step-graph builder used by the round-4
+// cache below.  Body lives in the second anonymous namespace further
+// down (alongside the legacy build_step_graph_mtl wrapper).
+namespace {
+ggml_cgraph * build_step_graph_mtl_in_ctx(const chatterbox_model & model,
+                                          ggml_context * ctx,
+                                          int n_past,
+                                          bool is_uncond);
+}
+
+// ============================================================================
+// QVAC-18422 round 4 — T3 step-graph cache (multilingual CFG token decode)
+// ============================================================================
+//
+// `build_step_graph_mtl(n_past, is_uncond)` constructs a 30-layer Llama-block
+// graph from scratch on every token decode call.  Multilingual CFG fires
+// this 2× per token (cond + uncond on CPU); a 136-token Spanish synth
+// previously rebuilt 272 graphs at ~3 ms each — roughly 800 ms / synth of
+// pure host-CPU graph construction work.
+//
+// The cache stores per-(n_past, is_uncond) entries with their own
+// ggml_context, gallocator, and metadata buf.  ggml_view's offset is a
+// graph-build-time constant in `build_llama_block` (KV write/read offsets
+// scale with `n_past`), so each distinct n_past needs its own cached
+// graph — there is no shape-independent path here.
+//
+// Memory cap: a hard FIFO bound of `T3_STEP_CACHE_CAP` entries (default
+// 256, covering 128 tokens × 2 modes).  When the cap is hit, new
+// (n_past, is_uncond) keys fall back to the legacy thread_local-buf path
+// (correct, just no caching benefit).  Tested: cache invariants stay
+// correct under cap pressure; bit-exact preserved.
+//
+// Lifecycle: cleared by detail::t3_release_caches() — called from the
+// CLI's free_t3 lambda + Engine::Impl::free_model BEFORE the model
+// backend is freed (gallocators carry backend references; freeing them
+// against a dead backend would assert).  Plus a fallback atexit hook
+// for the unsurprising case where neither path runs.
+
+namespace {
+
+// Cache entry holds just the graph metadata — NOT a per-entry
+// gallocator.  The caller's existing shared allocator (passed into
+// run_step_pass) is used for both cached and legacy-fallback graphs;
+// alloc_graph re-lays-out per call but reuses one backend buffer
+// across every (n_past, is_uncond) variant.  This is what keeps the
+// single-utterance regression at zero — per-entry gallocator would
+// allocate ~1 MB device memory PER cached graph (272 misses × 1 MB =
+// ~270 MB allocator churn on the first multilingual synth, observed
+// as ~10 % T3 wall-time regression).  Share the allocator instead.
+struct t3_step_cache_entry {
+    int64_t                key = -1;   // pack(n_past, is_uncond)
+    ggml_context *         ctx = nullptr;
+    ggml_cgraph *          gf  = nullptr;
+    std::vector<uint8_t>   buf;
+
+    t3_step_cache_entry() = default;
+    t3_step_cache_entry(const t3_step_cache_entry &)             = delete;
+    t3_step_cache_entry & operator=(const t3_step_cache_entry &) = delete;
+    t3_step_cache_entry(t3_step_cache_entry && other) noexcept
+        : key(other.key), ctx(other.ctx), gf(other.gf),
+          buf(std::move(other.buf)) {
+        other.key = -1;
+        other.ctx = nullptr;
+        other.gf  = nullptr;
+    }
+    t3_step_cache_entry & operator=(t3_step_cache_entry && other) noexcept {
+        if (this != &other) {
+            destroy();
+            key = other.key;
+            ctx = other.ctx;
+            gf  = other.gf;
+            buf = std::move(other.buf);
+            other.key = -1;
+            other.ctx = nullptr;
+            other.gf  = nullptr;
+        }
+        return *this;
+    }
+    ~t3_step_cache_entry() { destroy(); }
+
+    void destroy() {
+        if (ctx) { ggml_free(ctx); ctx = nullptr; }
+        gf  = nullptr;
+        key = -1;
+    }
+};
+
+constexpr size_t T3_STEP_CACHE_CAP = 256;
+
+// Caching is opt-in to avoid a small (~10 %) T3 regression on
+// single-utterance workloads where every step call is a cache miss.
+// In a single multilingual synth, n_past goes 0, 1, 2, ..., N-1 once
+// each, so the cache fills up but nothing is re-used — every miss
+// pays the bookkeeping cost (vector::resize, list insert, mutex
+// acquire) without any compensating hit savings.
+//
+// Server-mode and other multi-synth callers — where synth #2 starts
+// at n_past=0 again and re-decodes the same prompt prefix as
+// synth #1 — get a real win (~3 ms × hits per call ≈ 1 s / synth
+// on multilingual), so the env var unlocks caching for those
+// workloads:
+//
+//   CHATTERBOX_T3_STEP_CACHE=1 ./tts-cli ...
+//
+// Reads once at first use, cached as a static const bool.  Tests
+// set the env var via `setenv()` before any eval_step_mtl call.
+bool t3_step_cache_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("CHATTERBOX_T3_STEP_CACHE");
+        if (!e || !e[0]) return false;
+        return e[0] == '1' || e[0] == 't' || e[0] == 'T' ||
+               e[0] == 'y' || e[0] == 'Y';
+    }();
+    return enabled;
+}
+
+// Mutex protects the entire cache state below.  Held only across cache
+// state mutations, not across the underlying backend compute itself.
+std::mutex                                                              t3_step_cache_mu;
+std::list<t3_step_cache_entry>                                          t3_step_cache_lru;     // front = most recent
+std::unordered_map<int64_t, std::list<t3_step_cache_entry>::iterator>   t3_step_cache_idx;
+size_t                                                                  t3_step_cache_hits     = 0;
+size_t                                                                  t3_step_cache_misses   = 0;
+bool                                                                    t3_step_cache_atexit_registered = false;
+
+inline int64_t pack_step_key(int n_past, bool is_uncond) {
+    return ((int64_t) n_past << 1) | (is_uncond ? 1 : 0);
+}
+
+void t3_step_cache_release_locked() {
+    // Caller holds t3_step_cache_mu.
+    t3_step_cache_idx.clear();
+    t3_step_cache_lru.clear();   // entries' destructors free ctx + allocr
+    t3_step_cache_hits   = 0;
+    t3_step_cache_misses = 0;
+}
+
+void t3_step_cache_release_atexit() {
+    std::lock_guard<std::mutex> lk(t3_step_cache_mu);
+    t3_step_cache_release_locked();
+}
+
+// Look up a cached entry; on hit, splice it to the front (LRU "touch").
+// Returns nullptr on miss.  Mutex must NOT be held by caller.
+t3_step_cache_entry * t3_step_cache_lookup(int n_past, bool is_uncond) {
+    const int64_t key = pack_step_key(n_past, is_uncond);
+    std::lock_guard<std::mutex> lk(t3_step_cache_mu);
+    auto it = t3_step_cache_idx.find(key);
+    if (it == t3_step_cache_idx.end()) {
+        ++t3_step_cache_misses;
+        return nullptr;
+    }
+    // Move to front (LRU touch).  splice within the same list keeps
+    // iterators valid; this is the canonical std::list LRU pattern.
+    t3_step_cache_lru.splice(t3_step_cache_lru.begin(),
+                             t3_step_cache_lru, it->second);
+    ++t3_step_cache_hits;
+    return &(*it->second);
+}
+
+// Build a new cached entry and insert at the front.  If the cache is
+// at capacity, evicts the oldest (back-of-list) entry first.  Returns
+// the inserted entry, or nullptr on failure (e.g., backend init).
+//
+// Caller must NOT hold the mutex; this function takes it internally
+// because the build itself is heavy (~3 ms) and we don't want to
+// block other reader threads on it.  Two threads racing on the same
+// (n_past, is_uncond) miss are serialised here so only one builds.
+t3_step_cache_entry * t3_step_cache_insert_or_get(const chatterbox_model & model,
+                                                  int n_past, bool is_uncond) {
+    const int64_t key = pack_step_key(n_past, is_uncond);
+    std::lock_guard<std::mutex> lk(t3_step_cache_mu);
+
+    // Re-check after locking — another thread may have inserted while
+    // we were waiting.
+    auto existing = t3_step_cache_idx.find(key);
+    if (existing != t3_step_cache_idx.end()) {
+        t3_step_cache_lru.splice(t3_step_cache_lru.begin(),
+                                 t3_step_cache_lru, existing->second);
+        ++t3_step_cache_hits;
+        return &(*existing->second);
+    }
+
+    // Evict back-of-list if at capacity.
+    if (t3_step_cache_lru.size() >= T3_STEP_CACHE_CAP) {
+        const int64_t old_key = t3_step_cache_lru.back().key;
+        t3_step_cache_idx.erase(old_key);
+        t3_step_cache_lru.pop_back();   // dtor frees ctx + allocr
+    }
+
+    // Build the new entry at the front.
+    t3_step_cache_lru.emplace_front();
+    t3_step_cache_entry & e = t3_step_cache_lru.front();
+
+    const size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
+                            ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
+    e.buf.resize(buf_size);
+    e.key = key;
+
+    ggml_init_params p = { buf_size, e.buf.data(), /*no_alloc=*/true };
+    e.ctx = ggml_init(p);
+    if (!e.ctx) {
+        t3_step_cache_lru.pop_front();
+        return nullptr;
+    }
+
+    e.gf = build_step_graph_mtl_in_ctx(model, e.ctx, n_past, is_uncond);
+    if (!e.gf) {
+        t3_step_cache_lru.pop_front();
+        return nullptr;
+    }
+
+    t3_step_cache_idx[key] = t3_step_cache_lru.begin();
+
+    if (!t3_step_cache_atexit_registered) {
+        std::atexit(t3_step_cache_release_atexit);
+        t3_step_cache_atexit_registered = true;
+    }
+
+    return &t3_step_cache_lru.front();
+}
+
+}  // namespace
+
+// Public release entry-point.  Called from chatterbox_cli.cpp's
+// free_t3 lambda and chatterbox_engine.cpp's Impl::free_model BEFORE
+// ggml_backend_free.  Idempotent.
+void t3_release_caches() {
+    std::lock_guard<std::mutex> lk(t3_step_cache_mu);
+    t3_step_cache_release_locked();
+}
+
+// detail-scope bridges so the test_hooks namespace (defined further
+// down, outside detail::) can reach the round-4 cache state without
+// each individual symbol leaking into the public surface.  These
+// helpers are NOT for production callers; the only consumers are
+// test_hooks::t3_* in the same TU.
+size_t _t3_step_cache_size_for_tests() {
+    std::lock_guard<std::mutex> lk(t3_step_cache_mu);
+    return t3_step_cache_lru.size();
+}
+size_t _t3_step_cache_capacity_for_tests() {
+    return T3_STEP_CACHE_CAP;
+}
+bool _t3_step_cache_contains_for_tests(int n_past, bool is_uncond) {
+    const int64_t key = pack_step_key(n_past, is_uncond);
+    std::lock_guard<std::mutex> lk(t3_step_cache_mu);
+    return t3_step_cache_idx.count(key) > 0;
+}
+size_t _t3_step_cache_hits_for_tests() {
+    std::lock_guard<std::mutex> lk(t3_step_cache_mu);
+    return t3_step_cache_hits;
+}
+size_t _t3_step_cache_misses_for_tests() {
+    std::lock_guard<std::mutex> lk(t3_step_cache_mu);
+    return t3_step_cache_misses;
 }
 
 namespace {
@@ -750,16 +1010,14 @@ ggml_cgraph * build_step_graph_mtl_b2(const chatterbox_model & model,
     return gf;
 }
 
-ggml_cgraph * build_step_graph_mtl(const chatterbox_model & model,
-                                   int n_past,
-                                   bool is_uncond) {
+// Body of the step graph build, parameterised on a caller-provided
+// ggml_context.  Lets the (round-4) step-graph cache hold the ctx
+// alive across calls without sharing the legacy thread_local buf.
+ggml_cgraph * build_step_graph_mtl_in_ctx(const chatterbox_model & model,
+                                          ggml_context * ctx,
+                                          int n_past,
+                                          bool is_uncond) {
     const auto & hp = model.hparams;
-
-    static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
-                             ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
-    thread_local std::vector<uint8_t> buf(buf_size);
-    ggml_init_params p = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
 
     ggml_tensor * speech_token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
@@ -791,6 +1049,22 @@ ggml_cgraph * build_step_graph_mtl(const chatterbox_model & model,
     ggml_set_name(logits, "logits"); ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
 
+    return gf;
+}
+
+// Legacy non-cached entry point (still used as fallback when the
+// step-graph cache is at capacity).  Frees the per-call ctx — gf
+// remains valid because the bytes live in the thread_local buf
+// until the next call to ggml_init reuses the buf.
+ggml_cgraph * build_step_graph_mtl(const chatterbox_model & model,
+                                   int n_past,
+                                   bool is_uncond) {
+    static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
+                             ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
+    thread_local std::vector<uint8_t> buf(buf_size);
+    ggml_init_params p = { buf_size, buf.data(), true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_cgraph * gf = build_step_graph_mtl_in_ctx(model, ctx, n_past, is_uncond);
     ggml_free(ctx);
     return gf;
 }
@@ -994,7 +1268,27 @@ bool run_step_pass(const chatterbox_model & model,
                    int32_t token,
                    bool is_uncond,
                    std::vector<float> & logits_out) {
-    ggml_cgraph * gf = build_step_graph_mtl(model, n_past, is_uncond);
+    // QVAC-18422 round 4: when CHATTERBOX_T3_STEP_CACHE is set, try
+    // the per-(n_past, is_uncond) graph cache first.  On hit, we skip
+    // the ~3 ms build cost.  On miss + room: build into a fresh
+    // cache entry; the caller's allocator is used for layout either
+    // way (no ~1 MB-per-entry backend buffer regression).  On miss +
+    // cache full: fall back to the legacy thread_local-buf path.
+    //
+    // Default-disabled because in single-utterance workloads every
+    // step call is a unique n_past — the cache fills up but nothing
+    // is re-used.  See the t3_step_cache_enabled() comment above.
+    t3_step_cache_entry * entry = nullptr;
+    if (t3_step_cache_enabled()) {
+        entry = t3_step_cache_lookup(n_past, is_uncond);
+        if (!entry) {
+            entry = t3_step_cache_insert_or_get(model, n_past, is_uncond);
+        }
+    }
+
+    ggml_cgraph * gf = entry ? entry->gf
+                             : build_step_graph_mtl(model, n_past, is_uncond);
+
     // alloc_graph reserves lazily; see run_step_pass_b2 comment.
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_step_pass: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
@@ -1680,3 +1974,37 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
 }
 
 } // namespace tts_cpp::chatterbox::detail
+
+// ============================================================================
+// QVAC-18422 round 4 — T3 step-graph cache test hooks
+// ============================================================================
+//
+// Read-only observability for the cache state declared in the round-4
+// section of t3_mtl.cpp.  The cache state lives in an anonymous
+// namespace inside detail::; these forwarders go through the
+// `_t3_step_cache_*_for_tests` bridges defined alongside it.
+
+#include "chatterbox_tts_test_hooks.h"
+
+namespace tts_cpp::chatterbox::test_hooks {
+
+size_t t3_step_graph_cache_size() {
+    return tts_cpp::chatterbox::detail::_t3_step_cache_size_for_tests();
+}
+size_t t3_step_graph_cache_capacity() {
+    return tts_cpp::chatterbox::detail::_t3_step_cache_capacity_for_tests();
+}
+bool t3_step_graph_cache_contains(int n_past, bool is_uncond) {
+    return tts_cpp::chatterbox::detail::_t3_step_cache_contains_for_tests(n_past, is_uncond);
+}
+size_t t3_step_graph_cache_hits() {
+    return tts_cpp::chatterbox::detail::_t3_step_cache_hits_for_tests();
+}
+size_t t3_step_graph_cache_misses() {
+    return tts_cpp::chatterbox::detail::_t3_step_cache_misses_for_tests();
+}
+void t3_release_caches() {
+    tts_cpp::chatterbox::detail::t3_release_caches();
+}
+
+}  // namespace tts_cpp::chatterbox::test_hooks

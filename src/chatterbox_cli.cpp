@@ -1183,6 +1183,12 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     tts_cpp::chatterbox::detail::t3_stack_unregister(
                         model.buffer_stack, model.ctx_stack);
                 }
+                // QVAC-18422 round 4: drop the T3 step-graph cache
+                // BEFORE freeing the backend.  The cache holds
+                // gallocators that carry backend references; freeing
+                // them against a dead backend would assert inside the
+                // ggml-metal / ggml-vulkan / ggml-cuda dylib finalisers.
+                tts_cpp::chatterbox::detail::t3_release_caches();
                 ggml_backend_buffer_free(model.buffer_w);
                 ggml_backend_buffer_free(model.buffer_kv);
                 if (model.buffer_stack)    ggml_backend_buffer_free(model.buffer_stack);
@@ -2332,6 +2338,9 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 (long long)t3_total_ms, t3_tokens_total);
 
         ggml_gallocr_free(allocr);
+        // QVAC-18422 round 4: drop T3 step-graph cache BEFORE freeing
+        // the backend (gallocators in cached entries reference it).
+        tts_cpp::chatterbox::detail::t3_release_caches();
         ggml_backend_buffer_free(model.buffer_w);
         ggml_backend_buffer_free(model.buffer_kv);
         if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
