@@ -30,7 +30,8 @@ The branch now contains a full Supertonic path:
 |---|---|
 | `scripts/setup-supertonic2.sh` | Downloads the official Hugging Face bundle and writes the local GGUF. |
 | `scripts/convert-supertonic2-to-gguf.py` | Converts official ONNX/assets into `models/supertonic2.gguf` or `models/supertonic.gguf`. |
-| `build/supertonic-cli` | Supertonic text → 44.1 kHz wav on CPU. |
+| `build/tts-cli` | Autodetects `supertonic.arch` and routes Supertonic text → 44.1 kHz wav on CPU. |
+| `build/supertonic-cli` | Focused Supertonic compatibility/debug wrapper. |
 | `build/supertonic-bench` | Per-stage Supertonic benchmark with JSON output. |
 | `test-supertonic-*` | Stage and trace parity harnesses against ONNX reference dumps. |
 
@@ -472,15 +473,6 @@ python scripts/convert-supertonic2-to-gguf.py \
 
 ## Remaining Work
 
-### Product integration
-
-- Integrate Supertonic into `tts-cli` autodispatch.
-  - Detect `supertonic.arch` in the GGUF metadata.
-  - Route to the Supertonic engine when present.
-  - Keep Chatterbox `chatterbox.variant` routing unchanged.
-- Keep `supertonic-cli` as a debug/compatibility wrapper or make it a thin
-  alias after `tts-cli` support lands.
-
 ### Runtime and performance
 
 - Investigate vector 3/4-thread variance.
@@ -506,13 +498,13 @@ python scripts/convert-supertonic2-to-gguf.py \
 
 ```bash
 # Build Supertonic targets.
-cmake --build build --target supertonic-cli supertonic-bench test-supertonic-pipeline
+cmake --build build --target tts-cli supertonic-cli supertonic-bench test-supertonic-pipeline
 
 # Create local Supertonic 2 GGUF.
 bash scripts/setup-supertonic2.sh
 
 # Synthesize with Supertonic 2.
-./build/supertonic-cli \
+./build/tts-cli \
   --model models/supertonic2.gguf \
   --text "The quick brown fox jumps over the lazy dog." \
   --voice F1 --language en --steps 5 --speed 1.05 \

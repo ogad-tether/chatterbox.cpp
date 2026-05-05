@@ -80,8 +80,9 @@ quantisation pass that ships in this repo (§3.20)).
 ```
 
 `tts-cli` (and the back-compat `chatterbox` binary, same code) handles
-**both** Chatterbox variants — the runtime auto-detects the variant
-from `chatterbox.variant` GGUF metadata and dispatches:
+both Chatterbox variants via `chatterbox.variant` GGUF metadata.  Supertonic
+GGUFs are also autodetected from `supertonic.arch` and routed to the
+Supertonic engine.
 
 | Stage         | Turbo                                      | Multilingual                                        |
 |---------------|--------------------------------------------|-----------------------------------------------------|
@@ -116,7 +117,9 @@ Current status:
   (English) or `models/supertonic2.gguf` (multilingual), depending on flags.
   When `--onnx-dir` is omitted, it downloads the selected repo just like the
   Chatterbox converters.
-- `build/supertonic-cli` can synthesize a 44.1 kHz wav on CPU.
+- `build/tts-cli` autodetects Supertonic GGUFs from `supertonic.arch` and can
+  synthesize a 44.1 kHz wav on CPU.  `build/supertonic-cli` remains as a
+  focused compatibility/debug wrapper.
 - All four stages pass numerical parity against the ONNX reference
   (preprocess, duration, text encoder, vector estimator, vocoder), and the
   full pipeline (`test-supertonic-pipeline`) reproduces the ONNX reference
@@ -167,8 +170,8 @@ Example:
 # Stable English bundle: no language wrapping.
 bash scripts/setup-supertonic2.sh --arch supertonic
 
-cmake --build build --target supertonic-cli
-./build/supertonic-cli \
+cmake --build build --target tts-cli
+./build/tts-cli \
   --model models/supertonic.gguf \
   --text "The quick brown fox jumps over the lazy dog." \
   --voice F1 --language en --steps 5 --speed 1.05 \
@@ -177,15 +180,15 @@ cmake --build build --target supertonic-cli
 # Multilingual bundle: uses the <lang>...</lang> wrapping path.
 bash scripts/setup-supertonic2.sh
 
-cmake --build build --target supertonic-cli
-./build/supertonic-cli \
+cmake --build build --target tts-cli
+./build/tts-cli \
   --model models/supertonic2.gguf \
   --text "The quick brown fox jumps over the lazy dog." \
   --voice M1 --language en --steps 5 --speed 1.05 \
   --out /tmp/supertonic.wav
 
 # Bit-exact reproduction of the ONNX reference run (pass the same noise tensor)
-./build/supertonic-cli --model models/supertonic2.gguf \
+./build/tts-cli --model models/supertonic2.gguf \
   --text "The quick brown fox jumps over the lazy dog." \
   --voice M1 --language en --steps 5 --speed 1.05 \
   --noise-npy artifacts/supertonic-ref-quick/noise.npy \
@@ -270,7 +273,7 @@ code, and a set of per-stage validation harnesses:
 
 | Binary | What it does |
 |--------|--------------|
-| `build/tts-cli`            | End-to-end: text → speech tokens (T3) → wav (S3Gen + HiFT). Handles voice cloning via `--reference-audio`, autodetects Turbo vs Multilingual from the T3 GGUF. |
+| `build/tts-cli`            | End-to-end Chatterbox text → speech tokens (T3) → wav (S3Gen + HiFT), plus Supertonic text → wav. Handles Chatterbox voice cloning via `--reference-audio`, autodetects Chatterbox Turbo/Multilingual from `chatterbox.variant`, and autodetects Supertonic from `supertonic.arch`. |
 | `build/chatterbox`         | Identical second binary kept for backward compatibility with pre-rename scripts; same source as `tts-cli`. |
 | `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
 | `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
