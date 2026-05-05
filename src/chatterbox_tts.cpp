@@ -2594,8 +2594,12 @@ int s3gen_synthesize_to_wav(
 
         double step_t0 = now_ms();
         std::vector<float> dxdt_cond;
+        std::vector<float> dxdt_uncond;
+        // True when this step needs the CFG combine — both flavours of
+        // CFG path (B=2 batched and B=1 two-call) populate dxdt_uncond
+        // and require the linear `(1+cfg)*cond - cfg*uncond` mix.
+        bool have_cfg_uncond = false;
         if (use_b2) {
-            std::vector<float> dxdt_uncond;
             cfm_estimator_forward_b2(m, cfm_cache,
                 z, z,
                 mu, zero_mu,
@@ -2603,9 +2607,7 @@ int s3gen_synthesize_to_wav(
                 spks, zero_spks,
                 cond, zero_cond,
                 dxdt_cond, dxdt_uncond, T_mu, opts.cfm_f16_kv_attn);
-            for (size_t i = 0; i < dxdt_cond.size(); ++i) {
-                dxdt_cond[i] = (1.0f + cfg_rate) * dxdt_cond[i] - cfg_rate * dxdt_uncond[i];
-            }
+            have_cfg_uncond = true;
         } else if (!meanflow && cfg_rate != 0.0f) {
             // Non-Metal CFG path (CPU + any backend where use_b2 is false).
             // Run the conditional and unconditional passes back-to-back on
@@ -2616,12 +2618,21 @@ int s3gen_synthesize_to_wav(
             // previously the else clause computed only the conditional pass
             // and dropped CFG entirely on every non-Metal backend.
             dxdt_cond = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, opts.cfm_f16_kv_attn);
-            auto dxdt_uncond = cfm_estimator_forward(m, cfm_cache, z, zero_mu, t_emb, zero_spks, zero_cond, T_mu, opts.cfm_f16_kv_attn);
+            dxdt_uncond = cfm_estimator_forward(m, cfm_cache, z, zero_mu, t_emb, zero_spks, zero_cond, T_mu, opts.cfm_f16_kv_attn);
+            have_cfg_uncond = true;
+        } else {
+            dxdt_cond = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, opts.cfm_f16_kv_attn);
+        }
+
+        // Debug + dump hooks read the post-CFG-combine dxdt; precompute it
+        // when the caller actually asks for it, otherwise fold the combine
+        // into the Euler step below to save a pass over the array.
+        const bool need_full_dxdt = (debug_mode && meanflow) ||
+                                    (s == 0 && !opts.dump_mel_path.empty());
+        if (have_cfg_uncond && need_full_dxdt) {
             for (size_t i = 0; i < dxdt_cond.size(); ++i) {
                 dxdt_cond[i] = (1.0f + cfg_rate) * dxdt_cond[i] - cfg_rate * dxdt_uncond[i];
             }
-        } else {
-            dxdt_cond = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, opts.cfm_f16_kv_attn);
         }
         auto & dxdt = dxdt_cond;
         vlog("  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
@@ -2644,7 +2655,22 @@ int s3gen_synthesize_to_wav(
                     MEL, T_mu, base.c_str());
         }
 
-        for (size_t i = 0; i < z.size(); ++i) z[i] = z[i] + dt * dxdt[i];
+        // Fused CFG-combine + Euler step (QVAC-18422 round 3).  Saves one
+        // pass over `dxdt` per step.  When the debug/dump code-paths above
+        // already wrote the combined result back into `dxdt_cond`, we
+        // detect it via `need_full_dxdt && have_cfg_uncond` and fall back
+        // to the plain `z + dt * dxdt_cond` form so the math stays
+        // bit-exact across both branches.
+        if (have_cfg_uncond && !need_full_dxdt) {
+            const float c1 = (1.0f + cfg_rate);
+            const float c0 = -cfg_rate;
+            for (size_t i = 0; i < z.size(); ++i) {
+                const float d = c1 * dxdt_cond[i] + c0 * dxdt_uncond[i];
+                z[i] = z[i] + dt * d;
+            }
+        } else {
+            for (size_t i = 0; i < z.size(); ++i) z[i] = z[i] + dt * dxdt[i];
+        }
     }
     vlog("  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
 

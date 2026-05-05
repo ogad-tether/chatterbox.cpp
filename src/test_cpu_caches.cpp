@@ -468,6 +468,39 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
         CHECK(b.size() == 1024,
               "time_mlp cached entry must be (1024,) — saw %zu", b.size());
     }
+
+    // Variant-specific schedule shape — derived from the time_mlp cache
+    // size after a synth populates it.  Multilingual = 10 cosine-spaced
+    // t-values + 0 time_emb pairs (non-meanflow); Turbo = ≤3 t-values
+    // + 2 (t,r) time_emb pairs (meanflow).
+    if (n_time_mlp_after_a == 10 && n_time_emb_after_a == 0) {
+        // Multilingual cosine schedule: every entry must round-trip,
+        // every cosine_t(i, 10) for i in 0..9 must be present.
+        fprintf(stderr, "  detected multilingual variant (cosine n_timesteps=10)\n");
+        for (int i = 0; i < 10; ++i) {
+            float t_cos = cosine_t(i, 10);
+            auto v = th::peek_time_mlp_cached(t_cos);
+            CHECK(!v.empty(),
+                  "multilingual cosine t_span entry %d (t=%.6f) must be cached "
+                  "after first synth", i, t_cos);
+            if (!v.empty()) {
+                CHECK(v.size() == 1024,
+                      "multilingual cached t_emb entry %d size must be 1024 — "
+                      "saw %zu", i, v.size());
+            }
+        }
+    } else if (n_time_mlp_after_a <= 3 && n_time_emb_after_a == 2) {
+        fprintf(stderr, "  detected Turbo variant (meanflow t_span ⊆ {0,0.5,1})\n");
+        // Turbo's meanflow loop visits the pairs (0, 0.5) and (0.5, 1).
+        auto v05 = th::peek_time_mlp_cached(0.5f);
+        CHECK(!v05.empty(),
+              "Turbo: t_val=0.5 must be in time_mlp cache after first synth");
+    } else {
+        fprintf(stderr,
+                "  unrecognised variant: time_mlp=%zu time_emb=%zu — neither "
+                "the multilingual (10/0) nor Turbo (≤3/2) shape\n",
+                n_time_mlp_after_a, n_time_emb_after_a);
+    }
 }
 
 // ---------------- 4. Streaming shape invalidation ---------------------------
