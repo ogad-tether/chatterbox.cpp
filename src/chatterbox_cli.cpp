@@ -68,9 +68,21 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/select.h>
-#include <fcntl.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  include <io.h>
+#  include <direct.h>
+#  ifndef S_ISREG
+#    define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#  endif
+#  ifndef S_ISDIR
+#    define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#  endif
+#  define mkdir(path, mode) _mkdir(path)
+#else
+#  include <sys/select.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
 
 using namespace tts_cpp::chatterbox::detail;
 
@@ -1150,6 +1162,10 @@ int tts_cpp_cli_main(int argc, char ** argv) {
         // new sentence ≈ T3 prompt eval (~100-300 ms with Metal+q8_0) +
         // first-chunk S3Gen (~250 ms) ≈ 400-550 ms.
         if (!params.input_file.empty()) {
+#ifdef _WIN32
+            fprintf(stderr, "error: --input-file streaming is not supported on Windows in this build.\n");
+            return 1;
+#else
             // Wait for the S3Gen background preload up-front so that any
             // early-return below (fopen failure, missing tokenizer, ...)
             // doesn't leave a joinable std::thread that std::terminate()s on
@@ -1691,6 +1707,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             ggml_gallocr_free(allocr_live);
             free_t3();
             return loop_rc;
+#endif
         }
 
         // ----------- Segment planning & tokenization ------------------

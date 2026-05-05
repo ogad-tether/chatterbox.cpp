@@ -33,6 +33,10 @@ endif()
 
 find_package(OpenMP)
 
+if (MSVC)
+    add_compile_definitions(_USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+endif()
+
 set(TTS_CPP_LIB_SOURCES
     src/main.cpp
     src/chatterbox_cli.cpp
