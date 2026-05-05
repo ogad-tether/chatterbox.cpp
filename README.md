@@ -118,18 +118,44 @@ Current status:
   full pipeline (`test-supertonic-pipeline`) reproduces the ONNX reference
   waveform when fed the same initial noise tensor.
 - The production path is GGML-backed for duration, text encoder, vector
-  estimator, and vocoder.  Text relative-position self-attention is expressed
-  with stock GGML ops, and the speech-prompted text attention / vector
-  attention blocks use `ggml_flash_attn_ext` where the math allows it.
-- Vector estimator still uses several smaller graph islands with explicit
-  host-side layout packing between them.  `SUPERTONIC_VECTOR_PROFILE=1` prints
-  per-island timings for tuning those boundaries.
+  estimator, and vocoder.  Text relative-position self-attention and FFN blocks
+  are expressed with stock GGML ops, and the speech-prompted text attention /
+  vector attention blocks use `ggml_flash_attn_ext` where the math allows it.
+- Vector attention uses strided Q/K/V GGML views where the time-channel layout
+  permits it.  The vector runtime also keeps persistent graph/allocr caches for
+  attention, ConvNeXt group, and tail islands, plus fused ConvNeXt boundary /
+  tail update graphs and portable custom CPU kernels for pointwise Conv1D,
+  depthwise Conv1D, row-wise layer norm, dense time matmul, and fused
+  bias/GELU/residual elementwise work.
+- The vocoder keeps a persistent GGML graph cache and uses portable
+  BLAS/Accelerate-backed causal Conv1D custom ops for the hot projection paths.
+  BLAS worker threads are capped by default to avoid nested oversubscription
+  under GGML task-level threading.
+- `SUPERTONIC_VECTOR_PROFILE=1` and `SUPERTONIC_TEXT_PROFILE=1` print
+  per-island timings for tuning graph boundaries.  Current text profiling shows
+  stock-op relpos is ~0.7-0.8 ms/layer on the quick prompt, so a fused relpos
+  op is deferred until backend profiling proves it necessary.
 - CPU thread count is controlled by `--threads`; the default caps at 4 threads
   because the current small-graph Supertonic path regresses when oversubscribed.
-- Current quick-brown-fox CPU baseline on this machine (F1, English,
-  5 steps, speed `1.05`, 4 GGML threads) is median `RTF ≈ 0.170`
-  (`~5.9x` real time).  Matched ONNX Runtime CPU with 1 thread is median
-  `RTF ≈ 0.116`.
+- Current CPU benchmark artifacts live in
+  `artifacts/supertonic-thread-matrix/`.  The final matched matrix on this
+  machine uses F1, 5 denoise steps, speed `1.05`, `runs=3`, `warmup=1`, and
+  ONNX Runtime `CPUExecutionProvider` only.  GGML wins 10 of 12 matched
+  thread/prompt comparisons.  The only end-to-end losses are quick English at
+  4 threads (`157.7 ms` vs `148.8 ms`) and long English at 4 threads
+  (`361.2 ms` vs `351.5 ms`).
+- The current quick prompt 4-thread medians are `13.5 ms` text encoder,
+  `96.3 ms` vector estimator, `43.6 ms` vocoder, and `157.7 ms` total
+  (`RTF 0.050`).  Portuguese 4-thread now wins end to end (`234.3 ms` GGML vs
+  `250.8 ms` ONNX), with GGML vocoder at `68.9 ms` vs ONNX `95.6 ms`.
+
+Latest matched CPU matrix, median total milliseconds:
+
+| Prompt | GGML 1t | GGML 2t | GGML 3t | GGML 4t | ONNX 1t | ONNX 2t | ONNX 3t | ONNX 4t |
+|--------|--------:|--------:|--------:|--------:|--------:|--------:|--------:|--------:|
+| quick English | 298.0 | 189.4 | 157.7 | 157.7 | 373.8 | 218.5 | 168.3 | 148.8 |
+| longer English | 757.5 | 491.2 | 390.3 | 361.2 | 1103.0 | 580.6 | 555.7 | 351.5 |
+| Portuguese smoke | 457.2 | 292.9 | 251.0 | 234.3 | 610.6 | 344.6 | 268.3 | 250.8 |
 
 Example:
 

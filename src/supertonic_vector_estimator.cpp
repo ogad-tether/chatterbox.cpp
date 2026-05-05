@@ -2,6 +2,12 @@
 
 #include "ggml-alloc.h"
 
+#if defined(TTS_CPP_USE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#elif defined(TTS_CPP_USE_CBLAS)
+#include <cblas.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -147,6 +153,49 @@ ggml_tensor * conv1d_f32(ggml_context * ctx,
                          int stride,
                          int padding,
                          int dilation) {
+#if defined(TTS_CPP_USE_ACCELERATE) || defined(TTS_CPP_USE_CBLAS)
+    if (kernel->ne[0] == 1 && stride == 1 && padding == 0 && dilation == 1 &&
+        input->type == GGML_TYPE_F32 && kernel->type == GGML_TYPE_F32 &&
+        input->ne[2] == 1 && input->ne[3] == 1) {
+        auto pointwise_op = [](ggml_tensor * dst, int ith, int nth, void *) {
+            const ggml_tensor * x = dst->src[0];
+            const ggml_tensor * w = dst->src[1];
+            const int L = (int)x->ne[0];
+            const int IC = (int)x->ne[1];
+            const int OC = (int)w->ne[2];
+            const int oc0 = (OC * ith) / nth;
+            const int oc1 = (OC * (ith + 1)) / nth;
+            if (oc0 >= oc1) return;
+            const float * x_data = static_cast<const float *>(x->data);
+            const float * w_data = static_cast<const float *>(w->data);
+            float * y_data = static_cast<float *>(dst->data);
+            const int lda = (int)(x->nb[1] / sizeof(float));
+            const int ldb = (int)(w->nb[2] / sizeof(float));
+            const int ldc = (int)(dst->nb[1] / sizeof(float));
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        L, oc1 - oc0, IC,
+                        1.0f,
+                        x_data, lda,
+                        w_data + (size_t)oc0 * ldb, ldb,
+                        0.0f,
+                        y_data + (size_t)oc0 * ldc, ldc);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+        };
+        ggml_tensor * args[] = { input, kernel };
+        return ggml_custom_4d(ctx, GGML_TYPE_F32,
+                              input->ne[0], kernel->ne[2], input->ne[2], input->ne[3],
+                              args, 2,
+                              pointwise_op,
+                              GGML_N_TASKS_MAX,
+                              nullptr);
+    }
+#endif
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
     ggml_tensor * result = ggml_mul_mat(ctx,
         ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
@@ -171,11 +220,106 @@ ggml_tensor * edge_clamp_pad_1d(ggml_context * ctx, ggml_tensor * x, int pad_lef
     return out;
 }
 
+struct depthwise_same_op_config {
+    int dilation = 1;
+};
+
+const depthwise_same_op_config * depthwise_same_config(int dilation) {
+    static const depthwise_same_op_config d1{1};
+    static const depthwise_same_op_config d2{2};
+    static const depthwise_same_op_config d4{4};
+    static const depthwise_same_op_config d8{8};
+    switch (dilation) {
+        case 1: return &d1;
+        case 2: return &d2;
+        case 4: return &d4;
+        case 8: return &d8;
+        default: return nullptr;
+    }
+}
+
+void depthwise_same_custom_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto * cfg = static_cast<const depthwise_same_op_config *>(userdata);
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * b = dst->src[2];
+    const int L = (int)x->ne[0];
+    const int C = (int)x->ne[1];
+    const int K = (int)w->ne[0];
+    const int dilation = cfg ? cfg->dilation : 1;
+    const int pad_left = ((K - 1) * dilation) / 2;
+    const int c0 = (C * ith) / nth;
+    const int c1 = (C * (ith + 1)) / nth;
+
+    const auto * x_base = static_cast<const uint8_t *>(x->data);
+    const auto * w_base = static_cast<const uint8_t *>(w->data);
+    const auto * b_base = static_cast<const uint8_t *>(b->data);
+    auto * dst_base = static_cast<uint8_t *>(dst->data);
+
+    for (int c = c0; c < c1; ++c) {
+        const float bias = *reinterpret_cast<const float *>(b_base + (size_t)c * b->nb[0]);
+        if (K == 5) {
+            const float w0 = *reinterpret_cast<const float *>(w_base + (size_t)c * w->nb[2]);
+            const float w1 = *reinterpret_cast<const float *>(w_base + w->nb[0] + (size_t)c * w->nb[2]);
+            const float w2 = *reinterpret_cast<const float *>(w_base + 2 * w->nb[0] + (size_t)c * w->nb[2]);
+            const float w3 = *reinterpret_cast<const float *>(w_base + 3 * w->nb[0] + (size_t)c * w->nb[2]);
+            const float w4 = *reinterpret_cast<const float *>(w_base + 4 * w->nb[0] + (size_t)c * w->nb[2]);
+            for (int t = 0; t < L; ++t) {
+                const int s0 = std::max(0, t - 2 * dilation);
+                const int s1 = std::max(0, t - dilation);
+                const int s2 = t;
+                const int s3 = std::min(L - 1, t + dilation);
+                const int s4 = std::min(L - 1, t + 2 * dilation);
+                const float x0 = *reinterpret_cast<const float *>(x_base + (size_t)s0 * x->nb[0] + (size_t)c * x->nb[1]);
+                const float x1 = *reinterpret_cast<const float *>(x_base + (size_t)s1 * x->nb[0] + (size_t)c * x->nb[1]);
+                const float x2 = *reinterpret_cast<const float *>(x_base + (size_t)s2 * x->nb[0] + (size_t)c * x->nb[1]);
+                const float x3 = *reinterpret_cast<const float *>(x_base + (size_t)s3 * x->nb[0] + (size_t)c * x->nb[1]);
+                const float x4 = *reinterpret_cast<const float *>(x_base + (size_t)s4 * x->nb[0] + (size_t)c * x->nb[1]);
+                const float sum = bias + x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4;
+                *reinterpret_cast<float *>(dst_base + (size_t)t * dst->nb[0] + (size_t)c * dst->nb[1]) = sum;
+            }
+            continue;
+        }
+        for (int t = 0; t < L; ++t) {
+            float sum = bias;
+            for (int k = 0; k < K; ++k) {
+                int st = t + k * dilation - pad_left;
+                st = std::max(0, std::min(L - 1, st));
+                const float xv = *reinterpret_cast<const float *>(x_base + (size_t)st * x->nb[0] + (size_t)c * x->nb[1]);
+                const float wv = *reinterpret_cast<const float *>(w_base + (size_t)k * w->nb[0] + (size_t)c * w->nb[2]);
+                sum += xv * wv;
+            }
+            *reinterpret_cast<float *>(dst_base + (size_t)t * dst->nb[0] + (size_t)c * dst->nb[1]) = sum;
+        }
+    }
+}
+
+ggml_tensor * depthwise_same_custom_ggml(ggml_context * ctx,
+                                         ggml_tensor * x,
+                                         ggml_tensor * w,
+                                         ggml_tensor * b,
+                                         int dilation) {
+    const depthwise_same_op_config * cfg = depthwise_same_config(dilation);
+    if (!cfg || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = { x, w, b };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32,
+                          x->ne[0], x->ne[1], x->ne[2], x->ne[3],
+                          args, 3,
+                          depthwise_same_custom_op,
+                          GGML_N_TASKS_MAX,
+                          const_cast<depthwise_same_op_config *>(cfg));
+}
+
 ggml_tensor * depthwise_same_ggml(ggml_context * ctx,
                                   ggml_tensor * x,
                                   ggml_tensor * w,
                                   ggml_tensor * b,
                                   int dilation) {
+    if (ggml_tensor * custom = depthwise_same_custom_ggml(ctx, x, w, b, dilation)) {
+        return custom;
+    }
     const int K = (int) w->ne[0];
     const int pad_left = ((K - 1) * dilation) / 2;
     const int pad_right = (K - 1) * dilation - pad_left;
@@ -191,6 +335,46 @@ ggml_tensor * layer_norm_ggml(ggml_context * ctx,
                               ggml_tensor * x,
                               ggml_tensor * g,
                               ggml_tensor * b) {
+    if (x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+        x->ne[2] == 1 && x->ne[3] == 1) {
+        auto layer_norm_op = [](ggml_tensor * dst, int ith, int nth, void *) {
+            const ggml_tensor * src = dst->src[0];
+            const ggml_tensor * gamma = dst->src[1];
+            const ggml_tensor * beta = dst->src[2];
+            const int L = (int)src->ne[0];
+            const int C = (int)src->ne[1];
+            const int t0 = (L * ith) / nth;
+            const int t1 = (L * (ith + 1)) / nth;
+            const auto * src_base = static_cast<const uint8_t *>(src->data);
+            const auto * gamma_base = static_cast<const uint8_t *>(gamma->data);
+            const auto * beta_base = static_cast<const uint8_t *>(beta->data);
+            auto * dst_base = static_cast<uint8_t *>(dst->data);
+            for (int t = t0; t < t1; ++t) {
+                double mean = 0.0;
+                for (int c = 0; c < C; ++c) {
+                    mean += *reinterpret_cast<const float *>(src_base + (size_t)t * src->nb[0] + (size_t)c * src->nb[1]);
+                }
+                mean /= (double)C;
+                double var = 0.0;
+                for (int c = 0; c < C; ++c) {
+                    const float v = *reinterpret_cast<const float *>(src_base + (size_t)t * src->nb[0] + (size_t)c * src->nb[1]);
+                    const double d = (double)v - mean;
+                    var += d * d;
+                }
+                const float inv = 1.0f / std::sqrt((float)(var / (double)C) + 1e-6f);
+                for (int c = 0; c < C; ++c) {
+                    const float v = *reinterpret_cast<const float *>(src_base + (size_t)t * src->nb[0] + (size_t)c * src->nb[1]);
+                    const float gv = *reinterpret_cast<const float *>(gamma_base + (size_t)c * gamma->nb[0]);
+                    const float bv = *reinterpret_cast<const float *>(beta_base + (size_t)c * beta->nb[0]);
+                    const float y = ((v - (float)mean) * inv) * gv + bv;
+                    *reinterpret_cast<float *>(dst_base + (size_t)t * dst->nb[0] + (size_t)c * dst->nb[1]) = y;
+                }
+            }
+        };
+        ggml_tensor * args[] = { x, g, b };
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3],
+                              args, 3, layer_norm_op, GGML_N_TASKS_MAX, nullptr);
+    }
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     xt = ggml_norm(ctx, xt, 1e-6f);
     xt = ggml_mul(ctx, xt, repeat_like(ctx, g, xt));
@@ -202,6 +386,58 @@ ggml_tensor * dense_matmul_time_ggml(ggml_context * ctx,
                                      ggml_tensor * x,
                                      ggml_tensor * w,
                                      ggml_tensor * b) {
+#if defined(TTS_CPP_USE_ACCELERATE) || defined(TTS_CPP_USE_CBLAS)
+    if (x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && (!b || b->type == GGML_TYPE_F32) &&
+        x->ne[2] == 1 && x->ne[3] == 1 && w->ne[1] == x->ne[1]) {
+        auto dense_op = [](ggml_tensor * dst, int ith, int nth, void *) {
+            const ggml_tensor * src = dst->src[0];
+            const ggml_tensor * weight = dst->src[1];
+            const ggml_tensor * bias = dst->src[2];
+            const int L = (int)src->ne[0];
+            const int IC = (int)src->ne[1];
+            const int OC = (int)weight->ne[0];
+            const int oc0 = (OC * ith) / nth;
+            const int oc1 = (OC * (ith + 1)) / nth;
+            if (oc0 >= oc1) return;
+            const float * src_data = static_cast<const float *>(src->data);
+            const float * weight_data = static_cast<const float *>(weight->data);
+            float * dst_data = static_cast<float *>(dst->data);
+            const int lda = (int)(src->nb[1] / sizeof(float));
+            const int ldb = (int)(weight->nb[1] / sizeof(float));
+            const int ldc = (int)(dst->nb[1] / sizeof(float));
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans,
+                        L, oc1 - oc0, IC,
+                        1.0f,
+                        src_data, lda,
+                        weight_data + oc0, ldb,
+                        0.0f,
+                        dst_data + (size_t)oc0 * ldc, ldc);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+            if (bias) {
+                const auto * bias_base = static_cast<const uint8_t *>(bias->data);
+                for (int oc = oc0; oc < oc1; ++oc) {
+                    const float bv = *reinterpret_cast<const float *>(bias_base + (size_t)oc * bias->nb[0]);
+                    float * col = dst_data + (size_t)oc * ldc;
+                    for (int t = 0; t < L; ++t) col[t] += bv;
+                }
+            }
+        };
+        ggml_tensor * args_with_bias[] = { x, w, b };
+        ggml_tensor * args_no_bias[] = { x, w };
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], w->ne[0], x->ne[2], x->ne[3],
+                              b ? args_with_bias : args_no_bias,
+                              b ? 3 : 2,
+                              dense_op,
+                              GGML_N_TASKS_MAX,
+                              nullptr);
+    }
+#endif
     // Raw ONNX MatMul weights are [IC, OC] in row-major order, while GGML
     // tensors are loaded as ne=[OC, IC].  Make that transpose contiguous, then
     // view it as a Conv1d kernel [K=1, IC, OC] so it can consume the repo's
@@ -211,6 +447,76 @@ ggml_tensor * dense_matmul_time_ggml(ggml_context * ctx,
     ggml_tensor * y = conv1d_f32(ctx, kernel, x, 1, 0, 1);
     if (b) y = ggml_add(ctx, y, repeat_like(ctx, b, y));
     return y;
+}
+
+ggml_tensor * bias_gelu_ggml(ggml_context * ctx, ggml_tensor * x, ggml_tensor * b) {
+    if (x->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1) {
+        auto op = [](ggml_tensor * dst, int ith, int nth, void *) {
+            const ggml_tensor * src = dst->src[0];
+            const ggml_tensor * bias = dst->src[1];
+            const int L = (int)src->ne[0];
+            const int C = (int)src->ne[1];
+            const int c0 = (C * ith) / nth;
+            const int c1 = (C * (ith + 1)) / nth;
+            const auto * src_base = static_cast<const uint8_t *>(src->data);
+            const auto * bias_base = static_cast<const uint8_t *>(bias->data);
+            auto * dst_base = static_cast<uint8_t *>(dst->data);
+            for (int c = c0; c < c1; ++c) {
+                const float bv = *reinterpret_cast<const float *>(bias_base + (size_t)c * bias->nb[0]);
+                for (int t = 0; t < L; ++t) {
+                    const float v = *reinterpret_cast<const float *>(src_base + (size_t)t * src->nb[0] + (size_t)c * src->nb[1]) + bv;
+                    const float y = 0.5f * v * (1.0f + std::erff(v * 0.7071067811865475f));
+                    *reinterpret_cast<float *>(dst_base + (size_t)t * dst->nb[0] + (size_t)c * dst->nb[1]) = y;
+                }
+            }
+        };
+        ggml_tensor * args[] = { x, b };
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3],
+                              args, 2, op, GGML_N_TASKS_MAX, nullptr);
+    }
+    return ggml_gelu_erf(ctx, ggml_add(ctx, x, repeat_like(ctx, b, x)));
+}
+
+ggml_tensor * pw2_residual_ggml(ggml_context * ctx,
+                                ggml_tensor * residual,
+                                ggml_tensor * x,
+                                ggml_tensor * b,
+                                ggml_tensor * gamma) {
+    if (residual->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
+        b->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32 &&
+        x->ne[2] == 1 && x->ne[3] == 1) {
+        auto op = [](ggml_tensor * dst, int ith, int nth, void *) {
+            const ggml_tensor * residual = dst->src[0];
+            const ggml_tensor * src = dst->src[1];
+            const ggml_tensor * bias = dst->src[2];
+            const ggml_tensor * gamma = dst->src[3];
+            const int L = (int)src->ne[0];
+            const int C = (int)src->ne[1];
+            const int c0 = (C * ith) / nth;
+            const int c1 = (C * (ith + 1)) / nth;
+            const auto * res_base = static_cast<const uint8_t *>(residual->data);
+            const auto * src_base = static_cast<const uint8_t *>(src->data);
+            const auto * bias_base = static_cast<const uint8_t *>(bias->data);
+            const auto * gamma_base = static_cast<const uint8_t *>(gamma->data);
+            auto * dst_base = static_cast<uint8_t *>(dst->data);
+            for (int c = c0; c < c1; ++c) {
+                const float bv = *reinterpret_cast<const float *>(bias_base + (size_t)c * bias->nb[0]);
+                const float gv = *reinterpret_cast<const float *>(gamma_base + (size_t)c * gamma->nb[0]);
+                for (int t = 0; t < L; ++t) {
+                    const float rv = *reinterpret_cast<const float *>(res_base + (size_t)t * residual->nb[0] + (size_t)c * residual->nb[1]);
+                    const float xv = *reinterpret_cast<const float *>(src_base + (size_t)t * src->nb[0] + (size_t)c * src->nb[1]);
+                    const float y = rv + gv * (xv + bv);
+                    *reinterpret_cast<float *>(dst_base + (size_t)t * dst->nb[0] + (size_t)c * dst->nb[1]) = y;
+                }
+            }
+        };
+        ggml_tensor * args[] = { residual, x, b, gamma };
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3],
+                              args, 4, op, GGML_N_TASKS_MAX, nullptr);
+    }
+    x = ggml_add(ctx, x, repeat_like(ctx, b, x));
+    x = ggml_mul(ctx, x, repeat_like(ctx, gamma, x));
+    return ggml_add(ctx, residual, x);
 }
 
 ggml_tensor * vector_convnext_ggml(ggml_context * ctx,
@@ -227,12 +533,11 @@ ggml_tensor * vector_convnext_ggml(ggml_context * ctx,
         require_source_tensor(model, p + ".norm.norm.weight"),
         require_source_tensor(model, p + ".norm.norm.bias"));
     y = conv1d_f32(ctx, require_source_tensor(model, p + ".pwconv1.weight"), y, 1, 0, 1);
-    y = ggml_add(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".pwconv1.bias"), y));
-    y = ggml_gelu_erf(ctx, y);
+    y = bias_gelu_ggml(ctx, y, require_source_tensor(model, p + ".pwconv1.bias"));
     y = conv1d_f32(ctx, require_source_tensor(model, p + ".pwconv2.weight"), y, 1, 0, 1);
-    y = ggml_add(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".pwconv2.bias"), y));
-    y = ggml_mul(ctx, y, repeat_like(ctx, require_source_tensor(model, p + ".gamma"), y));
-    return ggml_add(ctx, residual, y);
+    return pw2_residual_ggml(ctx, residual, y,
+        require_source_tensor(model, p + ".pwconv2.bias"),
+        require_source_tensor(model, p + ".gamma"));
 }
 
 std::vector<float> tensor_to_time_channel(ggml_tensor * t) {
@@ -313,43 +618,6 @@ void cached_style_layouts(const supertonic_model & model,
     kctx_raw = &cache.kctx_raw;
 }
 
-struct attention_dlh_pack {
-    std::vector<float> q;
-    std::vector<float> k;
-    std::vector<float> v;
-};
-
-attention_dlh_pack & pack_attention_dlh(const std::vector<float> & q_tc,
-                                        const std::vector<float> & k_tc,
-                                        const std::vector<float> & v_tc,
-                                        int q_len,
-                                        int kv_len,
-                                        int n_heads,
-                                        int head_dim) {
-    thread_local attention_dlh_pack pack;
-    pack.q.assign((size_t)head_dim * q_len * n_heads, 0.0f);
-    pack.k.assign((size_t)head_dim * kv_len * n_heads, 0.0f);
-    pack.v.assign((size_t)head_dim * kv_len * n_heads, 0.0f);
-    const int width = n_heads * head_dim;
-    for (int h = 0; h < n_heads; ++h) {
-        for (int t = 0; t < q_len; ++t) {
-            for (int d = 0; d < head_dim; ++d) {
-                pack.q[(size_t)d + (size_t)head_dim*((size_t)t + (size_t)q_len*h)] =
-                    q_tc[(size_t)t*width + h*head_dim + d];
-            }
-        }
-        for (int t = 0; t < kv_len; ++t) {
-            for (int d = 0; d < head_dim; ++d) {
-                pack.k[(size_t)d + (size_t)head_dim*((size_t)t + (size_t)kv_len*h)] =
-                    k_tc[(size_t)t*width + h*head_dim + d];
-                pack.v[(size_t)d + (size_t)head_dim*((size_t)t + (size_t)kv_len*h)] =
-                    v_tc[(size_t)t*width + h*head_dim + d];
-            }
-        }
-    }
-    return pack;
-}
-
 struct vector_text_attention_cache {
     const supertonic_model * model = nullptr;
     int q_len = 0;
@@ -362,9 +630,9 @@ struct vector_text_attention_cache {
     ggml_context * ctx = nullptr;
     ggml_cgraph * gf = nullptr;
     ggml_gallocr_t allocr = nullptr;
-    ggml_tensor * q_in = nullptr;
-    ggml_tensor * k_in = nullptr;
-    ggml_tensor * v_in = nullptr;
+    ggml_tensor * q_tc_in = nullptr;
+    ggml_tensor * k_tc_in = nullptr;
+    ggml_tensor * v_tc_in = nullptr;
 };
 
 void free_text_attention_cache(vector_text_attention_cache & cache) {
@@ -397,14 +665,24 @@ void build_text_attention_cache(vector_text_attention_cache & cache,
     cache.ctx = ggml_init(p);
     cache.gf = ggml_new_graph_custom(cache.ctx, NODES, false);
 
-    cache.q_in = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, head_dim, q_len, n_heads);
-    ggml_set_name(cache.q_in, "vector_attn_q_dlh"); ggml_set_input(cache.q_in);
-    cache.k_in = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, head_dim, kv_len, n_heads);
-    ggml_set_name(cache.k_in, "vector_attn_k_dlh"); ggml_set_input(cache.k_in);
-    cache.v_in = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, head_dim, kv_len, n_heads);
-    ggml_set_name(cache.v_in, "vector_attn_v_dlh"); ggml_set_input(cache.v_in);
+    const int width = n_heads * head_dim;
+    cache.q_tc_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, width, q_len);
+    ggml_set_name(cache.q_tc_in, "vector_attn_q_tc"); ggml_set_input(cache.q_tc_in);
+    cache.k_tc_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, width, kv_len);
+    ggml_set_name(cache.k_tc_in, "vector_attn_k_tc"); ggml_set_input(cache.k_tc_in);
+    cache.v_tc_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, width, kv_len);
+    ggml_set_name(cache.v_tc_in, "vector_attn_v_tc"); ggml_set_input(cache.v_tc_in);
 
-    ggml_tensor * attn = ggml_flash_attn_ext(cache.ctx, cache.q_in, cache.k_in, cache.v_in,
+    const size_t time_stride = (size_t)width * sizeof(float);
+    const size_t head_stride = (size_t)head_dim * sizeof(float);
+    ggml_tensor * q_in = ggml_view_3d(cache.ctx, cache.q_tc_in,
+        head_dim, q_len, n_heads, time_stride, head_stride, 0);
+    ggml_tensor * k_in = ggml_view_3d(cache.ctx, cache.k_tc_in,
+        head_dim, kv_len, n_heads, time_stride, head_stride, 0);
+    ggml_tensor * v_in = ggml_view_3d(cache.ctx, cache.v_tc_in,
+        head_dim, kv_len, n_heads, time_stride, head_stride, 0);
+
+    ggml_tensor * attn = ggml_flash_attn_ext(cache.ctx, q_in, k_in, v_in,
                                              nullptr, 1.0f/16.0f, 0.0f, 0.0f);
     attn = ggml_reshape_2d(cache.ctx, attn, n_heads * head_dim, q_len);
     ggml_tensor * ctx_tc = ggml_cont(cache.ctx, ggml_transpose(cache.ctx, attn));
@@ -427,7 +705,9 @@ void build_text_attention_cache(vector_text_attention_cache & cache,
 
 std::vector<float> run_text_attention_cache(vector_text_attention_cache & cache,
                                             const supertonic_model & model,
-                                            const attention_dlh_pack & pack,
+                                            const std::vector<float> & q_tc,
+                                            const std::vector<float> & k_tc,
+                                            const std::vector<float> & v_tc,
                                             int q_len,
                                             int kv_len,
                                             int n_heads,
@@ -442,12 +722,603 @@ std::vector<float> run_text_attention_cache(vector_text_attention_cache & cache,
         cache.out_w_source != out_w_source || cache.out_b_source != out_b_source) {
         build_text_attention_cache(cache, model, q_len, kv_len, n_heads, head_dim, out_w_source, out_b_source);
     }
-    ggml_backend_tensor_set(cache.q_in, pack.q.data(), 0, pack.q.size()*sizeof(float));
-    ggml_backend_tensor_set(cache.k_in, pack.k.data(), 0, pack.k.size()*sizeof(float));
-    ggml_backend_tensor_set(cache.v_in, pack.v.data(), 0, pack.v.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.q_tc_in, q_tc.data(), 0, q_tc.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.k_tc_in, k_tc.data(), 0, k_tc.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.v_tc_in, v_tc.data(), 0, v_tc.size()*sizeof(float));
     profile_vector_compute(model, cache.gf, current_step, island);
     if (ctx_trace) *ctx_trace = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "vector_attn_ctx"));
     return tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "vector_attn_out"));
+}
+
+void push_trace(std::vector<supertonic_trace_tensor> & trace,
+                const std::string & name,
+                int L,
+                int C,
+                const std::vector<float> & data);
+
+struct vector_group_graph_result {
+    std::vector<float> post;
+    std::vector<float> q;
+    std::vector<float> k;
+    std::vector<float> v;
+};
+
+struct vector_group_graph_cache {
+    const supertonic_model * model = nullptr;
+    int L = 0;
+    int C = 0;
+    int text_len = 0;
+    int group = 0;
+    int conv_block = 0;
+    int linear_block = 0;
+    int post_block = 0;
+    bool trace_outputs = false;
+    std::string matmul_source;
+    std::string q_matmul_source;
+    std::string k_matmul_source;
+    std::string v_matmul_source;
+    std::string q_name;
+    std::string k_name;
+    std::string v_name;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * x_in = nullptr;
+    ggml_tensor * temb_in = nullptr;
+    ggml_tensor * text_in = nullptr;
+};
+
+void free_group_graph_cache(vector_group_graph_cache & cache) {
+    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+std::string vector_main_block(int index) {
+    return "vector_estimator:tts.ttl.vector_field.main_blocks." + std::to_string(index);
+}
+
+void build_group_graph_cache(vector_group_graph_cache & cache,
+                             const supertonic_model & model,
+                             int L,
+                             int C,
+                             int group,
+                             int conv_block,
+                             int linear_block,
+                             const std::string & matmul_source,
+                             int post_block,
+                             int text_len,
+                             const std::string & q_matmul_source,
+                             const std::string & k_matmul_source,
+                             const std::string & v_matmul_source,
+                             const std::string & q_name,
+                             const std::string & k_name,
+                             const std::string & v_name,
+                             bool trace_outputs) {
+    free_group_graph_cache(cache);
+    cache.model = &model;
+    cache.L = L;
+    cache.C = C;
+    cache.text_len = text_len;
+    cache.group = group;
+    cache.conv_block = conv_block;
+    cache.linear_block = linear_block;
+    cache.post_block = post_block;
+    cache.trace_outputs = trace_outputs;
+    cache.matmul_source = matmul_source;
+    cache.q_matmul_source = q_matmul_source;
+    cache.k_matmul_source = k_matmul_source;
+    cache.v_matmul_source = v_matmul_source;
+    cache.q_name = q_name;
+    cache.k_name = k_name;
+    cache.v_name = v_name;
+
+    constexpr int NODES = 512;
+    const size_t buf_size = ggml_tensor_overhead() * NODES + ggml_graph_overhead_custom(NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params p = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(p);
+    cache.gf = ggml_new_graph_custom(cache.ctx, NODES, false);
+
+    cache.x_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(cache.x_in, "vector_group_in"); ggml_set_input(cache.x_in);
+    cache.temb_in = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, 64);
+    ggml_set_name(cache.temb_in, "vector_group_temb"); ggml_set_input(cache.temb_in);
+    cache.text_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, text_len, 256);
+    ggml_set_name(cache.text_in, "vector_group_text"); ggml_set_input(cache.text_in);
+
+    ggml_tensor * cur = cache.x_in;
+    int dils[4] = {1, 2, 4, 8};
+    for (int j = 0; j < 4; ++j) {
+        cur = vector_convnext_ggml(cache.ctx, model,
+            vector_main_block(conv_block) + ".convnext." + std::to_string(j),
+            cur, dils[j]);
+        if (trace_outputs) {
+            const std::string name = "ve_group" + std::to_string(group) + "_convnext" + std::to_string(j);
+            ggml_set_name(cur, name.c_str()); ggml_set_output(cur);
+            ggml_build_forward_expand(cache.gf, cur);
+        }
+    }
+    ggml_tensor * t_proj = ggml_mul_mat(cache.ctx,
+        ggml_cont(cache.ctx, ggml_transpose(cache.ctx, require_source_tensor(model, matmul_source))),
+        ggml_reshape_2d(cache.ctx, cache.temb_in, 64, 1));
+    t_proj = ggml_add(cache.ctx, t_proj,
+        ggml_reshape_2d(cache.ctx,
+            require_source_tensor(model, vector_main_block(linear_block) + ".linear.linear.bias"),
+            C, 1));
+    cur = ggml_add(cache.ctx, cur, repeat_like(cache.ctx, t_proj, cur));
+    if (trace_outputs) {
+        const std::string time_name = "ve_group" + std::to_string(group) + "_time_add";
+        ggml_set_name(cur, time_name.c_str()); ggml_set_output(cur);
+        ggml_build_forward_expand(cache.gf, cur);
+    }
+    cur = vector_convnext_ggml(cache.ctx, model,
+        vector_main_block(post_block) + ".convnext.0",
+        cur, 1);
+    const std::string post_name = "ve_group" + std::to_string(group) + "_block" +
+        std::to_string(post_block) + "_convnext0";
+    ggml_set_name(cur, post_name.c_str()); ggml_set_output(cur);
+    ggml_build_forward_expand(cache.gf, cur);
+
+    const std::string attn_prefix = vector_main_block(post_block + 1) + ".attn.";
+    ggml_tensor * q = dense_matmul_time_ggml(cache.ctx, cur,
+        require_source_tensor(model, q_matmul_source),
+        require_source_tensor(model, attn_prefix + "W_query.linear.bias"));
+    ggml_tensor * k = dense_matmul_time_ggml(cache.ctx, cache.text_in,
+        require_source_tensor(model, k_matmul_source),
+        require_source_tensor(model, attn_prefix + "W_key.linear.bias"));
+    ggml_tensor * v = dense_matmul_time_ggml(cache.ctx, cache.text_in,
+        require_source_tensor(model, v_matmul_source),
+        require_source_tensor(model, attn_prefix + "W_value.linear.bias"));
+    ggml_set_name(q, q_name.c_str()); ggml_set_output(q); ggml_build_forward_expand(cache.gf, q);
+    ggml_set_name(k, k_name.c_str()); ggml_set_output(k); ggml_build_forward_expand(cache.gf, k);
+    ggml_set_name(v, v_name.c_str()); ggml_set_output(v); ggml_build_forward_expand(cache.gf, v);
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new vector group cache failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve vector group cache failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+}
+
+vector_group_graph_result run_group_graph_cache(vector_group_graph_cache & cache,
+                                                const supertonic_model & model,
+                                                const std::vector<float> & x_tc,
+                                                int L,
+                                                int C,
+                                                const std::vector<float> & temb,
+                                                const std::vector<float> & text_lc_host,
+                                                int text_len,
+                                                int current_step,
+                                                int group,
+                                                int conv_block,
+                                                int linear_block,
+                                                const std::string & matmul_source,
+                                                int post_block,
+                                                const std::string & q_matmul_source,
+                                                const std::string & k_matmul_source,
+                                                const std::string & v_matmul_source,
+                                                const std::string & q_name,
+                                                const std::string & k_name,
+                                                const std::string & v_name,
+                                                const char * island,
+                                                std::vector<supertonic_trace_tensor> * trace) {
+    if (cache.model != &model || cache.L != L || cache.C != C || cache.text_len != text_len ||
+        cache.group != group || cache.conv_block != conv_block ||
+        cache.linear_block != linear_block || cache.post_block != post_block ||
+        cache.trace_outputs != (trace != nullptr) ||
+        cache.matmul_source != matmul_source ||
+        cache.q_matmul_source != q_matmul_source || cache.k_matmul_source != k_matmul_source ||
+        cache.v_matmul_source != v_matmul_source) {
+        build_group_graph_cache(cache, model, L, C, group, conv_block, linear_block, matmul_source, post_block,
+                                text_len, q_matmul_source, k_matmul_source, v_matmul_source,
+                                q_name, k_name, v_name,
+                                trace != nullptr);
+    }
+    std::vector<float> x_raw = pack_time_channel_for_ggml(x_tc, L, C);
+    ggml_backend_tensor_set(cache.x_in, x_raw.data(), 0, x_raw.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.temb_in, temb.data(), 0, temb.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.text_in, text_lc_host.data(), 0, text_lc_host.size()*sizeof(float));
+    profile_vector_compute(model, cache.gf, current_step, island);
+    if (trace) {
+        for (int j = 0; j < 4; ++j) {
+            const std::string name = "ve_group" + std::to_string(group) + "_convnext" + std::to_string(j);
+            push_trace(*trace, name, L, C, tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, name.c_str())));
+        }
+        const std::string time_name = "ve_group" + std::to_string(group) + "_time_add";
+        push_trace(*trace, time_name, L, C, tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, time_name.c_str())));
+    }
+    const std::string post_name = "ve_group" + std::to_string(group) + "_block" +
+        std::to_string(post_block) + "_convnext0";
+    vector_group_graph_result out;
+    out.post = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, post_name.c_str()));
+    out.q = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, q_name.c_str()));
+    out.k = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, k_name.c_str()));
+    out.v = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, v_name.c_str()));
+    if (trace) {
+        push_trace(*trace, post_name, L, C, out.post);
+        push_trace(*trace, q_name, L, 256, out.q);
+        push_trace(*trace, k_name, text_len, 256, out.k);
+        push_trace(*trace, v_name, text_len, 256, out.v);
+    }
+    return out;
+}
+
+struct vector_res_style_qkv_result {
+    std::vector<float> post;
+    std::vector<float> sq;
+    std::vector<float> sk;
+    std::vector<float> sv;
+};
+
+struct vector_res_style_qkv_cache {
+    const supertonic_model * model = nullptr;
+    int L = 0;
+    int C = 0;
+    int norm_block = 0;
+    int post_block = 0;
+    int style_block = 0;
+    bool trace_outputs = false;
+    std::string q_matmul_source;
+    std::string k_matmul_source;
+    std::string v_matmul_source;
+    std::string residual_name;
+    std::string norm_name;
+    std::string post_name;
+    std::string q_name;
+    std::string k_name;
+    std::string v_name;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * lhs_in = nullptr;
+    ggml_tensor * rhs_in = nullptr;
+    ggml_tensor * style_v_in = nullptr;
+    ggml_tensor * kctx_in = nullptr;
+};
+
+void free_res_style_qkv_cache(vector_res_style_qkv_cache & cache) {
+    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void build_res_style_qkv_cache(vector_res_style_qkv_cache & cache,
+                               const supertonic_model & model,
+                               int L,
+                               int C,
+                               int norm_block,
+                               int post_block,
+                               int style_block,
+                               const std::string & q_matmul_source,
+                               const std::string & k_matmul_source,
+                               const std::string & v_matmul_source,
+                               const std::string & residual_name,
+                               const std::string & norm_name,
+                               const std::string & post_name,
+                               const std::string & q_name,
+                               const std::string & k_name,
+                               const std::string & v_name,
+                               bool trace_outputs) {
+    free_res_style_qkv_cache(cache);
+    cache.model = &model;
+    cache.L = L;
+    cache.C = C;
+    cache.norm_block = norm_block;
+    cache.post_block = post_block;
+    cache.style_block = style_block;
+    cache.trace_outputs = trace_outputs;
+    cache.q_matmul_source = q_matmul_source;
+    cache.k_matmul_source = k_matmul_source;
+    cache.v_matmul_source = v_matmul_source;
+    cache.residual_name = residual_name;
+    cache.norm_name = norm_name;
+    cache.post_name = post_name;
+    cache.q_name = q_name;
+    cache.k_name = k_name;
+    cache.v_name = v_name;
+
+    constexpr int NODES = 512;
+    const size_t buf_size = ggml_tensor_overhead() * NODES + ggml_graph_overhead_custom(NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params p = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(p);
+    cache.gf = ggml_new_graph_custom(cache.ctx, NODES, false);
+
+    cache.lhs_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(cache.lhs_in, "res_style_lhs"); ggml_set_input(cache.lhs_in);
+    cache.rhs_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(cache.rhs_in, "res_style_rhs"); ggml_set_input(cache.rhs_in);
+    cache.style_v_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, 50, 256);
+    ggml_set_name(cache.style_v_in, "res_style_ttl_lc"); ggml_set_input(cache.style_v_in);
+    cache.kctx_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, 50, 256);
+    ggml_set_name(cache.kctx_in, "res_style_kctx_lc"); ggml_set_input(cache.kctx_in);
+
+    ggml_tensor * res = ggml_add(cache.ctx, cache.lhs_in, cache.rhs_in);
+    ggml_set_name(res, residual_name.c_str());
+    if (trace_outputs) {
+        ggml_set_output(res);
+        ggml_build_forward_expand(cache.gf, res);
+    }
+    ggml_tensor * norm = layer_norm_ggml(cache.ctx, res,
+        require_source_tensor(model, vector_main_block(norm_block) + ".norm.norm.weight"),
+        require_source_tensor(model, vector_main_block(norm_block) + ".norm.norm.bias"));
+    ggml_set_name(norm, norm_name.c_str());
+    if (trace_outputs) {
+        ggml_set_output(norm);
+        ggml_build_forward_expand(cache.gf, norm);
+    }
+    ggml_tensor * post = vector_convnext_ggml(cache.ctx, model,
+        vector_main_block(post_block) + ".convnext.0",
+        norm, 1);
+    ggml_set_name(post, post_name.c_str()); ggml_set_output(post);
+    ggml_build_forward_expand(cache.gf, post);
+
+    const std::string style_prefix = vector_main_block(style_block) + ".attention.";
+    ggml_tensor * sq = dense_matmul_time_ggml(cache.ctx, post,
+        require_source_tensor(model, q_matmul_source),
+        require_source_tensor(model, style_prefix + "W_query.linear.bias"));
+    ggml_tensor * sk = dense_matmul_time_ggml(cache.ctx, cache.kctx_in,
+        require_source_tensor(model, k_matmul_source),
+        require_source_tensor(model, style_prefix + "W_key.linear.bias"));
+    sk = ggml_tanh(cache.ctx, sk);
+    ggml_tensor * sv = dense_matmul_time_ggml(cache.ctx, cache.style_v_in,
+        require_source_tensor(model, v_matmul_source),
+        require_source_tensor(model, style_prefix + "W_value.linear.bias"));
+    ggml_set_name(sq, q_name.c_str()); ggml_set_output(sq); ggml_build_forward_expand(cache.gf, sq);
+    ggml_set_name(sk, k_name.c_str()); ggml_set_output(sk); ggml_build_forward_expand(cache.gf, sk);
+    ggml_set_name(sv, v_name.c_str()); ggml_set_output(sv); ggml_build_forward_expand(cache.gf, sv);
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new res-style-qkv failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve res-style-qkv failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+}
+
+vector_res_style_qkv_result run_res_style_qkv_cache(vector_res_style_qkv_cache & cache,
+                                                    const supertonic_model & model,
+                                                    const std::vector<float> & lhs_tc,
+                                                    const std::vector<float> & rhs_tc,
+                                                    int L,
+                                                    int C,
+                                                    const std::vector<float> & style_v_raw,
+                                                    const std::vector<float> & kctx_raw,
+                                                    int current_step,
+                                                    int norm_block,
+                                                    int post_block,
+                                                    int style_block,
+                                                    const std::string & q_matmul_source,
+                                                    const std::string & k_matmul_source,
+                                                    const std::string & v_matmul_source,
+                                                    const std::string & residual_name,
+                                                    const std::string & norm_name,
+                                                    const std::string & post_name,
+                                                    const std::string & q_name,
+                                                    const std::string & k_name,
+                                                    const std::string & v_name,
+                                                    const char * island,
+                                                    std::vector<supertonic_trace_tensor> * trace) {
+    const bool want_trace = trace != nullptr;
+    if (cache.model != &model || cache.L != L || cache.C != C ||
+        cache.norm_block != norm_block || cache.post_block != post_block ||
+        cache.style_block != style_block || cache.trace_outputs != want_trace ||
+        cache.q_matmul_source != q_matmul_source || cache.k_matmul_source != k_matmul_source ||
+        cache.v_matmul_source != v_matmul_source) {
+        build_res_style_qkv_cache(cache, model, L, C, norm_block, post_block, style_block,
+                                  q_matmul_source, k_matmul_source, v_matmul_source,
+                                  residual_name, norm_name, post_name, q_name, k_name, v_name,
+                                  want_trace);
+    }
+    std::vector<float> lhs_raw = pack_time_channel_for_ggml(lhs_tc, L, C);
+    std::vector<float> rhs_raw = pack_time_channel_for_ggml(rhs_tc, L, C);
+    ggml_backend_tensor_set(cache.lhs_in, lhs_raw.data(), 0, lhs_raw.size() * sizeof(float));
+    ggml_backend_tensor_set(cache.rhs_in, rhs_raw.data(), 0, rhs_raw.size() * sizeof(float));
+    ggml_backend_tensor_set(cache.style_v_in, style_v_raw.data(), 0, style_v_raw.size() * sizeof(float));
+    ggml_backend_tensor_set(cache.kctx_in, kctx_raw.data(), 0, kctx_raw.size() * sizeof(float));
+    profile_vector_compute(model, cache.gf, current_step, island);
+    if (trace) {
+        push_trace(*trace, residual_name, L, C, tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, residual_name.c_str())));
+        push_trace(*trace, norm_name, L, C, tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, norm_name.c_str())));
+    }
+    vector_res_style_qkv_result out;
+    out.post = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, post_name.c_str()));
+    out.sq = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, q_name.c_str()));
+    out.sk = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, k_name.c_str()));
+    out.sv = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, v_name.c_str()));
+    if (trace) {
+        push_trace(*trace, post_name, L, C, out.post);
+        push_trace(*trace, q_name, L, 256, out.sq);
+        push_trace(*trace, k_name, 50, 256, out.sk);
+        push_trace(*trace, v_name, 50, 256, out.sv);
+    }
+    return out;
+}
+
+struct vector_tail_graph_cache {
+    const supertonic_model * model = nullptr;
+    int L = 0;
+    int C = 0;
+    int Cin = 0;
+    int total_steps = 0;
+    bool trace_outputs = false;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * tail_in = nullptr;
+    ggml_tensor * tail_mask = nullptr;
+    ggml_tensor * tail_noise = nullptr;
+};
+
+#if defined(TTS_CPP_USE_ACCELERATE) || defined(TTS_CPP_USE_CBLAS)
+void tail_update_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    if (ith != 0) return;
+    const int total_steps = *static_cast<const int *>(userdata);
+    const ggml_tensor * tail = dst->src[0];
+    const ggml_tensor * mask = dst->src[1];
+    const ggml_tensor * noise = dst->src[2];
+    const ggml_tensor * weight = dst->src[3];
+    const int L = (int)tail->ne[0];
+    const int IC = (int)tail->ne[1];
+    const int OC = (int)weight->ne[2];
+    const float * tail_data = static_cast<const float *>(tail->data);
+    const float * weight_data = static_cast<const float *>(weight->data);
+    float * dst_data = static_cast<float *>(dst->data);
+    const int lda = (int)(tail->nb[1] / sizeof(float));
+    const int ldb = (int)(weight->nb[2] / sizeof(float));
+    const int ldc = (int)(dst->nb[1] / sizeof(float));
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                L, OC, IC,
+                1.0f,
+                tail_data, lda,
+                weight_data, ldb,
+                0.0f,
+                dst_data, ldc);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+    const auto * mask_base = static_cast<const uint8_t *>(mask->data);
+    const auto * noise_base = static_cast<const uint8_t *>(noise->data);
+    const float step_scale = 1.0f / (float)total_steps;
+    for (int c = 0; c < OC; ++c) {
+        float * out_col = dst_data + (size_t)c * ldc;
+        for (int t = 0; t < L; ++t) {
+            const float mv = *reinterpret_cast<const float *>(mask_base + (size_t)t * mask->nb[0]);
+            const float nv = *reinterpret_cast<const float *>(noise_base + (size_t)t * noise->nb[0] + (size_t)c * noise->nb[1]);
+            out_col[t] = nv + out_col[t] * mv * step_scale;
+        }
+    }
+}
+#endif
+
+void free_tail_graph_cache(vector_tail_graph_cache & cache) {
+    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void build_tail_graph_cache(vector_tail_graph_cache & cache,
+                            const supertonic_model & model,
+                            int L,
+                            int C,
+                            int Cin,
+                            int total_steps,
+                            bool trace_outputs) {
+    free_tail_graph_cache(cache);
+    cache.model = &model;
+    cache.L = L;
+    cache.C = C;
+    cache.Cin = Cin;
+    cache.total_steps = total_steps;
+    cache.trace_outputs = trace_outputs;
+
+    constexpr int NODES = 512;
+    const size_t buf_size = ggml_tensor_overhead() * NODES + ggml_graph_overhead_custom(NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params p = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(p);
+    cache.gf = ggml_new_graph_custom(cache.ctx, NODES, false);
+
+    cache.tail_in = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, C);
+    ggml_set_name(cache.tail_in, "tail_in"); ggml_set_input(cache.tail_in);
+    cache.tail_mask = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, L);
+    ggml_set_name(cache.tail_mask, "tail_mask"); ggml_set_input(cache.tail_mask);
+    cache.tail_noise = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, L, Cin);
+    ggml_set_name(cache.tail_noise, "tail_noise"); ggml_set_input(cache.tail_noise);
+    ggml_tensor * tail = cache.tail_in;
+    for (int j = 0; j < 4; ++j) {
+        tail = vector_convnext_ggml(cache.ctx, model,
+            "vector_estimator:tts.ttl.vector_field.last_convnext.convnext." + std::to_string(j),
+            tail, 1);
+        if (trace_outputs) {
+            const std::string name = "ve_last_convnext" + std::to_string(j);
+            ggml_set_name(tail, name.c_str()); ggml_set_output(tail);
+            ggml_build_forward_expand(cache.gf, tail);
+        }
+    }
+    ggml_tensor * velocity_t = nullptr;
+#if defined(TTS_CPP_USE_ACCELERATE) || defined(TTS_CPP_USE_CBLAS)
+    if (!trace_outputs) {
+        ggml_tensor * args[] = {
+            tail,
+            cache.tail_mask,
+            cache.tail_noise,
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.proj_out.net.weight")
+        };
+        ggml_tensor * next = ggml_custom_4d(cache.ctx, GGML_TYPE_F32, L, Cin, 1, 1,
+                                           args, 4, tail_update_op, 1, &cache.total_steps);
+        ggml_set_name(next, "ve_next_latent_tc"); ggml_set_output(next);
+        ggml_build_forward_expand(cache.gf, next);
+    } else
+#endif
+    {
+        velocity_t = conv1d_f32(cache.ctx,
+            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.proj_out.net.weight"),
+            tail, 1, 0, 1);
+        velocity_t = ggml_mul(cache.ctx, velocity_t, repeat_like(cache.ctx, cache.tail_mask, velocity_t));
+        ggml_set_name(velocity_t, "ve_proj_out"); ggml_set_output(velocity_t);
+        ggml_build_forward_expand(cache.gf, velocity_t);
+        ggml_tensor * next = ggml_add(cache.ctx, cache.tail_noise,
+            ggml_scale(cache.ctx, velocity_t, 1.0f/(float) total_steps));
+        ggml_set_name(next, "ve_next_latent_tc"); ggml_set_output(next);
+        ggml_build_forward_expand(cache.gf, next);
+    }
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new vector tail cache failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve vector tail cache failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+}
+
+std::vector<float> run_tail_graph_cache(vector_tail_graph_cache & cache,
+                                        const supertonic_model & model,
+                                        const std::vector<float> & x_tc,
+                                        const float * noisy_latent,
+                                        const float * latent_mask,
+                                        int L,
+                                        int C,
+                                        int Cin,
+                                        int current_step,
+                                        int total_steps,
+                                        std::vector<supertonic_trace_tensor> * trace) {
+    if (cache.model != &model || cache.L != L || cache.C != C ||
+        cache.Cin != Cin || cache.total_steps != total_steps ||
+        cache.trace_outputs != (trace != nullptr)) {
+        build_tail_graph_cache(cache, model, L, C, Cin, total_steps, trace != nullptr);
+    }
+    std::vector<float> tail_in_raw = pack_time_channel_for_ggml(x_tc, L, C);
+    std::vector<float> noise_tc((size_t)L*Cin);
+    for (int t = 0; t < L; ++t) {
+        for (int c = 0; c < Cin; ++c) {
+            noise_tc[(size_t)t*Cin+c] = noisy_latent[(size_t)c*L+t];
+        }
+    }
+    std::vector<float> noise_raw = pack_time_channel_for_ggml(noise_tc, L, Cin);
+    ggml_backend_tensor_set(cache.tail_in, tail_in_raw.data(), 0, tail_in_raw.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.tail_mask, latent_mask, 0, (size_t)L*sizeof(float));
+    ggml_backend_tensor_set(cache.tail_noise, noise_raw.data(), 0, noise_raw.size()*sizeof(float));
+    profile_vector_compute(model, cache.gf, current_step, "tail");
+    if (trace) {
+        for (int j = 0; j < 4; ++j) {
+            const std::string name = "ve_last_convnext" + std::to_string(j);
+            push_trace(*trace, name, L, C, tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, name.c_str())));
+        }
+        push_trace(*trace, "ve_proj_out", L, Cin, tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "ve_proj_out")));
+    }
+    std::vector<float> next_latent_tc = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "ve_next_latent_tc"));
+    if (trace) push_trace(*trace, "ve_next_latent_tc", L, Cin, next_latent_tc);
+    return next_latent_tc;
 }
 
 void push_trace(std::vector<supertonic_trace_tensor> & trace,
@@ -1178,8 +2049,10 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_tensor * y = conv1d_f32(ctx, require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.proj_in.net.weight"), x, 1, 0, 1);
         ggml_tensor * masked = ggml_mul(ctx, y, repeat_like(ctx, mask, y));
         ggml_set_name(masked, "ve_masked");
-        ggml_set_output(masked);
-        ggml_build_forward_expand(gf, masked);
+        if (include_ggml_trace) {
+            ggml_set_output(masked);
+            ggml_build_forward_expand(gf, masked);
+        }
 
         ggml_tensor * cur = masked;
         int dils_ggml[4] = {1, 2, 4, 8};
@@ -1187,10 +2060,12 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             cur = vector_convnext_ggml(ctx, model,
                 "vector_estimator:tts.ttl.vector_field.main_blocks.0.convnext." + std::to_string(j),
                 cur, dils_ggml[j]);
-            const std::string name = "ve_block0_convnext" + std::to_string(j);
-            ggml_set_name(cur, name.c_str());
-            ggml_set_output(cur);
-            ggml_build_forward_expand(gf, cur);
+            if (include_ggml_trace) {
+                const std::string name = "ve_block0_convnext" + std::to_string(j);
+                ggml_set_name(cur, name.c_str());
+                ggml_set_output(cur);
+                ggml_build_forward_expand(gf, cur);
+            }
         }
 
         ggml_tensor * t_proj = ggml_mul_mat(ctx,
@@ -1202,8 +2077,10 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
                 C, 1));
         cur = ggml_add(ctx, cur, repeat_like(ctx, t_proj, cur));
         ggml_set_name(cur, "ve_time_add0");
-        ggml_set_output(cur);
-        ggml_build_forward_expand(gf, cur);
+        if (include_ggml_trace) {
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
 
         cur = vector_convnext_ggml(ctx, model,
             "vector_estimator:tts.ttl.vector_field.main_blocks.2.convnext.0",
@@ -1264,10 +2141,9 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         f32_tensor theta = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
         apply_rope(theta.data.data(), q_out, L, 4, 64);
         apply_rope(theta.data.data(), k_out, text_len, 4, 64);
-        attention_dlh_pack & att0_pack = pack_attention_dlh(q_out, k_out, v_out, L, text_len, 4, 64);
         thread_local vector_text_attention_cache att0_cache;
         std::vector<float> att0_ctx_trace;
-        std::vector<float> attn_out_ggml = run_text_attention_cache(att0_cache, model, att0_pack,
+        std::vector<float> attn_out_ggml = run_text_attention_cache(att0_cache, model, q_out, k_out, v_out,
             L, text_len, 4, 64,
             "vector_estimator:onnx::MatMul_3110",
             "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.out_fc.linear.bias",
@@ -1278,101 +2154,32 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_attn0_ctx", {L, 256}, att0_ctx_trace});
         PUSH_GGML_TRACE({"ve_attn0_out", {L, C}, attn_out_ggml});
 
-        constexpr int RES_NODES = 128;
-        static size_t res_buf_size = ggml_tensor_overhead() * RES_NODES +
-                                     ggml_graph_overhead_custom(RES_NODES, false);
-        thread_local std::vector<uint8_t> res_buf(res_buf_size);
-        ggml_init_params rp = { res_buf_size, res_buf.data(), true };
-        ggml_context * rctx = ggml_init(rp);
-        ggml_cgraph * rgf = ggml_new_graph_custom(rctx, RES_NODES, false);
-        ggml_tensor * lhs_in = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(lhs_in, "res_lhs"); ggml_set_input(lhs_in);
-        ggml_tensor * rhs_in = ggml_new_tensor_2d(rctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(rhs_in, "res_rhs"); ggml_set_input(rhs_in);
-        ggml_tensor * res = ggml_add(rctx, lhs_in, rhs_in);
-        ggml_set_name(res, "ve_attn0_residual"); ggml_set_output(res);
-        ggml_build_forward_expand(rgf, res);
-        ggml_tensor * norm = layer_norm_ggml(rctx, res,
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.weight"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.norm.norm.bias"));
-        ggml_set_name(norm, "ve_attn0_norm"); ggml_set_output(norm);
-        ggml_build_forward_expand(rgf, norm);
-        ggml_tensor * post = vector_convnext_ggml(rctx, model,
-            "vector_estimator:tts.ttl.vector_field.main_blocks.4.convnext.0",
-            norm, 1);
-        ggml_set_name(post, "ve_block4_convnext0"); ggml_set_output(post);
-        ggml_build_forward_expand(rgf, post);
-        ggml_gallocr_t rallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!rallocr) throw std::runtime_error("ggml_gallocr_new residual failed");
-        if (!ggml_gallocr_reserve(rallocr, rgf)) {
-            ggml_gallocr_free(rallocr);
-            throw std::runtime_error("ggml_gallocr_reserve residual failed");
-        }
-        ggml_gallocr_alloc_graph(rallocr, rgf);
-        std::vector<float> lhs_raw = pack_time_channel_for_ggml(block2_ggml, L, C);
-        std::vector<float> rhs_raw = pack_time_channel_for_ggml(attn_out_ggml, L, C);
-        ggml_backend_tensor_set(lhs_in, lhs_raw.data(), 0, lhs_raw.size() * sizeof(float));
-        ggml_backend_tensor_set(rhs_in, rhs_raw.data(), 0, rhs_raw.size() * sizeof(float));
-        profile_vector_compute(model, rgf, current_step, "attn0_residual");
-        PUSH_GGML_TRACE({"ve_attn0_residual", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(rgf, "ve_attn0_residual"))});
-        PUSH_GGML_TRACE({"ve_attn0_norm", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(rgf, "ve_attn0_norm"))});
-        std::vector<float> post_ggml = tensor_to_time_channel(ggml_graph_get_tensor(rgf, "ve_block4_convnext0"));
-        PUSH_GGML_TRACE({"ve_block4_convnext0", {L, C}, post_ggml});
-        ggml_gallocr_free(rallocr);
-
-        constexpr int STYLE_NODES = 256;
-        static size_t style_buf_size = ggml_tensor_overhead() * STYLE_NODES +
-                                       ggml_graph_overhead_custom(STYLE_NODES, false);
-        thread_local std::vector<uint8_t> style_buf(style_buf_size);
-        ggml_init_params sp = { style_buf_size, style_buf.data(), true };
-        ggml_context * sctx = ggml_init(sp);
-        ggml_cgraph * sgf = ggml_new_graph_custom(sctx, STYLE_NODES, false);
-        ggml_tensor * style_x = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(style_x, "style_x"); ggml_set_input(style_x);
-        ggml_tensor * style_v_in = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, 50, 256);
-        ggml_set_name(style_v_in, "style_ttl_lc"); ggml_set_input(style_v_in);
-        ggml_tensor * kctx_in = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, 50, 256);
-        ggml_set_name(kctx_in, "style_kctx_lc"); ggml_set_input(kctx_in);
-
-        ggml_tensor * sq = dense_matmul_time_ggml(sctx, style_x,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3116"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.5.attention.W_query.linear.bias"));
-        ggml_tensor * sk = dense_matmul_time_ggml(sctx, kctx_in,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3117"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.5.attention.W_key.linear.bias"));
-        sk = ggml_tanh(sctx, sk);
-        ggml_tensor * sv = dense_matmul_time_ggml(sctx, style_v_in,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3118"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.5.attention.W_value.linear.bias"));
-        ggml_set_name(sq, "ve_style0_q"); ggml_set_output(sq); ggml_build_forward_expand(sgf, sq);
-        ggml_set_name(sk, "ve_style0_k_tanh"); ggml_set_output(sk); ggml_build_forward_expand(sgf, sk);
-        ggml_set_name(sv, "ve_style0_v"); ggml_set_output(sv); ggml_build_forward_expand(sgf, sv);
-
-        ggml_gallocr_t sallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!sallocr) throw std::runtime_error("ggml_gallocr_new style failed");
-        if (!ggml_gallocr_reserve(sallocr, sgf)) {
-            ggml_gallocr_free(sallocr);
-            throw std::runtime_error("ggml_gallocr_reserve style failed");
-        }
-        ggml_gallocr_alloc_graph(sallocr, sgf);
-        std::vector<float> style_x_raw = pack_time_channel_for_ggml(post_ggml, L, C);
         const std::vector<float> * style_v_raw = nullptr;
         const std::vector<float> * kctx_raw = nullptr;
         cached_style_layouts(model, style_ttl, style_v_raw, kctx_raw);
-        ggml_backend_tensor_set(style_x, style_x_raw.data(), 0, style_x_raw.size() * sizeof(float));
-        ggml_backend_tensor_set(style_v_in, style_v_raw->data(), 0, style_v_raw->size() * sizeof(float));
-        ggml_backend_tensor_set(kctx_in, kctx_raw->data(), 0, kctx_raw->size() * sizeof(float));
-        profile_vector_compute(model, sgf, current_step, "style0_qkv");
-        std::vector<float> sq_out = tensor_to_time_channel(ggml_graph_get_tensor(sgf, "ve_style0_q"));
-        std::vector<float> sk_out = tensor_to_time_channel(ggml_graph_get_tensor(sgf, "ve_style0_k_tanh"));
-        std::vector<float> sv_out = tensor_to_time_channel(ggml_graph_get_tensor(sgf, "ve_style0_v"));
-        PUSH_GGML_TRACE({"ve_style0_q", {L, 256}, sq_out});
-        PUSH_GGML_TRACE({"ve_style0_k_tanh", {50, 256}, sk_out});
-        PUSH_GGML_TRACE({"ve_style0_v", {50, 256}, sv_out});
-        attention_dlh_pack & style0_pack = pack_attention_dlh(sq_out, sk_out, sv_out, L, 50, 2, 128);
+        thread_local vector_res_style_qkv_cache style0_res_qkv_cache;
+        vector_res_style_qkv_result style0_res_qkv = run_res_style_qkv_cache(
+            style0_res_qkv_cache, model, block2_ggml, attn_out_ggml, L, C,
+            *style_v_raw, *kctx_raw, current_step,
+            3, 4, 5,
+            "vector_estimator:onnx::MatMul_3116",
+            "vector_estimator:onnx::MatMul_3117",
+            "vector_estimator:onnx::MatMul_3118",
+            "ve_attn0_residual",
+            "ve_attn0_norm",
+            "ve_block4_convnext0",
+            "ve_style0_q",
+            "ve_style0_k_tanh",
+            "ve_style0_v",
+            "attn0_residual_style_qkv",
+            include_ggml_trace ? &ggml_trace : nullptr);
+        std::vector<float> post_ggml = std::move(style0_res_qkv.post);
+        std::vector<float> sq_out = std::move(style0_res_qkv.sq);
+        std::vector<float> sk_out = std::move(style0_res_qkv.sk);
+        std::vector<float> sv_out = std::move(style0_res_qkv.sv);
         thread_local vector_text_attention_cache style0_attn_cache;
         std::vector<float> style0_ctx_trace;
-        std::vector<float> style_out_ggml = run_text_attention_cache(style0_attn_cache, model, style0_pack,
+        std::vector<float> style_out_ggml = run_text_attention_cache(style0_attn_cache, model, sq_out, sk_out, sv_out,
             L, 50, 2, 128,
             "vector_estimator:onnx::MatMul_3119",
             "vector_estimator:tts.ttl.vector_field.main_blocks.5.attention.out_fc.linear.bias",
@@ -1392,8 +2199,11 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_tensor * style_lhs_in = ggml_new_tensor_2d(srctx, GGML_TYPE_F32, L, C);
         ggml_set_name(style_lhs_in, "style_lhs_in"); ggml_set_input(style_lhs_in);
         ggml_tensor * style_res = ggml_add(srctx, style_lhs_in, style_out_in);
-        ggml_set_name(style_res, "ve_style0_residual"); ggml_set_output(style_res);
-        ggml_build_forward_expand(srgf, style_res);
+        ggml_set_name(style_res, "ve_style0_residual");
+        if (include_ggml_trace) {
+            ggml_set_output(style_res);
+            ggml_build_forward_expand(srgf, style_res);
+        }
         ggml_tensor * style_norm = layer_norm_ggml(srctx, style_res,
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.5.norm.norm.weight"),
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.5.norm.norm.bias"));
@@ -1416,108 +2226,25 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_style0_norm", {L, C}, style_norm_ggml});
         ggml_gallocr_free(srallocr);
 
-        constexpr int G1_NODES = 512;
-        static size_t g1_buf_size = ggml_tensor_overhead() * G1_NODES +
-                                    ggml_graph_overhead_custom(G1_NODES, false);
-        thread_local std::vector<uint8_t> g1_buf(g1_buf_size);
-        ggml_init_params g1p = { g1_buf_size, g1_buf.data(), true };
-        ggml_context * g1ctx = ggml_init(g1p);
-        ggml_cgraph * g1gf = ggml_new_graph_custom(g1ctx, G1_NODES, false);
-        ggml_tensor * g1_in = ggml_new_tensor_2d(g1ctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g1_in, "g1_in"); ggml_set_input(g1_in);
-        ggml_tensor * g1_temb = ggml_new_tensor_1d(g1ctx, GGML_TYPE_F32, 64);
-        ggml_set_name(g1_temb, "g1_temb"); ggml_set_input(g1_temb);
-        ggml_tensor * g1cur = g1_in;
-        int dils_g1_ggml[4] = {1, 2, 4, 8};
-        for (int j = 0; j < 4; ++j) {
-            g1cur = vector_convnext_ggml(g1ctx, model,
-                "vector_estimator:tts.ttl.vector_field.main_blocks.6.convnext." + std::to_string(j),
-                g1cur, dils_g1_ggml[j]);
-            const std::string name = "ve_group1_convnext" + std::to_string(j);
-            ggml_set_name(g1cur, name.c_str()); ggml_set_output(g1cur);
-            ggml_build_forward_expand(g1gf, g1cur);
-        }
-        ggml_tensor * g1_tproj = ggml_mul_mat(g1ctx,
-            ggml_cont(g1ctx, ggml_transpose(g1ctx, require_source_tensor(model, "vector_estimator:onnx::MatMul_3140"))),
-            ggml_reshape_2d(g1ctx, g1_temb, 64, 1));
-        g1_tproj = ggml_add(g1ctx, g1_tproj,
-            ggml_reshape_2d(g1ctx,
-                require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.7.linear.linear.bias"),
-                C, 1));
-        g1cur = ggml_add(g1ctx, g1cur, repeat_like(g1ctx, g1_tproj, g1cur));
-        ggml_set_name(g1cur, "ve_group1_time_add"); ggml_set_output(g1cur);
-        ggml_build_forward_expand(g1gf, g1cur);
-        g1cur = vector_convnext_ggml(g1ctx, model,
-            "vector_estimator:tts.ttl.vector_field.main_blocks.8.convnext.0",
-            g1cur, 1);
-        ggml_set_name(g1cur, "ve_group1_block8_convnext0"); ggml_set_output(g1cur);
-        ggml_build_forward_expand(g1gf, g1cur);
-        ggml_gallocr_t g1allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g1allocr) throw std::runtime_error("ggml_gallocr_new group1 failed");
-        if (!ggml_gallocr_reserve(g1allocr, g1gf)) {
-            ggml_gallocr_free(g1allocr);
-            throw std::runtime_error("ggml_gallocr_reserve group1 failed");
-        }
-        ggml_gallocr_alloc_graph(g1allocr, g1gf);
-        std::vector<float> g1_in_raw = pack_time_channel_for_ggml(style_norm_ggml, L, C);
-        ggml_backend_tensor_set(g1_in, g1_in_raw.data(), 0, g1_in_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g1_temb, te_host.data(), 0, te_host.size()*sizeof(float));
-        profile_vector_compute(model, g1gf, current_step, "group1_conv");
-        for (int j = 0; j < 4; ++j) {
-            const std::string name = "ve_group1_convnext" + std::to_string(j);
-            PUSH_GGML_TRACE({name, {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g1gf, name.c_str()))});
-        }
-        PUSH_GGML_TRACE({"ve_group1_time_add", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g1gf, "ve_group1_time_add"))});
-        std::vector<float> g1_block8 = tensor_to_time_channel(ggml_graph_get_tensor(g1gf, "ve_group1_block8_convnext0"));
-        PUSH_GGML_TRACE({"ve_group1_block8_convnext0", {L, C}, g1_block8});
-
-        constexpr int G1_ATT_NODES = 512;
-        static size_t g1_att_buf_size = ggml_tensor_overhead() * G1_ATT_NODES +
-                                        ggml_graph_overhead_custom(G1_ATT_NODES, false);
-        thread_local std::vector<uint8_t> g1_att_buf(g1_att_buf_size);
-        ggml_init_params g1ap = { g1_att_buf_size, g1_att_buf.data(), true };
-        ggml_context * g1actx = ggml_init(g1ap);
-        ggml_cgraph * g1agf = ggml_new_graph_custom(g1actx, G1_ATT_NODES, false);
-        ggml_tensor * g1a_x = ggml_new_tensor_2d(g1actx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g1a_x, "g1a_x"); ggml_set_input(g1a_x);
-        ggml_tensor * g1a_text = ggml_new_tensor_2d(g1actx, GGML_TYPE_F32, text_len, 256);
-        ggml_set_name(g1a_text, "g1a_text"); ggml_set_input(g1a_text);
-        ggml_tensor * g1q = dense_matmul_time_ggml(g1actx, g1a_x,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3146"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.9.attn.W_query.linear.bias"));
-        ggml_set_name(g1q, "ve_g1_attn_q"); ggml_set_output(g1q); ggml_build_forward_expand(g1agf, g1q);
-        ggml_tensor * g1k = dense_matmul_time_ggml(g1actx, g1a_text,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3147"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.9.attn.W_key.linear.bias"));
-        ggml_set_name(g1k, "ve_g1_attn_k"); ggml_set_output(g1k); ggml_build_forward_expand(g1agf, g1k);
-        ggml_tensor * g1v = dense_matmul_time_ggml(g1actx, g1a_text,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3148"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.9.attn.W_value.linear.bias"));
-        ggml_set_name(g1v, "ve_g1_attn_v"); ggml_set_output(g1v); ggml_build_forward_expand(g1agf, g1v);
-        ggml_gallocr_t g1aallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g1aallocr) throw std::runtime_error("ggml_gallocr_new group1 attn failed");
-        if (!ggml_gallocr_reserve(g1aallocr, g1agf)) {
-            ggml_gallocr_free(g1aallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group1 attn failed");
-        }
-        ggml_gallocr_alloc_graph(g1aallocr, g1agf);
-        std::vector<float> g1a_x_raw = pack_time_channel_for_ggml(g1_block8, L, C);
-        ggml_backend_tensor_set(g1a_x, g1a_x_raw.data(), 0, g1a_x_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g1a_text, text_lc_host.data(), 0, text_lc_host.size()*sizeof(float));
-        profile_vector_compute(model, g1agf, current_step, "g1_attn_qkv");
-        std::vector<float> g1q_out = tensor_to_time_channel(ggml_graph_get_tensor(g1agf, "ve_g1_attn_q"));
-        std::vector<float> g1k_out = tensor_to_time_channel(ggml_graph_get_tensor(g1agf, "ve_g1_attn_k"));
-        std::vector<float> g1v_out = tensor_to_time_channel(ggml_graph_get_tensor(g1agf, "ve_g1_attn_v"));
-        PUSH_GGML_TRACE({"ve_g1_attn_q", {L, 256}, g1q_out});
-        PUSH_GGML_TRACE({"ve_g1_attn_k", {text_len, 256}, g1k_out});
-        PUSH_GGML_TRACE({"ve_g1_attn_v", {text_len, 256}, g1v_out});
+        thread_local vector_group_graph_cache g1_group_cache;
+        vector_group_graph_result g1_group = run_group_graph_cache(g1_group_cache, model, style_norm_ggml,
+            L, C, te_host, text_lc_host, text_len, current_step,
+            1, 6, 7, "vector_estimator:onnx::MatMul_3140", 8,
+            "vector_estimator:onnx::MatMul_3146",
+            "vector_estimator:onnx::MatMul_3147",
+            "vector_estimator:onnx::MatMul_3148",
+            "ve_g1_attn_q", "ve_g1_attn_k", "ve_g1_attn_v",
+            "group1_conv_attn_qkv", include_ggml_trace ? &ggml_trace : nullptr);
+        std::vector<float> g1_block8 = std::move(g1_group.post);
+        std::vector<float> g1q_out = std::move(g1_group.q);
+        std::vector<float> g1k_out = std::move(g1_group.k);
+        std::vector<float> g1v_out = std::move(g1_group.v);
         f32_tensor theta_g1 = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
         apply_rope(theta_g1.data.data(), g1q_out, L, 4, 64);
         apply_rope(theta_g1.data.data(), g1k_out, text_len, 4, 64);
-        attention_dlh_pack & g1_attn_pack = pack_attention_dlh(g1q_out, g1k_out, g1v_out, L, text_len, 4, 64);
         thread_local vector_text_attention_cache g1_attn_cache;
         std::vector<float> g1_attn_ctx_trace;
-        std::vector<float> g1_attn_out = run_text_attention_cache(g1_attn_cache, model, g1_attn_pack,
+        std::vector<float> g1_attn_out = run_text_attention_cache(g1_attn_cache, model, g1q_out, g1k_out, g1v_out,
             L, text_len, 4, 64,
             "vector_estimator:onnx::MatMul_3155",
             "vector_estimator:tts.ttl.vector_field.main_blocks.9.attn.out_fc.linear.bias",
@@ -1527,98 +2254,30 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g1_attn_k_rope", {text_len, 256}, g1k_out});
         PUSH_GGML_TRACE({"ve_g1_attn_ctx", {L, 256}, g1_attn_ctx_trace});
         PUSH_GGML_TRACE({"ve_g1_attn_out", {L, C}, g1_attn_out});
-        ggml_gallocr_free(g1aallocr);
 
-        constexpr int G1_RES_NODES = 128;
-        static size_t g1_res_buf_size = ggml_tensor_overhead() * G1_RES_NODES +
-                                        ggml_graph_overhead_custom(G1_RES_NODES, false);
-        thread_local std::vector<uint8_t> g1_res_buf(g1_res_buf_size);
-        ggml_init_params g1rp = { g1_res_buf_size, g1_res_buf.data(), true };
-        ggml_context * g1rctx = ggml_init(g1rp);
-        ggml_cgraph * g1rgf = ggml_new_graph_custom(g1rctx, G1_RES_NODES, false);
-        ggml_tensor * g1_lhs = ggml_new_tensor_2d(g1rctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g1_lhs, "g1_res_lhs"); ggml_set_input(g1_lhs);
-        ggml_tensor * g1_rhs = ggml_new_tensor_2d(g1rctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g1_rhs, "g1_res_rhs"); ggml_set_input(g1_rhs);
-        ggml_tensor * g1_res = ggml_add(g1rctx, g1_lhs, g1_rhs);
-        ggml_set_name(g1_res, "ve_g1_attn_residual"); ggml_set_output(g1_res);
-        ggml_build_forward_expand(g1rgf, g1_res);
-        ggml_tensor * g1_norm = layer_norm_ggml(g1rctx, g1_res,
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.9.norm.norm.weight"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.9.norm.norm.bias"));
-        ggml_set_name(g1_norm, "ve_g1_attn_norm"); ggml_set_output(g1_norm);
-        ggml_build_forward_expand(g1rgf, g1_norm);
-        ggml_tensor * g1_post = vector_convnext_ggml(g1rctx, model,
-            "vector_estimator:tts.ttl.vector_field.main_blocks.10.convnext.0",
-            g1_norm, 1);
-        ggml_set_name(g1_post, "ve_g1_block10_convnext0"); ggml_set_output(g1_post);
-        ggml_build_forward_expand(g1rgf, g1_post);
-        ggml_gallocr_t g1rallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g1rallocr) throw std::runtime_error("ggml_gallocr_new group1 residual failed");
-        if (!ggml_gallocr_reserve(g1rallocr, g1rgf)) {
-            ggml_gallocr_free(g1rallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group1 residual failed");
-        }
-        ggml_gallocr_alloc_graph(g1rallocr, g1rgf);
-        std::vector<float> g1_lhs_raw = pack_time_channel_for_ggml(g1_block8, L, C);
-        std::vector<float> g1_rhs_raw = pack_time_channel_for_ggml(g1_attn_out, L, C);
-        ggml_backend_tensor_set(g1_lhs, g1_lhs_raw.data(), 0, g1_lhs_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g1_rhs, g1_rhs_raw.data(), 0, g1_rhs_raw.size()*sizeof(float));
-        profile_vector_compute(model, g1rgf, current_step, "g1_attn_residual");
-        PUSH_GGML_TRACE({"ve_g1_attn_residual", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g1rgf, "ve_g1_attn_residual"))});
-        PUSH_GGML_TRACE({"ve_g1_attn_norm", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g1rgf, "ve_g1_attn_norm"))});
-        std::vector<float> g1_block10 = tensor_to_time_channel(ggml_graph_get_tensor(g1rgf, "ve_g1_block10_convnext0"));
-        PUSH_GGML_TRACE({"ve_g1_block10_convnext0", {L, C}, g1_block10});
-        ggml_gallocr_free(g1rallocr);
-
-        constexpr int G1_STYLE_NODES = 256;
-        static size_t g1_style_buf_size = ggml_tensor_overhead() * G1_STYLE_NODES +
-                                          ggml_graph_overhead_custom(G1_STYLE_NODES, false);
-        thread_local std::vector<uint8_t> g1_style_buf(g1_style_buf_size);
-        ggml_init_params g1sp = { g1_style_buf_size, g1_style_buf.data(), true };
-        ggml_context * g1sctx = ggml_init(g1sp);
-        ggml_cgraph * g1sgf = ggml_new_graph_custom(g1sctx, G1_STYLE_NODES, false);
-        ggml_tensor * g1_style_x = ggml_new_tensor_2d(g1sctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g1_style_x, "g1_style_x"); ggml_set_input(g1_style_x);
-        ggml_tensor * g1_style_v_in = ggml_new_tensor_2d(g1sctx, GGML_TYPE_F32, 50, 256);
-        ggml_set_name(g1_style_v_in, "g1_style_ttl_lc"); ggml_set_input(g1_style_v_in);
-        ggml_tensor * g1_kctx_in = ggml_new_tensor_2d(g1sctx, GGML_TYPE_F32, 50, 256);
-        ggml_set_name(g1_kctx_in, "g1_style_kctx_lc"); ggml_set_input(g1_kctx_in);
-        ggml_tensor * g1sq = dense_matmul_time_ggml(g1sctx, g1_style_x,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3161"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.11.attention.W_query.linear.bias"));
-        ggml_tensor * g1sk = dense_matmul_time_ggml(g1sctx, g1_kctx_in,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3162"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.11.attention.W_key.linear.bias"));
-        g1sk = ggml_tanh(g1sctx, g1sk);
-        ggml_tensor * g1sv = dense_matmul_time_ggml(g1sctx, g1_style_v_in,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3163"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.11.attention.W_value.linear.bias"));
-        ggml_set_name(g1sq, "ve_g1_style_q"); ggml_set_output(g1sq); ggml_build_forward_expand(g1sgf, g1sq);
-        ggml_set_name(g1sk, "ve_g1_style_k_tanh"); ggml_set_output(g1sk); ggml_build_forward_expand(g1sgf, g1sk);
-        ggml_set_name(g1sv, "ve_g1_style_v"); ggml_set_output(g1sv); ggml_build_forward_expand(g1sgf, g1sv);
-        ggml_gallocr_t g1sallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g1sallocr) throw std::runtime_error("ggml_gallocr_new group1 style failed");
-        if (!ggml_gallocr_reserve(g1sallocr, g1sgf)) {
-            ggml_gallocr_free(g1sallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group1 style failed");
-        }
-        ggml_gallocr_alloc_graph(g1sallocr, g1sgf);
-        std::vector<float> g1_style_x_raw = pack_time_channel_for_ggml(g1_block10, L, C);
-        ggml_backend_tensor_set(g1_style_x, g1_style_x_raw.data(), 0, g1_style_x_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g1_style_v_in, style_v_raw->data(), 0, style_v_raw->size()*sizeof(float));
-        ggml_backend_tensor_set(g1_kctx_in, kctx_raw->data(), 0, kctx_raw->size()*sizeof(float));
-        profile_vector_compute(model, g1sgf, current_step, "g1_style_qkv");
-        std::vector<float> g1sq_out = tensor_to_time_channel(ggml_graph_get_tensor(g1sgf, "ve_g1_style_q"));
-        std::vector<float> g1sk_out = tensor_to_time_channel(ggml_graph_get_tensor(g1sgf, "ve_g1_style_k_tanh"));
-        std::vector<float> g1sv_out = tensor_to_time_channel(ggml_graph_get_tensor(g1sgf, "ve_g1_style_v"));
-        PUSH_GGML_TRACE({"ve_g1_style_q", {L, 256}, g1sq_out});
-        PUSH_GGML_TRACE({"ve_g1_style_k_tanh", {50, 256}, g1sk_out});
-        PUSH_GGML_TRACE({"ve_g1_style_v", {50, 256}, g1sv_out});
-        attention_dlh_pack & g1_style_pack = pack_attention_dlh(g1sq_out, g1sk_out, g1sv_out, L, 50, 2, 128);
+        thread_local vector_res_style_qkv_cache g1_res_qkv_cache;
+        vector_res_style_qkv_result g1_res_qkv = run_res_style_qkv_cache(
+            g1_res_qkv_cache, model, g1_block8, g1_attn_out, L, C,
+            *style_v_raw, *kctx_raw, current_step,
+            9, 10, 11,
+            "vector_estimator:onnx::MatMul_3161",
+            "vector_estimator:onnx::MatMul_3162",
+            "vector_estimator:onnx::MatMul_3163",
+            "ve_g1_attn_residual",
+            "ve_g1_attn_norm",
+            "ve_g1_block10_convnext0",
+            "ve_g1_style_q",
+            "ve_g1_style_k_tanh",
+            "ve_g1_style_v",
+            "g1_attn_residual_style_qkv",
+            include_ggml_trace ? &ggml_trace : nullptr);
+        std::vector<float> g1_block10 = std::move(g1_res_qkv.post);
+        std::vector<float> g1sq_out = std::move(g1_res_qkv.sq);
+        std::vector<float> g1sk_out = std::move(g1_res_qkv.sk);
+        std::vector<float> g1sv_out = std::move(g1_res_qkv.sv);
         thread_local vector_text_attention_cache g1_style_attn_cache;
         std::vector<float> g1_style_ctx_trace;
-        std::vector<float> g1_style_out = run_text_attention_cache(g1_style_attn_cache, model, g1_style_pack,
+        std::vector<float> g1_style_out = run_text_attention_cache(g1_style_attn_cache, model, g1sq_out, g1sk_out, g1sv_out,
             L, 50, 2, 128,
             "vector_estimator:onnx::MatMul_3164",
             "vector_estimator:tts.ttl.vector_field.main_blocks.11.attention.out_fc.linear.bias",
@@ -1626,7 +2285,6 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             include_ggml_trace ? &g1_style_ctx_trace : nullptr);
         PUSH_GGML_TRACE({"ve_g1_style_ctx", {L, 256}, g1_style_ctx_trace});
         PUSH_GGML_TRACE({"ve_g1_style_out", {L, C}, g1_style_out});
-        ggml_gallocr_free(g1sallocr);
 
         constexpr int G1_STYLE_RES_NODES = 128;
         static size_t g1_style_res_buf_size = ggml_tensor_overhead() * G1_STYLE_RES_NODES +
@@ -1640,8 +2298,11 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_tensor * g1_style_out_in = ggml_new_tensor_2d(g1srctx, GGML_TYPE_F32, L, C);
         ggml_set_name(g1_style_out_in, "g1_style_out_in"); ggml_set_input(g1_style_out_in);
         ggml_tensor * g1_style_res = ggml_add(g1srctx, g1_style_lhs, g1_style_out_in);
-        ggml_set_name(g1_style_res, "ve_g1_style_residual"); ggml_set_output(g1_style_res);
-        ggml_build_forward_expand(g1srgf, g1_style_res);
+        ggml_set_name(g1_style_res, "ve_g1_style_residual");
+        if (include_ggml_trace) {
+            ggml_set_output(g1_style_res);
+            ggml_build_forward_expand(g1srgf, g1_style_res);
+        }
         ggml_tensor * g1_style_norm = layer_norm_ggml(g1srctx, g1_style_res,
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.11.norm.norm.weight"),
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.11.norm.norm.bias"));
@@ -1664,108 +2325,25 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g1_style_norm", {L, C}, g1_style_norm_vec});
         ggml_gallocr_free(g1srallocr);
 
-        constexpr int G2_NODES = 512;
-        static size_t g2_buf_size = ggml_tensor_overhead() * G2_NODES +
-                                    ggml_graph_overhead_custom(G2_NODES, false);
-        thread_local std::vector<uint8_t> g2_buf(g2_buf_size);
-        ggml_init_params g2p = { g2_buf_size, g2_buf.data(), true };
-        ggml_context * g2ctx = ggml_init(g2p);
-        ggml_cgraph * g2gf = ggml_new_graph_custom(g2ctx, G2_NODES, false);
-        ggml_tensor * g2_in = ggml_new_tensor_2d(g2ctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g2_in, "g2_in"); ggml_set_input(g2_in);
-        ggml_tensor * g2_temb = ggml_new_tensor_1d(g2ctx, GGML_TYPE_F32, 64);
-        ggml_set_name(g2_temb, "g2_temb"); ggml_set_input(g2_temb);
-        ggml_tensor * g2cur = g2_in;
-        int dils_g2_ggml[4] = {1, 2, 4, 8};
-        for (int j = 0; j < 4; ++j) {
-            g2cur = vector_convnext_ggml(g2ctx, model,
-                "vector_estimator:tts.ttl.vector_field.main_blocks.12.convnext." + std::to_string(j),
-                g2cur, dils_g2_ggml[j]);
-            const std::string name = "ve_group2_convnext" + std::to_string(j);
-            ggml_set_name(g2cur, name.c_str()); ggml_set_output(g2cur);
-            ggml_build_forward_expand(g2gf, g2cur);
-        }
-        ggml_tensor * g2_tproj = ggml_mul_mat(g2ctx,
-            ggml_cont(g2ctx, ggml_transpose(g2ctx, require_source_tensor(model, "vector_estimator:onnx::MatMul_3185"))),
-            ggml_reshape_2d(g2ctx, g2_temb, 64, 1));
-        g2_tproj = ggml_add(g2ctx, g2_tproj,
-            ggml_reshape_2d(g2ctx,
-                require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.13.linear.linear.bias"),
-                C, 1));
-        g2cur = ggml_add(g2ctx, g2cur, repeat_like(g2ctx, g2_tproj, g2cur));
-        ggml_set_name(g2cur, "ve_group2_time_add"); ggml_set_output(g2cur);
-        ggml_build_forward_expand(g2gf, g2cur);
-        g2cur = vector_convnext_ggml(g2ctx, model,
-            "vector_estimator:tts.ttl.vector_field.main_blocks.14.convnext.0",
-            g2cur, 1);
-        ggml_set_name(g2cur, "ve_group2_block14_convnext0"); ggml_set_output(g2cur);
-        ggml_build_forward_expand(g2gf, g2cur);
-        ggml_gallocr_t g2allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g2allocr) throw std::runtime_error("ggml_gallocr_new group2 failed");
-        if (!ggml_gallocr_reserve(g2allocr, g2gf)) {
-            ggml_gallocr_free(g2allocr);
-            throw std::runtime_error("ggml_gallocr_reserve group2 failed");
-        }
-        ggml_gallocr_alloc_graph(g2allocr, g2gf);
-        std::vector<float> g2_in_raw = pack_time_channel_for_ggml(g1_style_norm_vec, L, C);
-        ggml_backend_tensor_set(g2_in, g2_in_raw.data(), 0, g2_in_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g2_temb, te_host.data(), 0, te_host.size()*sizeof(float));
-        profile_vector_compute(model, g2gf, current_step, "group2_conv");
-        for (int j = 0; j < 4; ++j) {
-            const std::string name = "ve_group2_convnext" + std::to_string(j);
-            PUSH_GGML_TRACE({name, {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g2gf, name.c_str()))});
-        }
-        PUSH_GGML_TRACE({"ve_group2_time_add", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g2gf, "ve_group2_time_add"))});
-        std::vector<float> g2_block14 = tensor_to_time_channel(ggml_graph_get_tensor(g2gf, "ve_group2_block14_convnext0"));
-        PUSH_GGML_TRACE({"ve_group2_block14_convnext0", {L, C}, g2_block14});
-
-        constexpr int G2_ATT_NODES = 512;
-        static size_t g2_att_buf_size = ggml_tensor_overhead() * G2_ATT_NODES +
-                                        ggml_graph_overhead_custom(G2_ATT_NODES, false);
-        thread_local std::vector<uint8_t> g2_att_buf(g2_att_buf_size);
-        ggml_init_params g2ap = { g2_att_buf_size, g2_att_buf.data(), true };
-        ggml_context * g2actx = ggml_init(g2ap);
-        ggml_cgraph * g2agf = ggml_new_graph_custom(g2actx, G2_ATT_NODES, false);
-        ggml_tensor * g2a_x = ggml_new_tensor_2d(g2actx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g2a_x, "g2a_x"); ggml_set_input(g2a_x);
-        ggml_tensor * g2a_text = ggml_new_tensor_2d(g2actx, GGML_TYPE_F32, text_len, 256);
-        ggml_set_name(g2a_text, "g2a_text"); ggml_set_input(g2a_text);
-        ggml_tensor * g2q = dense_matmul_time_ggml(g2actx, g2a_x,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3191"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.15.attn.W_query.linear.bias"));
-        ggml_set_name(g2q, "ve_g2_attn_q"); ggml_set_output(g2q); ggml_build_forward_expand(g2agf, g2q);
-        ggml_tensor * g2k = dense_matmul_time_ggml(g2actx, g2a_text,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3192"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.15.attn.W_key.linear.bias"));
-        ggml_set_name(g2k, "ve_g2_attn_k"); ggml_set_output(g2k); ggml_build_forward_expand(g2agf, g2k);
-        ggml_tensor * g2v = dense_matmul_time_ggml(g2actx, g2a_text,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3193"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.15.attn.W_value.linear.bias"));
-        ggml_set_name(g2v, "ve_g2_attn_v"); ggml_set_output(g2v); ggml_build_forward_expand(g2agf, g2v);
-        ggml_gallocr_t g2aallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g2aallocr) throw std::runtime_error("ggml_gallocr_new group2 attn failed");
-        if (!ggml_gallocr_reserve(g2aallocr, g2agf)) {
-            ggml_gallocr_free(g2aallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group2 attn failed");
-        }
-        ggml_gallocr_alloc_graph(g2aallocr, g2agf);
-        std::vector<float> g2a_x_raw = pack_time_channel_for_ggml(g2_block14, L, C);
-        ggml_backend_tensor_set(g2a_x, g2a_x_raw.data(), 0, g2a_x_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g2a_text, text_lc_host.data(), 0, text_lc_host.size()*sizeof(float));
-        profile_vector_compute(model, g2agf, current_step, "g2_attn_qkv");
-        std::vector<float> g2q_out = tensor_to_time_channel(ggml_graph_get_tensor(g2agf, "ve_g2_attn_q"));
-        std::vector<float> g2k_out = tensor_to_time_channel(ggml_graph_get_tensor(g2agf, "ve_g2_attn_k"));
-        std::vector<float> g2v_out = tensor_to_time_channel(ggml_graph_get_tensor(g2agf, "ve_g2_attn_v"));
-        PUSH_GGML_TRACE({"ve_g2_attn_q", {L, 256}, g2q_out});
-        PUSH_GGML_TRACE({"ve_g2_attn_k", {text_len, 256}, g2k_out});
-        PUSH_GGML_TRACE({"ve_g2_attn_v", {text_len, 256}, g2v_out});
+        thread_local vector_group_graph_cache g2_group_cache;
+        vector_group_graph_result g2_group = run_group_graph_cache(g2_group_cache, model, g1_style_norm_vec,
+            L, C, te_host, text_lc_host, text_len, current_step,
+            2, 12, 13, "vector_estimator:onnx::MatMul_3185", 14,
+            "vector_estimator:onnx::MatMul_3191",
+            "vector_estimator:onnx::MatMul_3192",
+            "vector_estimator:onnx::MatMul_3193",
+            "ve_g2_attn_q", "ve_g2_attn_k", "ve_g2_attn_v",
+            "group2_conv_attn_qkv", include_ggml_trace ? &ggml_trace : nullptr);
+        std::vector<float> g2_block14 = std::move(g2_group.post);
+        std::vector<float> g2q_out = std::move(g2_group.q);
+        std::vector<float> g2k_out = std::move(g2_group.k);
+        std::vector<float> g2v_out = std::move(g2_group.v);
         f32_tensor theta_g2 = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
         apply_rope(theta_g2.data.data(), g2q_out, L, 4, 64);
         apply_rope(theta_g2.data.data(), g2k_out, text_len, 4, 64);
-        attention_dlh_pack & g2_attn_pack = pack_attention_dlh(g2q_out, g2k_out, g2v_out, L, text_len, 4, 64);
         thread_local vector_text_attention_cache g2_attn_cache;
         std::vector<float> g2_attn_ctx_trace;
-        std::vector<float> g2_attn_out = run_text_attention_cache(g2_attn_cache, model, g2_attn_pack,
+        std::vector<float> g2_attn_out = run_text_attention_cache(g2_attn_cache, model, g2q_out, g2k_out, g2v_out,
             L, text_len, 4, 64,
             "vector_estimator:onnx::MatMul_3200",
             "vector_estimator:tts.ttl.vector_field.main_blocks.15.attn.out_fc.linear.bias",
@@ -1775,98 +2353,30 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g2_attn_k_rope", {text_len, 256}, g2k_out});
         PUSH_GGML_TRACE({"ve_g2_attn_ctx", {L, 256}, g2_attn_ctx_trace});
         PUSH_GGML_TRACE({"ve_g2_attn_out", {L, C}, g2_attn_out});
-        ggml_gallocr_free(g2aallocr);
 
-        constexpr int G2_RES_NODES = 128;
-        static size_t g2_res_buf_size = ggml_tensor_overhead() * G2_RES_NODES +
-                                        ggml_graph_overhead_custom(G2_RES_NODES, false);
-        thread_local std::vector<uint8_t> g2_res_buf(g2_res_buf_size);
-        ggml_init_params g2rp = { g2_res_buf_size, g2_res_buf.data(), true };
-        ggml_context * g2rctx = ggml_init(g2rp);
-        ggml_cgraph * g2rgf = ggml_new_graph_custom(g2rctx, G2_RES_NODES, false);
-        ggml_tensor * g2_lhs = ggml_new_tensor_2d(g2rctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g2_lhs, "g2_res_lhs"); ggml_set_input(g2_lhs);
-        ggml_tensor * g2_rhs = ggml_new_tensor_2d(g2rctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g2_rhs, "g2_res_rhs"); ggml_set_input(g2_rhs);
-        ggml_tensor * g2_res = ggml_add(g2rctx, g2_lhs, g2_rhs);
-        ggml_set_name(g2_res, "ve_g2_attn_residual"); ggml_set_output(g2_res);
-        ggml_build_forward_expand(g2rgf, g2_res);
-        ggml_tensor * g2_norm = layer_norm_ggml(g2rctx, g2_res,
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.15.norm.norm.weight"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.15.norm.norm.bias"));
-        ggml_set_name(g2_norm, "ve_g2_attn_norm"); ggml_set_output(g2_norm);
-        ggml_build_forward_expand(g2rgf, g2_norm);
-        ggml_tensor * g2_post = vector_convnext_ggml(g2rctx, model,
-            "vector_estimator:tts.ttl.vector_field.main_blocks.16.convnext.0",
-            g2_norm, 1);
-        ggml_set_name(g2_post, "ve_g2_block16_convnext0"); ggml_set_output(g2_post);
-        ggml_build_forward_expand(g2rgf, g2_post);
-        ggml_gallocr_t g2rallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g2rallocr) throw std::runtime_error("ggml_gallocr_new group2 residual failed");
-        if (!ggml_gallocr_reserve(g2rallocr, g2rgf)) {
-            ggml_gallocr_free(g2rallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group2 residual failed");
-        }
-        ggml_gallocr_alloc_graph(g2rallocr, g2rgf);
-        std::vector<float> g2_lhs_raw = pack_time_channel_for_ggml(g2_block14, L, C);
-        std::vector<float> g2_rhs_raw = pack_time_channel_for_ggml(g2_attn_out, L, C);
-        ggml_backend_tensor_set(g2_lhs, g2_lhs_raw.data(), 0, g2_lhs_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g2_rhs, g2_rhs_raw.data(), 0, g2_rhs_raw.size()*sizeof(float));
-        profile_vector_compute(model, g2rgf, current_step, "g2_attn_residual");
-        PUSH_GGML_TRACE({"ve_g2_attn_residual", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g2rgf, "ve_g2_attn_residual"))});
-        PUSH_GGML_TRACE({"ve_g2_attn_norm", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g2rgf, "ve_g2_attn_norm"))});
-        std::vector<float> g2_block16 = tensor_to_time_channel(ggml_graph_get_tensor(g2rgf, "ve_g2_block16_convnext0"));
-        PUSH_GGML_TRACE({"ve_g2_block16_convnext0", {L, C}, g2_block16});
-        ggml_gallocr_free(g2rallocr);
-
-        constexpr int G2_STYLE_NODES = 256;
-        static size_t g2_style_buf_size = ggml_tensor_overhead() * G2_STYLE_NODES +
-                                          ggml_graph_overhead_custom(G2_STYLE_NODES, false);
-        thread_local std::vector<uint8_t> g2_style_buf(g2_style_buf_size);
-        ggml_init_params g2sp = { g2_style_buf_size, g2_style_buf.data(), true };
-        ggml_context * g2sctx = ggml_init(g2sp);
-        ggml_cgraph * g2sgf = ggml_new_graph_custom(g2sctx, G2_STYLE_NODES, false);
-        ggml_tensor * g2_style_x = ggml_new_tensor_2d(g2sctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g2_style_x, "g2_style_x"); ggml_set_input(g2_style_x);
-        ggml_tensor * g2_style_v_in = ggml_new_tensor_2d(g2sctx, GGML_TYPE_F32, 50, 256);
-        ggml_set_name(g2_style_v_in, "g2_style_ttl_lc"); ggml_set_input(g2_style_v_in);
-        ggml_tensor * g2_kctx_in = ggml_new_tensor_2d(g2sctx, GGML_TYPE_F32, 50, 256);
-        ggml_set_name(g2_kctx_in, "g2_style_kctx_lc"); ggml_set_input(g2_kctx_in);
-        ggml_tensor * g2sq = dense_matmul_time_ggml(g2sctx, g2_style_x,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3206"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.17.attention.W_query.linear.bias"));
-        ggml_tensor * g2sk = dense_matmul_time_ggml(g2sctx, g2_kctx_in,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3207"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.17.attention.W_key.linear.bias"));
-        g2sk = ggml_tanh(g2sctx, g2sk);
-        ggml_tensor * g2sv = dense_matmul_time_ggml(g2sctx, g2_style_v_in,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3208"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.17.attention.W_value.linear.bias"));
-        ggml_set_name(g2sq, "ve_g2_style_q"); ggml_set_output(g2sq); ggml_build_forward_expand(g2sgf, g2sq);
-        ggml_set_name(g2sk, "ve_g2_style_k_tanh"); ggml_set_output(g2sk); ggml_build_forward_expand(g2sgf, g2sk);
-        ggml_set_name(g2sv, "ve_g2_style_v"); ggml_set_output(g2sv); ggml_build_forward_expand(g2sgf, g2sv);
-        ggml_gallocr_t g2sallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g2sallocr) throw std::runtime_error("ggml_gallocr_new group2 style failed");
-        if (!ggml_gallocr_reserve(g2sallocr, g2sgf)) {
-            ggml_gallocr_free(g2sallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group2 style failed");
-        }
-        ggml_gallocr_alloc_graph(g2sallocr, g2sgf);
-        std::vector<float> g2_style_x_raw = pack_time_channel_for_ggml(g2_block16, L, C);
-        ggml_backend_tensor_set(g2_style_x, g2_style_x_raw.data(), 0, g2_style_x_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g2_style_v_in, style_v_raw->data(), 0, style_v_raw->size()*sizeof(float));
-        ggml_backend_tensor_set(g2_kctx_in, kctx_raw->data(), 0, kctx_raw->size()*sizeof(float));
-        profile_vector_compute(model, g2sgf, current_step, "g2_style_qkv");
-        std::vector<float> g2sq_out = tensor_to_time_channel(ggml_graph_get_tensor(g2sgf, "ve_g2_style_q"));
-        std::vector<float> g2sk_out = tensor_to_time_channel(ggml_graph_get_tensor(g2sgf, "ve_g2_style_k_tanh"));
-        std::vector<float> g2sv_out = tensor_to_time_channel(ggml_graph_get_tensor(g2sgf, "ve_g2_style_v"));
-        PUSH_GGML_TRACE({"ve_g2_style_q", {L, 256}, g2sq_out});
-        PUSH_GGML_TRACE({"ve_g2_style_k_tanh", {50, 256}, g2sk_out});
-        PUSH_GGML_TRACE({"ve_g2_style_v", {50, 256}, g2sv_out});
-        attention_dlh_pack & g2_style_pack = pack_attention_dlh(g2sq_out, g2sk_out, g2sv_out, L, 50, 2, 128);
+        thread_local vector_res_style_qkv_cache g2_res_qkv_cache;
+        vector_res_style_qkv_result g2_res_qkv = run_res_style_qkv_cache(
+            g2_res_qkv_cache, model, g2_block14, g2_attn_out, L, C,
+            *style_v_raw, *kctx_raw, current_step,
+            15, 16, 17,
+            "vector_estimator:onnx::MatMul_3206",
+            "vector_estimator:onnx::MatMul_3207",
+            "vector_estimator:onnx::MatMul_3208",
+            "ve_g2_attn_residual",
+            "ve_g2_attn_norm",
+            "ve_g2_block16_convnext0",
+            "ve_g2_style_q",
+            "ve_g2_style_k_tanh",
+            "ve_g2_style_v",
+            "g2_attn_residual_style_qkv",
+            include_ggml_trace ? &ggml_trace : nullptr);
+        std::vector<float> g2_block16 = std::move(g2_res_qkv.post);
+        std::vector<float> g2sq_out = std::move(g2_res_qkv.sq);
+        std::vector<float> g2sk_out = std::move(g2_res_qkv.sk);
+        std::vector<float> g2sv_out = std::move(g2_res_qkv.sv);
         thread_local vector_text_attention_cache g2_style_attn_cache;
         std::vector<float> g2_style_ctx_trace;
-        std::vector<float> g2_style_out = run_text_attention_cache(g2_style_attn_cache, model, g2_style_pack,
+        std::vector<float> g2_style_out = run_text_attention_cache(g2_style_attn_cache, model, g2sq_out, g2sk_out, g2sv_out,
             L, 50, 2, 128,
             "vector_estimator:onnx::MatMul_3209",
             "vector_estimator:tts.ttl.vector_field.main_blocks.17.attention.out_fc.linear.bias",
@@ -1874,7 +2384,6 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             include_ggml_trace ? &g2_style_ctx_trace : nullptr);
         PUSH_GGML_TRACE({"ve_g2_style_ctx", {L, 256}, g2_style_ctx_trace});
         PUSH_GGML_TRACE({"ve_g2_style_out", {L, C}, g2_style_out});
-        ggml_gallocr_free(g2sallocr);
 
         constexpr int G2_STYLE_RES_NODES = 128;
         static size_t g2_style_res_buf_size = ggml_tensor_overhead() * G2_STYLE_RES_NODES +
@@ -1888,8 +2397,11 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_tensor * g2_style_out_in = ggml_new_tensor_2d(g2srctx, GGML_TYPE_F32, L, C);
         ggml_set_name(g2_style_out_in, "g2_style_out_in"); ggml_set_input(g2_style_out_in);
         ggml_tensor * g2_style_res = ggml_add(g2srctx, g2_style_lhs, g2_style_out_in);
-        ggml_set_name(g2_style_res, "ve_g2_style_residual"); ggml_set_output(g2_style_res);
-        ggml_build_forward_expand(g2srgf, g2_style_res);
+        ggml_set_name(g2_style_res, "ve_g2_style_residual");
+        if (include_ggml_trace) {
+            ggml_set_output(g2_style_res);
+            ggml_build_forward_expand(g2srgf, g2_style_res);
+        }
         ggml_tensor * g2_style_norm = layer_norm_ggml(g2srctx, g2_style_res,
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.17.norm.norm.weight"),
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.17.norm.norm.bias"));
@@ -1912,108 +2424,25 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g2_style_norm", {L, C}, g2_style_norm_vec});
         ggml_gallocr_free(g2srallocr);
 
-        constexpr int G3_NODES = 512;
-        static size_t g3_buf_size = ggml_tensor_overhead() * G3_NODES +
-                                    ggml_graph_overhead_custom(G3_NODES, false);
-        thread_local std::vector<uint8_t> g3_buf(g3_buf_size);
-        ggml_init_params g3p = { g3_buf_size, g3_buf.data(), true };
-        ggml_context * g3ctx = ggml_init(g3p);
-        ggml_cgraph * g3gf = ggml_new_graph_custom(g3ctx, G3_NODES, false);
-        ggml_tensor * g3_in = ggml_new_tensor_2d(g3ctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g3_in, "g3_in"); ggml_set_input(g3_in);
-        ggml_tensor * g3_temb = ggml_new_tensor_1d(g3ctx, GGML_TYPE_F32, 64);
-        ggml_set_name(g3_temb, "g3_temb"); ggml_set_input(g3_temb);
-        ggml_tensor * g3cur = g3_in;
-        int dils_g3_ggml[4] = {1, 2, 4, 8};
-        for (int j = 0; j < 4; ++j) {
-            g3cur = vector_convnext_ggml(g3ctx, model,
-                "vector_estimator:tts.ttl.vector_field.main_blocks.18.convnext." + std::to_string(j),
-                g3cur, dils_g3_ggml[j]);
-            const std::string name = "ve_group3_convnext" + std::to_string(j);
-            ggml_set_name(g3cur, name.c_str()); ggml_set_output(g3cur);
-            ggml_build_forward_expand(g3gf, g3cur);
-        }
-        ggml_tensor * g3_tproj = ggml_mul_mat(g3ctx,
-            ggml_cont(g3ctx, ggml_transpose(g3ctx, require_source_tensor(model, "vector_estimator:onnx::MatMul_3230"))),
-            ggml_reshape_2d(g3ctx, g3_temb, 64, 1));
-        g3_tproj = ggml_add(g3ctx, g3_tproj,
-            ggml_reshape_2d(g3ctx,
-                require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.19.linear.linear.bias"),
-                C, 1));
-        g3cur = ggml_add(g3ctx, g3cur, repeat_like(g3ctx, g3_tproj, g3cur));
-        ggml_set_name(g3cur, "ve_group3_time_add"); ggml_set_output(g3cur);
-        ggml_build_forward_expand(g3gf, g3cur);
-        g3cur = vector_convnext_ggml(g3ctx, model,
-            "vector_estimator:tts.ttl.vector_field.main_blocks.20.convnext.0",
-            g3cur, 1);
-        ggml_set_name(g3cur, "ve_group3_block20_convnext0"); ggml_set_output(g3cur);
-        ggml_build_forward_expand(g3gf, g3cur);
-        ggml_gallocr_t g3allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g3allocr) throw std::runtime_error("ggml_gallocr_new group3 failed");
-        if (!ggml_gallocr_reserve(g3allocr, g3gf)) {
-            ggml_gallocr_free(g3allocr);
-            throw std::runtime_error("ggml_gallocr_reserve group3 failed");
-        }
-        ggml_gallocr_alloc_graph(g3allocr, g3gf);
-        std::vector<float> g3_in_raw = pack_time_channel_for_ggml(g2_style_norm_vec, L, C);
-        ggml_backend_tensor_set(g3_in, g3_in_raw.data(), 0, g3_in_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g3_temb, te_host.data(), 0, te_host.size()*sizeof(float));
-        profile_vector_compute(model, g3gf, current_step, "group3_conv");
-        for (int j = 0; j < 4; ++j) {
-            const std::string name = "ve_group3_convnext" + std::to_string(j);
-            PUSH_GGML_TRACE({name, {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g3gf, name.c_str()))});
-        }
-        PUSH_GGML_TRACE({"ve_group3_time_add", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g3gf, "ve_group3_time_add"))});
-        std::vector<float> g3_block20 = tensor_to_time_channel(ggml_graph_get_tensor(g3gf, "ve_group3_block20_convnext0"));
-        PUSH_GGML_TRACE({"ve_group3_block20_convnext0", {L, C}, g3_block20});
-
-        constexpr int G3_ATT_NODES = 512;
-        static size_t g3_att_buf_size = ggml_tensor_overhead() * G3_ATT_NODES +
-                                        ggml_graph_overhead_custom(G3_ATT_NODES, false);
-        thread_local std::vector<uint8_t> g3_att_buf(g3_att_buf_size);
-        ggml_init_params g3ap = { g3_att_buf_size, g3_att_buf.data(), true };
-        ggml_context * g3actx = ggml_init(g3ap);
-        ggml_cgraph * g3agf = ggml_new_graph_custom(g3actx, G3_ATT_NODES, false);
-        ggml_tensor * g3a_x = ggml_new_tensor_2d(g3actx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g3a_x, "g3a_x"); ggml_set_input(g3a_x);
-        ggml_tensor * g3a_text = ggml_new_tensor_2d(g3actx, GGML_TYPE_F32, text_len, 256);
-        ggml_set_name(g3a_text, "g3a_text"); ggml_set_input(g3a_text);
-        ggml_tensor * g3q = dense_matmul_time_ggml(g3actx, g3a_x,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3236"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.21.attn.W_query.linear.bias"));
-        ggml_set_name(g3q, "ve_g3_attn_q"); ggml_set_output(g3q); ggml_build_forward_expand(g3agf, g3q);
-        ggml_tensor * g3k = dense_matmul_time_ggml(g3actx, g3a_text,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3237"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.21.attn.W_key.linear.bias"));
-        ggml_set_name(g3k, "ve_g3_attn_k"); ggml_set_output(g3k); ggml_build_forward_expand(g3agf, g3k);
-        ggml_tensor * g3v = dense_matmul_time_ggml(g3actx, g3a_text,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3238"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.21.attn.W_value.linear.bias"));
-        ggml_set_name(g3v, "ve_g3_attn_v"); ggml_set_output(g3v); ggml_build_forward_expand(g3agf, g3v);
-        ggml_gallocr_t g3aallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g3aallocr) throw std::runtime_error("ggml_gallocr_new group3 attn failed");
-        if (!ggml_gallocr_reserve(g3aallocr, g3agf)) {
-            ggml_gallocr_free(g3aallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group3 attn failed");
-        }
-        ggml_gallocr_alloc_graph(g3aallocr, g3agf);
-        std::vector<float> g3a_x_raw = pack_time_channel_for_ggml(g3_block20, L, C);
-        ggml_backend_tensor_set(g3a_x, g3a_x_raw.data(), 0, g3a_x_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g3a_text, text_lc_host.data(), 0, text_lc_host.size()*sizeof(float));
-        profile_vector_compute(model, g3agf, current_step, "g3_attn_qkv");
-        std::vector<float> g3q_out = tensor_to_time_channel(ggml_graph_get_tensor(g3agf, "ve_g3_attn_q"));
-        std::vector<float> g3k_out = tensor_to_time_channel(ggml_graph_get_tensor(g3agf, "ve_g3_attn_k"));
-        std::vector<float> g3v_out = tensor_to_time_channel(ggml_graph_get_tensor(g3agf, "ve_g3_attn_v"));
-        PUSH_GGML_TRACE({"ve_g3_attn_q", {L, 256}, g3q_out});
-        PUSH_GGML_TRACE({"ve_g3_attn_k", {text_len, 256}, g3k_out});
-        PUSH_GGML_TRACE({"ve_g3_attn_v", {text_len, 256}, g3v_out});
+        thread_local vector_group_graph_cache g3_group_cache;
+        vector_group_graph_result g3_group = run_group_graph_cache(g3_group_cache, model, g2_style_norm_vec,
+            L, C, te_host, text_lc_host, text_len, current_step,
+            3, 18, 19, "vector_estimator:onnx::MatMul_3230", 20,
+            "vector_estimator:onnx::MatMul_3236",
+            "vector_estimator:onnx::MatMul_3237",
+            "vector_estimator:onnx::MatMul_3238",
+            "ve_g3_attn_q", "ve_g3_attn_k", "ve_g3_attn_v",
+            "group3_conv_attn_qkv", include_ggml_trace ? &ggml_trace : nullptr);
+        std::vector<float> g3_block20 = std::move(g3_group.post);
+        std::vector<float> g3q_out = std::move(g3_group.q);
+        std::vector<float> g3k_out = std::move(g3_group.k);
+        std::vector<float> g3v_out = std::move(g3_group.v);
         f32_tensor theta_g3 = read_f32(model, "vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
         apply_rope(theta_g3.data.data(), g3q_out, L, 4, 64);
         apply_rope(theta_g3.data.data(), g3k_out, text_len, 4, 64);
-        attention_dlh_pack & g3_attn_pack = pack_attention_dlh(g3q_out, g3k_out, g3v_out, L, text_len, 4, 64);
         thread_local vector_text_attention_cache g3_attn_cache;
         std::vector<float> g3_attn_ctx_trace;
-        std::vector<float> g3_attn_out = run_text_attention_cache(g3_attn_cache, model, g3_attn_pack,
+        std::vector<float> g3_attn_out = run_text_attention_cache(g3_attn_cache, model, g3q_out, g3k_out, g3v_out,
             L, text_len, 4, 64,
             "vector_estimator:onnx::MatMul_3245",
             "vector_estimator:tts.ttl.vector_field.main_blocks.21.attn.out_fc.linear.bias",
@@ -2023,98 +2452,30 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g3_attn_k_rope", {text_len, 256}, g3k_out});
         PUSH_GGML_TRACE({"ve_g3_attn_ctx", {L, 256}, g3_attn_ctx_trace});
         PUSH_GGML_TRACE({"ve_g3_attn_out", {L, C}, g3_attn_out});
-        ggml_gallocr_free(g3aallocr);
 
-        constexpr int G3_RES_NODES = 128;
-        static size_t g3_res_buf_size = ggml_tensor_overhead() * G3_RES_NODES +
-                                        ggml_graph_overhead_custom(G3_RES_NODES, false);
-        thread_local std::vector<uint8_t> g3_res_buf(g3_res_buf_size);
-        ggml_init_params g3rp = { g3_res_buf_size, g3_res_buf.data(), true };
-        ggml_context * g3rctx = ggml_init(g3rp);
-        ggml_cgraph * g3rgf = ggml_new_graph_custom(g3rctx, G3_RES_NODES, false);
-        ggml_tensor * g3_lhs = ggml_new_tensor_2d(g3rctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g3_lhs, "g3_res_lhs"); ggml_set_input(g3_lhs);
-        ggml_tensor * g3_rhs = ggml_new_tensor_2d(g3rctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g3_rhs, "g3_res_rhs"); ggml_set_input(g3_rhs);
-        ggml_tensor * g3_res = ggml_add(g3rctx, g3_lhs, g3_rhs);
-        ggml_set_name(g3_res, "ve_g3_attn_residual"); ggml_set_output(g3_res);
-        ggml_build_forward_expand(g3rgf, g3_res);
-        ggml_tensor * g3_norm = layer_norm_ggml(g3rctx, g3_res,
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.21.norm.norm.weight"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.21.norm.norm.bias"));
-        ggml_set_name(g3_norm, "ve_g3_attn_norm"); ggml_set_output(g3_norm);
-        ggml_build_forward_expand(g3rgf, g3_norm);
-        ggml_tensor * g3_post = vector_convnext_ggml(g3rctx, model,
-            "vector_estimator:tts.ttl.vector_field.main_blocks.22.convnext.0",
-            g3_norm, 1);
-        ggml_set_name(g3_post, "ve_g3_block22_convnext0"); ggml_set_output(g3_post);
-        ggml_build_forward_expand(g3rgf, g3_post);
-        ggml_gallocr_t g3rallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g3rallocr) throw std::runtime_error("ggml_gallocr_new group3 residual failed");
-        if (!ggml_gallocr_reserve(g3rallocr, g3rgf)) {
-            ggml_gallocr_free(g3rallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group3 residual failed");
-        }
-        ggml_gallocr_alloc_graph(g3rallocr, g3rgf);
-        std::vector<float> g3_lhs_raw = pack_time_channel_for_ggml(g3_block20, L, C);
-        std::vector<float> g3_rhs_raw = pack_time_channel_for_ggml(g3_attn_out, L, C);
-        ggml_backend_tensor_set(g3_lhs, g3_lhs_raw.data(), 0, g3_lhs_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g3_rhs, g3_rhs_raw.data(), 0, g3_rhs_raw.size()*sizeof(float));
-        profile_vector_compute(model, g3rgf, current_step, "g3_attn_residual");
-        PUSH_GGML_TRACE({"ve_g3_attn_residual", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g3rgf, "ve_g3_attn_residual"))});
-        PUSH_GGML_TRACE({"ve_g3_attn_norm", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(g3rgf, "ve_g3_attn_norm"))});
-        std::vector<float> g3_block22 = tensor_to_time_channel(ggml_graph_get_tensor(g3rgf, "ve_g3_block22_convnext0"));
-        PUSH_GGML_TRACE({"ve_g3_block22_convnext0", {L, C}, g3_block22});
-        ggml_gallocr_free(g3rallocr);
-
-        constexpr int G3_STYLE_NODES = 256;
-        static size_t g3_style_buf_size = ggml_tensor_overhead() * G3_STYLE_NODES +
-                                          ggml_graph_overhead_custom(G3_STYLE_NODES, false);
-        thread_local std::vector<uint8_t> g3_style_buf(g3_style_buf_size);
-        ggml_init_params g3sp = { g3_style_buf_size, g3_style_buf.data(), true };
-        ggml_context * g3sctx = ggml_init(g3sp);
-        ggml_cgraph * g3sgf = ggml_new_graph_custom(g3sctx, G3_STYLE_NODES, false);
-        ggml_tensor * g3_style_x = ggml_new_tensor_2d(g3sctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(g3_style_x, "g3_style_x"); ggml_set_input(g3_style_x);
-        ggml_tensor * g3_style_v_in = ggml_new_tensor_2d(g3sctx, GGML_TYPE_F32, 50, 256);
-        ggml_set_name(g3_style_v_in, "g3_style_ttl_lc"); ggml_set_input(g3_style_v_in);
-        ggml_tensor * g3_kctx_in = ggml_new_tensor_2d(g3sctx, GGML_TYPE_F32, 50, 256);
-        ggml_set_name(g3_kctx_in, "g3_style_kctx_lc"); ggml_set_input(g3_kctx_in);
-        ggml_tensor * g3sq = dense_matmul_time_ggml(g3sctx, g3_style_x,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3251"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.23.attention.W_query.linear.bias"));
-        ggml_tensor * g3sk = dense_matmul_time_ggml(g3sctx, g3_kctx_in,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3252"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.23.attention.W_key.linear.bias"));
-        g3sk = ggml_tanh(g3sctx, g3sk);
-        ggml_tensor * g3sv = dense_matmul_time_ggml(g3sctx, g3_style_v_in,
-            require_source_tensor(model, "vector_estimator:onnx::MatMul_3253"),
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.23.attention.W_value.linear.bias"));
-        ggml_set_name(g3sq, "ve_g3_style_q"); ggml_set_output(g3sq); ggml_build_forward_expand(g3sgf, g3sq);
-        ggml_set_name(g3sk, "ve_g3_style_k_tanh"); ggml_set_output(g3sk); ggml_build_forward_expand(g3sgf, g3sk);
-        ggml_set_name(g3sv, "ve_g3_style_v"); ggml_set_output(g3sv); ggml_build_forward_expand(g3sgf, g3sv);
-        ggml_gallocr_t g3sallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g3sallocr) throw std::runtime_error("ggml_gallocr_new group3 style failed");
-        if (!ggml_gallocr_reserve(g3sallocr, g3sgf)) {
-            ggml_gallocr_free(g3sallocr);
-            throw std::runtime_error("ggml_gallocr_reserve group3 style failed");
-        }
-        ggml_gallocr_alloc_graph(g3sallocr, g3sgf);
-        std::vector<float> g3_style_x_raw = pack_time_channel_for_ggml(g3_block22, L, C);
-        ggml_backend_tensor_set(g3_style_x, g3_style_x_raw.data(), 0, g3_style_x_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(g3_style_v_in, style_v_raw->data(), 0, style_v_raw->size()*sizeof(float));
-        ggml_backend_tensor_set(g3_kctx_in, kctx_raw->data(), 0, kctx_raw->size()*sizeof(float));
-        profile_vector_compute(model, g3sgf, current_step, "g3_style_qkv");
-        std::vector<float> g3sq_out = tensor_to_time_channel(ggml_graph_get_tensor(g3sgf, "ve_g3_style_q"));
-        std::vector<float> g3sk_out = tensor_to_time_channel(ggml_graph_get_tensor(g3sgf, "ve_g3_style_k_tanh"));
-        std::vector<float> g3sv_out = tensor_to_time_channel(ggml_graph_get_tensor(g3sgf, "ve_g3_style_v"));
-        PUSH_GGML_TRACE({"ve_g3_style_q", {L, 256}, g3sq_out});
-        PUSH_GGML_TRACE({"ve_g3_style_k_tanh", {50, 256}, g3sk_out});
-        PUSH_GGML_TRACE({"ve_g3_style_v", {50, 256}, g3sv_out});
-        attention_dlh_pack & g3_style_pack = pack_attention_dlh(g3sq_out, g3sk_out, g3sv_out, L, 50, 2, 128);
+        thread_local vector_res_style_qkv_cache g3_res_qkv_cache;
+        vector_res_style_qkv_result g3_res_qkv = run_res_style_qkv_cache(
+            g3_res_qkv_cache, model, g3_block20, g3_attn_out, L, C,
+            *style_v_raw, *kctx_raw, current_step,
+            21, 22, 23,
+            "vector_estimator:onnx::MatMul_3251",
+            "vector_estimator:onnx::MatMul_3252",
+            "vector_estimator:onnx::MatMul_3253",
+            "ve_g3_attn_residual",
+            "ve_g3_attn_norm",
+            "ve_g3_block22_convnext0",
+            "ve_g3_style_q",
+            "ve_g3_style_k_tanh",
+            "ve_g3_style_v",
+            "g3_attn_residual_style_qkv",
+            include_ggml_trace ? &ggml_trace : nullptr);
+        std::vector<float> g3_block22 = std::move(g3_res_qkv.post);
+        std::vector<float> g3sq_out = std::move(g3_res_qkv.sq);
+        std::vector<float> g3sk_out = std::move(g3_res_qkv.sk);
+        std::vector<float> g3sv_out = std::move(g3_res_qkv.sv);
         thread_local vector_text_attention_cache g3_style_attn_cache;
         std::vector<float> g3_style_ctx_trace;
-        std::vector<float> g3_style_out = run_text_attention_cache(g3_style_attn_cache, model, g3_style_pack,
+        std::vector<float> g3_style_out = run_text_attention_cache(g3_style_attn_cache, model, g3sq_out, g3sk_out, g3sv_out,
             L, 50, 2, 128,
             "vector_estimator:onnx::MatMul_3254",
             "vector_estimator:tts.ttl.vector_field.main_blocks.23.attention.out_fc.linear.bias",
@@ -2122,7 +2483,6 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
             include_ggml_trace ? &g3_style_ctx_trace : nullptr);
         PUSH_GGML_TRACE({"ve_g3_style_ctx", {L, 256}, g3_style_ctx_trace});
         PUSH_GGML_TRACE({"ve_g3_style_out", {L, C}, g3_style_out});
-        ggml_gallocr_free(g3sallocr);
 
         constexpr int G3_STYLE_RES_NODES = 128;
         static size_t g3_style_res_buf_size = ggml_tensor_overhead() * G3_STYLE_RES_NODES +
@@ -2136,8 +2496,11 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_tensor * g3_style_out_in = ggml_new_tensor_2d(g3srctx, GGML_TYPE_F32, L, C);
         ggml_set_name(g3_style_out_in, "g3_style_out_in"); ggml_set_input(g3_style_out_in);
         ggml_tensor * g3_style_res = ggml_add(g3srctx, g3_style_lhs, g3_style_out_in);
-        ggml_set_name(g3_style_res, "ve_g3_style_residual"); ggml_set_output(g3_style_res);
-        ggml_build_forward_expand(g3srgf, g3_style_res);
+        ggml_set_name(g3_style_res, "ve_g3_style_residual");
+        if (include_ggml_trace) {
+            ggml_set_output(g3_style_res);
+            ggml_build_forward_expand(g3srgf, g3_style_res);
+        }
         ggml_tensor * g3_style_norm = layer_norm_ggml(g3srctx, g3_style_res,
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.23.norm.norm.weight"),
             require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.main_blocks.23.norm.norm.bias"));
@@ -2160,65 +2523,11 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         PUSH_GGML_TRACE({"ve_g3_style_norm", {L, C}, g3_style_norm_vec});
         ggml_gallocr_free(g3srallocr);
 
-        constexpr int TAIL_NODES = 512;
-        static size_t tail_buf_size = ggml_tensor_overhead() * TAIL_NODES +
-                                      ggml_graph_overhead_custom(TAIL_NODES, false);
-        thread_local std::vector<uint8_t> tail_buf(tail_buf_size);
-        ggml_init_params tailp = { tail_buf_size, tail_buf.data(), true };
-        ggml_context * tailctx = ggml_init(tailp);
-        ggml_cgraph * tailgf = ggml_new_graph_custom(tailctx, TAIL_NODES, false);
-        ggml_tensor * tail_in = ggml_new_tensor_2d(tailctx, GGML_TYPE_F32, L, C);
-        ggml_set_name(tail_in, "tail_in"); ggml_set_input(tail_in);
-        ggml_tensor * tail_mask = ggml_new_tensor_1d(tailctx, GGML_TYPE_F32, L);
-        ggml_set_name(tail_mask, "tail_mask"); ggml_set_input(tail_mask);
-        ggml_tensor * tail_noise = ggml_new_tensor_2d(tailctx, GGML_TYPE_F32, L, Cin);
-        ggml_set_name(tail_noise, "tail_noise"); ggml_set_input(tail_noise);
-        ggml_tensor * tail = tail_in;
-        for (int j = 0; j < 4; ++j) {
-            tail = vector_convnext_ggml(tailctx, model,
-                "vector_estimator:tts.ttl.vector_field.last_convnext.convnext." + std::to_string(j),
-                tail, 1);
-            const std::string name = "ve_last_convnext" + std::to_string(j);
-            ggml_set_name(tail, name.c_str()); ggml_set_output(tail);
-            ggml_build_forward_expand(tailgf, tail);
-        }
-        ggml_tensor * velocity_t = conv1d_f32(tailctx,
-            require_source_tensor(model, "vector_estimator:tts.ttl.vector_field.proj_out.net.weight"),
-            tail, 1, 0, 1);
-        velocity_t = ggml_mul(tailctx, velocity_t, repeat_like(tailctx, tail_mask, velocity_t));
-        ggml_set_name(velocity_t, "ve_proj_out"); ggml_set_output(velocity_t);
-        ggml_build_forward_expand(tailgf, velocity_t);
-        ggml_tensor * next = ggml_add(tailctx, tail_noise, ggml_scale(tailctx, velocity_t, 1.0f/(float) total_steps));
-        ggml_set_name(next, "ve_next_latent_tc"); ggml_set_output(next);
-        ggml_build_forward_expand(tailgf, next);
-        ggml_gallocr_t tailallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!tailallocr) throw std::runtime_error("ggml_gallocr_new tail failed");
-        if (!ggml_gallocr_reserve(tailallocr, tailgf)) {
-            ggml_gallocr_free(tailallocr);
-            throw std::runtime_error("ggml_gallocr_reserve tail failed");
-        }
-        ggml_gallocr_alloc_graph(tailallocr, tailgf);
-        std::vector<float> tail_in_raw = pack_time_channel_for_ggml(g3_style_norm_vec, L, C);
-        std::vector<float> noise_tc((size_t)L*Cin);
-        for (int t = 0; t < L; ++t) for (int c = 0; c < Cin; ++c) noise_tc[(size_t)t*Cin+c] = noisy_latent[(size_t)c*L+t];
-        std::vector<float> noise_raw = pack_time_channel_for_ggml(noise_tc, L, Cin);
-        ggml_backend_tensor_set(tail_in, tail_in_raw.data(), 0, tail_in_raw.size()*sizeof(float));
-        ggml_backend_tensor_set(tail_mask, latent_mask, 0, (size_t)L*sizeof(float));
-        ggml_backend_tensor_set(tail_noise, noise_raw.data(), 0, noise_raw.size()*sizeof(float));
-        profile_vector_compute(model, tailgf, current_step, "tail");
-        for (int j = 0; j < 4; ++j) {
-            const std::string name = "ve_last_convnext" + std::to_string(j);
-            PUSH_GGML_TRACE({name, {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(tailgf, name.c_str()))});
-        }
-        PUSH_GGML_TRACE({"ve_proj_out", {L, Cin}, tensor_to_time_channel(ggml_graph_get_tensor(tailgf, "ve_proj_out"))});
-        std::vector<float> next_latent_tc = tensor_to_time_channel(ggml_graph_get_tensor(tailgf, "ve_next_latent_tc"));
+        thread_local vector_tail_graph_cache tail_cache;
+        std::vector<float> next_latent_tc = run_tail_graph_cache(tail_cache, model, g3_style_norm_vec,
+            noisy_latent, latent_mask, L, C, Cin, current_step, total_steps,
+            include_ggml_trace ? &ggml_trace : nullptr);
         if (next_latent_tc_out) *next_latent_tc_out = next_latent_tc;
-        PUSH_GGML_TRACE({"ve_next_latent_tc", {L, Cin}, next_latent_tc});
-        ggml_gallocr_free(tailallocr);
-        ggml_gallocr_free(g3allocr);
-        ggml_gallocr_free(g2allocr);
-        ggml_gallocr_free(g1allocr);
-        ggml_gallocr_free(sallocr);
 
         ggml_gallocr_free(allocr);
         profile_vector_step_end(current_step);

@@ -17,6 +17,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <thread>
 
@@ -102,6 +103,34 @@ ggml_backend_t init_supertonic_backend(int n_gpu_layers, bool verbose) {
     return b;
 }
 
+void set_env_if_unset(const char * name, const char * value) {
+    if (std::getenv(name) != nullptr) return;
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
+}
+
+void configure_supertonic_blas_threads_once() {
+#if defined(TTS_CPP_USE_ACCELERATE)
+    static bool configured = false;
+    if (configured) return;
+    configured = true;
+    // The Supertonic CPU graphs already parallelize across GGML tasks. Letting
+    // Accelerate spawn a second worker pool for every small pointwise matmul
+    // hurts vector scaling on 3-4 thread runs.
+    set_env_if_unset("VECLIB_MAXIMUM_THREADS", "1");
+#elif defined(TTS_CPP_USE_CBLAS)
+    static bool configured = false;
+    if (configured) return;
+    configured = true;
+    set_env_if_unset("OPENBLAS_NUM_THREADS", "1");
+    set_env_if_unset("MKL_NUM_THREADS", "1");
+    set_env_if_unset("BLIS_NUM_THREADS", "1");
+#endif
+}
+
 } // namespace
 
 ggml_tensor * require_tensor(const supertonic_model & model, const std::string & name) {
@@ -119,6 +148,7 @@ ggml_tensor * require_source_tensor(const supertonic_model & model, const std::s
 }
 
 void supertonic_set_n_threads(supertonic_model & model, int n_threads) {
+    configure_supertonic_blas_threads_once();
     if (n_threads <= 0) {
         const int hw = (int) std::thread::hardware_concurrency();
         n_threads = std::min(std::max(1, hw), 4);

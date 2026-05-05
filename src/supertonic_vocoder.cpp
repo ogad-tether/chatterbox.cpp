@@ -2,7 +2,16 @@
 
 #include "ggml-alloc.h"
 
+#if defined(TTS_CPP_USE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#elif defined(TTS_CPP_USE_CBLAS)
+#include <cblas.h>
+#endif
+
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -40,6 +49,20 @@ inline float gelu(float x) {
     return 0.5f * x * (1.0f + std::erff(x * 0.7071067811865475f));
 }
 
+bool vocoder_profile_enabled() {
+    static const bool enabled = std::getenv("SUPERTONIC_VOCODER_PROFILE") != nullptr;
+    return enabled;
+}
+
+void profile_vocoder_checkpoint(const char * label,
+                                std::chrono::steady_clock::time_point & last) {
+    if (!vocoder_profile_enabled()) return;
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+    last = now;
+    std::fprintf(stderr, "supertonic_vocoder_profile island=%s ms=%.3f\n", label, ms);
+}
+
 ggml_tensor * repeat_like(ggml_context * ctx, ggml_tensor * v, ggml_tensor * like) {
     if (ggml_n_dims(v) == 1 && ggml_n_dims(like) >= 2) {
         if (like->ne[0] == v->ne[0]) v = ggml_reshape_2d(ctx, v, v->ne[0], 1);
@@ -72,6 +95,125 @@ ggml_tensor * conv1d_causal_ggml(ggml_context * ctx,
                                  ggml_tensor * b,
                                  int dilation = 1) {
     const int K = (int) w->ne[0];
+#if defined(TTS_CPP_USE_ACCELERATE) || defined(TTS_CPP_USE_CBLAS)
+    if (K == 1 && dilation == 1 &&
+        x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        (!b || b->type == GGML_TYPE_F32) &&
+        x->ne[2] == 1 && x->ne[3] == 1) {
+        auto pointwise_op = [](ggml_tensor * dst, int ith, int, void *) {
+            if (ith != 0) return;
+            const ggml_tensor * src = dst->src[0];
+            const ggml_tensor * weight = dst->src[1];
+            const ggml_tensor * bias = dst->src[2];
+            const int L = (int)src->ne[0];
+            const int IC = (int)src->ne[1];
+            const int OC = (int)weight->ne[2];
+            const float * src_data = static_cast<const float *>(src->data);
+            const float * weight_data = static_cast<const float *>(weight->data);
+            float * dst_data = static_cast<float *>(dst->data);
+            const int lda = (int)(src->nb[1] / sizeof(float));
+            const int ldb = (int)(weight->nb[2] / sizeof(float));
+            const int ldc = (int)(dst->nb[1] / sizeof(float));
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        L, OC, IC,
+                        1.0f,
+                        src_data, lda,
+                        weight_data, ldb,
+                        0.0f,
+                        dst_data, ldc);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+            if (bias) {
+                const auto * bias_base = static_cast<const uint8_t *>(bias->data);
+                for (int oc = 0; oc < OC; ++oc) {
+                    const float bv = *reinterpret_cast<const float *>(bias_base + (size_t)oc * bias->nb[0]);
+                    float * col = dst_data + (size_t)oc * ldc;
+                    for (int t = 0; t < L; ++t) col[t] += bv;
+                }
+            }
+        };
+        ggml_tensor * args_with_bias[] = { x, w, b };
+        ggml_tensor * args_no_bias[] = { x, w };
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], w->ne[2], x->ne[2], x->ne[3],
+                              b ? args_with_bias : args_no_bias,
+                              b ? 3 : 2,
+                              pointwise_op,
+                              1,
+                              nullptr);
+    }
+    if (K > 1 && dilation == 1 &&
+        x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        (!b || b->type == GGML_TYPE_F32) &&
+        x->ne[2] == 1 && x->ne[3] == 1) {
+        auto conv_op = [](ggml_tensor * dst, int ith, int, void *) {
+            if (ith != 0) return;
+            const ggml_tensor * src = dst->src[0];
+            const ggml_tensor * weight = dst->src[1];
+            const ggml_tensor * bias = dst->src[2];
+            const int L = (int)src->ne[0];
+            const int IC = (int)src->ne[1];
+            const int K = (int)weight->ne[0];
+            const int OC = (int)weight->ne[2];
+            const int KC = K * IC;
+            const int pad_left = K - 1;
+            const auto * src_base = static_cast<const uint8_t *>(src->data);
+            const auto * weight_data = static_cast<const float *>(weight->data);
+            auto * dst_data = static_cast<float *>(dst->data);
+            const int ldb = (int)(weight->nb[2] / sizeof(float));
+            const int ldc = (int)(dst->nb[1] / sizeof(float));
+
+            std::vector<float> cols((size_t)L * KC);
+            for (int ic = 0; ic < IC; ++ic) {
+                for (int k = 0; k < K; ++k) {
+                    const int col = ic * K + k;
+                    float * col_ptr = cols.data() + (size_t)col * L;
+                    for (int t = 0; t < L; ++t) {
+                        int st = t + k - pad_left;
+                        if (st < 0) st = 0;
+                        col_ptr[t] = *reinterpret_cast<const float *>(
+                            src_base + (size_t)st * src->nb[0] + (size_t)ic * src->nb[1]);
+                    }
+                }
+            }
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        L, OC, KC,
+                        1.0f,
+                        cols.data(), L,
+                        weight_data, ldb,
+                        0.0f,
+                        dst_data, ldc);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+            if (bias) {
+                const auto * bias_base = static_cast<const uint8_t *>(bias->data);
+                for (int oc = 0; oc < OC; ++oc) {
+                    const float bv = *reinterpret_cast<const float *>(bias_base + (size_t)oc * bias->nb[0]);
+                    float * col = dst_data + (size_t)oc * ldc;
+                    for (int t = 0; t < L; ++t) col[t] += bv;
+                }
+            }
+        };
+        ggml_tensor * args_with_bias[] = { x, w, b };
+        ggml_tensor * args_no_bias[] = { x, w };
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], w->ne[2], x->ne[2], x->ne[3],
+                              b ? args_with_bias : args_no_bias,
+                              b ? 3 : 2,
+                              conv_op,
+                              1,
+                              nullptr);
+    }
+#endif
     ggml_tensor * padded = causal_replicate_pad_1d(ctx, x, (K - 1) * dilation);
     ggml_tensor * im2col = ggml_im2col(ctx, w, padded, 1, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
     ggml_tensor * y = ggml_mul_mat(ctx,
@@ -82,11 +224,82 @@ ggml_tensor * conv1d_causal_ggml(ggml_context * ctx,
     return y;
 }
 
+struct depthwise_causal_op_config {
+    int dilation = 1;
+};
+
+const depthwise_causal_op_config * depthwise_causal_config(int dilation) {
+    static const depthwise_causal_op_config d1{1};
+    static const depthwise_causal_op_config d2{2};
+    static const depthwise_causal_op_config d4{4};
+    switch (dilation) {
+        case 1: return &d1;
+        case 2: return &d2;
+        case 4: return &d4;
+        default: return nullptr;
+    }
+}
+
+void depthwise_causal_custom_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto * cfg = static_cast<const depthwise_causal_op_config *>(userdata);
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * b = dst->src[2];
+    const int L = (int)x->ne[0];
+    const int C = (int)x->ne[1];
+    const int K = (int)w->ne[0];
+    const int dilation = cfg ? cfg->dilation : 1;
+    const int pad_left = (K - 1) * dilation;
+    const int c0 = (C * ith) / nth;
+    const int c1 = (C * (ith + 1)) / nth;
+
+    const auto * x_base = static_cast<const uint8_t *>(x->data);
+    const auto * w_base = static_cast<const uint8_t *>(w->data);
+    const auto * b_base = static_cast<const uint8_t *>(b->data);
+    auto * dst_base = static_cast<uint8_t *>(dst->data);
+
+    for (int c = c0; c < c1; ++c) {
+        const float bias = *reinterpret_cast<const float *>(b_base + (size_t)c * b->nb[0]);
+        for (int t = 0; t < L; ++t) {
+            float sum = bias;
+            for (int k = 0; k < K; ++k) {
+                int st = t + k * dilation - pad_left;
+                if (st < 0) st = 0;
+                const float xv = *reinterpret_cast<const float *>(x_base + (size_t)st * x->nb[0] + (size_t)c * x->nb[1]);
+                const float wv = *reinterpret_cast<const float *>(w_base + (size_t)k * w->nb[0] + (size_t)c * w->nb[2]);
+                sum += xv * wv;
+            }
+            *reinterpret_cast<float *>(dst_base + (size_t)t * dst->nb[0] + (size_t)c * dst->nb[1]) = sum;
+        }
+    }
+}
+
+ggml_tensor * depthwise_causal_custom_ggml(ggml_context * ctx,
+                                           ggml_tensor * x,
+                                           ggml_tensor * w,
+                                           ggml_tensor * b,
+                                           int dilation) {
+    const depthwise_causal_op_config * cfg = depthwise_causal_config(dilation);
+    if (!cfg || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = { x, w, b };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32,
+                          x->ne[0], x->ne[1], x->ne[2], x->ne[3],
+                          args, 3,
+                          depthwise_causal_custom_op,
+                          GGML_N_TASKS_MAX,
+                          const_cast<depthwise_causal_op_config *>(cfg));
+}
+
 ggml_tensor * depthwise_conv1d_causal_ggml(ggml_context * ctx,
                                            ggml_tensor * x,
                                            ggml_tensor * w,
                                            ggml_tensor * b,
                                            int dilation) {
+    if (ggml_tensor * custom = depthwise_causal_custom_ggml(ctx, x, w, b, dilation)) {
+        return custom;
+    }
     const int K = (int) w->ne[0];
     ggml_tensor * padded = causal_replicate_pad_1d(ctx, x, (K - 1) * dilation);
     ggml_tensor * new_b = ggml_reshape_4d(ctx, padded, padded->ne[0], 1, padded->ne[1], padded->ne[2]);
@@ -123,62 +336,87 @@ ggml_tensor * convnext_block_ggml(ggml_context * ctx,
     return ggml_add(ctx, residual, y);
 }
 
-ggml_cgraph * build_supertonic_vocoder_graph(const supertonic_model & model,
-                                             int latent_len) {
+struct vocoder_graph_cache {
+    const supertonic_model * model = nullptr;
+    int latent_len = 0;
+    std::vector<uint8_t> buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    ggml_tensor * x_in = nullptr;
+    ggml_tensor * bn_scale = nullptr;
+    ggml_tensor * bn_shift = nullptr;
+    ggml_tensor * wav = nullptr;
+};
+
+void free_vocoder_cache(vocoder_graph_cache & cache) {
+    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    if (cache.ctx) ggml_free(cache.ctx);
+    cache = {};
+}
+
+void build_supertonic_vocoder_cache(vocoder_graph_cache & cache,
+                                    const supertonic_model & model,
+                                    int latent_len) {
+    free_vocoder_cache(cache);
+    cache.model = &model;
+    cache.latent_len = latent_len;
     const int C_latent = model.hparams.latent_dim;
     const int T0 = latent_len * model.hparams.ttl_chunk_compress_factor;
     constexpr int MAX_NODES = 4096;
-    static size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
-                             ggml_graph_overhead_custom(MAX_NODES, false);
-    thread_local std::vector<uint8_t> buf(buf_size);
-    ggml_init_params p = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(p);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+    const size_t buf_size = ggml_tensor_overhead() * MAX_NODES +
+                            ggml_graph_overhead_custom(MAX_NODES, false);
+    cache.buf.assign(buf_size, 0);
+    ggml_init_params p = { buf_size, cache.buf.data(), true };
+    cache.ctx = ggml_init(p);
+    cache.gf = ggml_new_graph_custom(cache.ctx, MAX_NODES, false);
 
-    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T0, C_latent);
-    ggml_set_name(x, "vocoder_in");
-    ggml_set_input(x);
+    ggml_tensor * x = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, T0, C_latent);
+    cache.x_in = x;
+    ggml_set_name(cache.x_in, "vocoder_in");
+    ggml_set_input(cache.x_in);
 
-    ggml_tensor * bn_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
-    ggml_set_name(bn_scale, "vocoder_bn_scale");
-    ggml_set_input(bn_scale);
-    ggml_tensor * bn_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
-    ggml_set_name(bn_shift, "vocoder_bn_shift");
-    ggml_set_input(bn_shift);
+    cache.bn_scale = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, 512);
+    ggml_set_name(cache.bn_scale, "vocoder_bn_scale");
+    ggml_set_input(cache.bn_scale);
+    cache.bn_shift = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, 512);
+    ggml_set_name(cache.bn_shift, "vocoder_bn_shift");
+    ggml_set_input(cache.bn_shift);
 
     const float normalizer_scale = scalar_f32_tensor(model.vocoder.normalizer_scale);
-    x = ggml_scale(ctx, x, 1.0f / normalizer_scale);
-    x = ggml_mul(ctx, x, repeat_like(ctx, model.vocoder.latent_std, x));
-    x = ggml_add(ctx, x, repeat_like(ctx, model.vocoder.latent_mean, x));
+    x = ggml_scale(cache.ctx, x, 1.0f / normalizer_scale);
+    x = ggml_mul(cache.ctx, x, repeat_like(cache.ctx, model.vocoder.latent_std, x));
+    x = ggml_add(cache.ctx, x, repeat_like(cache.ctx, model.vocoder.latent_mean, x));
     ggml_set_name(x, "vocoder_denorm");
-    ggml_set_output(x);
 
-    x = conv1d_causal_ggml(ctx, x, model.vocoder.embed_w, model.vocoder.embed_b);
+    x = conv1d_causal_ggml(cache.ctx, x, model.vocoder.embed_w, model.vocoder.embed_b);
     ggml_set_name(x, "vocoder_embed");
-    ggml_set_output(x);
     for (int i = 0; i < 10; ++i) {
-        x = convnext_block_ggml(ctx, model.vocoder.convnext[(size_t) i], x, i);
+        x = convnext_block_ggml(cache.ctx, model.vocoder.convnext[(size_t) i], x, i);
         ggml_set_name(x, ("vocoder_convnext_" + std::to_string(i)).c_str());
-        ggml_set_output(x);
     }
 
-    x = ggml_mul(ctx, x, repeat_like(ctx, bn_scale, x));
-    x = ggml_add(ctx, x, repeat_like(ctx, bn_shift, x));
+    x = ggml_mul(cache.ctx, x, repeat_like(cache.ctx, cache.bn_scale, x));
+    x = ggml_add(cache.ctx, x, repeat_like(cache.ctx, cache.bn_shift, x));
     ggml_set_name(x, "vocoder_final_norm");
-    ggml_set_output(x);
 
-    x = conv1d_causal_ggml(ctx, x, model.vocoder.head1_w, model.vocoder.head1_b);
+    x = conv1d_causal_ggml(cache.ctx, x, model.vocoder.head1_w, model.vocoder.head1_b);
     ggml_set_name(x, "vocoder_head1");
-    ggml_set_output(x);
     const float prelu = scalar_f32_tensor(model.vocoder.head_prelu);
-    x = ggml_leaky_relu(ctx, x, prelu, false);
+    x = ggml_leaky_relu(cache.ctx, x, prelu, false);
     ggml_set_name(x, "vocoder_prelu");
-    ggml_set_output(x);
-    x = conv1d_causal_ggml(ctx, x, model.vocoder.head2_w, nullptr);
+    x = conv1d_causal_ggml(cache.ctx, x, model.vocoder.head2_w, nullptr);
     ggml_set_name(x, "wav");
     ggml_set_output(x);
-    ggml_build_forward_expand(gf, x);
-    return gf;
+    ggml_build_forward_expand(cache.gf, x);
+    cache.wav = x;
+
+    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new vocoder cache failed");
+    if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+        throw std::runtime_error("ggml_gallocr_reserve vocoder cache failed");
+    }
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
 }
 
 void linear1x1(const std::vector<float> & x, int L, int IC,
@@ -449,6 +687,7 @@ bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
                                      std::vector<float> & wav_out,
                                      std::string * error) {
     try {
+        auto profile_last = std::chrono::steady_clock::now();
         const int C_latent = model.hparams.latent_dim;
         const int factor = model.hparams.ttl_chunk_compress_factor;
         const int T0 = latent_len * factor;
@@ -464,6 +703,7 @@ bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
                 }
             }
         }
+        profile_vocoder_checkpoint("unpack", profile_last);
 
         f32_tensor gamma = read_f32_tensor(model.vocoder.final_norm_g);
         f32_tensor beta = read_f32_tensor(model.vocoder.final_norm_b);
@@ -474,24 +714,23 @@ bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
             bn_scale[c] = gamma.data[c] / std::sqrt(var.data[c] + 1e-5f);
             bn_shift[c] = beta.data[c] - mean.data[c] * bn_scale[c];
         }
+        profile_vocoder_checkpoint("bn_params", profile_last);
 
-        ggml_cgraph * gf = build_supertonic_vocoder_graph(model, latent_len);
-        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!allocr) throw std::runtime_error("ggml_gallocr_new failed");
-        if (!ggml_gallocr_reserve(allocr, gf)) {
-            ggml_gallocr_free(allocr);
-            throw std::runtime_error("ggml_gallocr_reserve failed");
+        thread_local vocoder_graph_cache cache;
+        if (cache.model != &model || cache.latent_len != latent_len) {
+            build_supertonic_vocoder_cache(cache, model, latent_len);
         }
-        ggml_gallocr_alloc_graph(allocr, gf);
+        profile_vocoder_checkpoint("graph_cache", profile_last);
 
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vocoder_in"), x_in.data(), 0, x_in.size() * sizeof(float));
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vocoder_bn_scale"), bn_scale.data(), 0, bn_scale.size() * sizeof(float));
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "vocoder_bn_shift"), bn_shift.data(), 0, bn_shift.size() * sizeof(float));
+        ggml_backend_tensor_set(cache.x_in, x_in.data(), 0, x_in.size() * sizeof(float));
+        ggml_backend_tensor_set(cache.bn_scale, bn_scale.data(), 0, bn_scale.size() * sizeof(float));
+        ggml_backend_tensor_set(cache.bn_shift, bn_shift.data(), 0, bn_shift.size() * sizeof(float));
+        profile_vocoder_checkpoint("set_inputs", profile_last);
 
-        supertonic_graph_compute(model, gf);
-        ggml_tensor * out = ggml_graph_get_tensor(gf, "wav");
-        wav_out = ggml_tensor_to_time_channel(out);
-        ggml_gallocr_free(allocr);
+        supertonic_graph_compute(model, cache.gf);
+        profile_vocoder_checkpoint("compute", profile_last);
+        wav_out = ggml_tensor_to_time_channel(cache.wav);
+        profile_vocoder_checkpoint("readback", profile_last);
         if (error) error->clear();
         return true;
     } catch (const std::exception & e) {

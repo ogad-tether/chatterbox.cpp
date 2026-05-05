@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(GNUInstallDirs)
+include(CheckIncludeFileCXX)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(TTS_CPP_STANDALONE_DEFAULT ON)
@@ -227,6 +228,13 @@ if (TTS_CPP_BUILD_TESTS)
     target_link_libraries(test-supertonic-vocoder-trace PRIVATE ggml)
     target_include_directories(test-supertonic-vocoder-trace PRIVATE ggml/include src)
 
+    add_executable(test-supertonic-vocoder-pointwise
+        src/test_supertonic_vocoder_pointwise.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_vocoder.cpp)
+    target_link_libraries(test-supertonic-vocoder-pointwise PRIVATE ggml)
+    target_include_directories(test-supertonic-vocoder-pointwise PRIVATE ggml/include src)
+
     add_executable(test-supertonic-duration
         src/test_supertonic_duration.cpp
         src/supertonic_gguf.cpp
@@ -289,6 +297,39 @@ if (TTS_CPP_BUILD_TESTS)
         src/supertonic_vocoder.cpp)
     target_link_libraries(supertonic-bench PRIVATE ggml)
     target_include_directories(supertonic-bench PRIVATE ggml/include src)
+endif()
+
+set(TTS_CPP_POINTWISE_ACCEL_TARGETS
+    tts-cpp
+    test-supertonic-vector
+    test-supertonic-vector-trace
+    test-supertonic-vocoder
+    test-supertonic-vocoder-trace
+    test-supertonic-vocoder-pointwise
+    test-supertonic-pipeline
+    supertonic-bench)
+
+if (APPLE)
+    find_library(TTS_CPP_ACCELERATE_FRAMEWORK Accelerate)
+    if (TTS_CPP_ACCELERATE_FRAMEWORK)
+        foreach(_tts_accel_target ${TTS_CPP_POINTWISE_ACCEL_TARGETS})
+            if (TARGET ${_tts_accel_target})
+                target_link_libraries(${_tts_accel_target} PRIVATE ${TTS_CPP_ACCELERATE_FRAMEWORK})
+                target_compile_definitions(${_tts_accel_target} PRIVATE TTS_CPP_USE_ACCELERATE)
+            endif()
+        endforeach()
+    endif()
+else()
+    check_include_file_cxx(cblas.h TTS_CPP_HAS_CBLAS_H)
+    find_package(BLAS)
+    if (TTS_CPP_HAS_CBLAS_H AND BLAS_FOUND)
+        foreach(_tts_cblas_target ${TTS_CPP_POINTWISE_ACCEL_TARGETS})
+            if (TARGET ${_tts_cblas_target})
+                target_link_libraries(${_tts_cblas_target} PRIVATE ${BLAS_LIBRARIES})
+                target_compile_definitions(${_tts_cblas_target} PRIVATE TTS_CPP_USE_CBLAS)
+            endif()
+        endforeach()
+    endif()
 endif()
 
 if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
