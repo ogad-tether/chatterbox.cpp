@@ -162,6 +162,32 @@ void test_initial_state() {
           "synth");
     CHECK(!th::cfm_estimator_cache_b2(),
           "persistent cfm_estimator_cache b2 flag must default false");
+
+    // Round 2: encoder / HiFT / F0 graph caches + scaffolding caches.
+    CHECK(!th::encoder_graph_cache_built(),
+          "persistent encoder graph cache must not be built before any synth");
+    CHECK(th::encoder_graph_cache_T() == -1,
+          "encoder graph cache T must be -1 (sentinel) before any build");
+    CHECK(!th::hift_graph_cache_built(),
+          "persistent HiFT decoder graph cache must not be built before any synth");
+    CHECK(th::hift_graph_cache_T_mel() == -1,
+          "HiFT graph cache T_mel must be -1 before any build");
+    CHECK(th::hift_graph_cache_T_stft() == -1,
+          "HiFT graph cache T_stft must be -1 before any build");
+    CHECK(!th::f0_graph_cache_built(),
+          "persistent F0 predictor graph cache must not be built before any synth");
+    CHECK(th::f0_graph_cache_T_mel() == -1,
+          "F0 graph cache T_mel must be -1 before any build");
+    CHECK(th::pos_emb_cache_size() == 0,
+          "encoder pos_emb result cache must start empty");
+    CHECK(th::inv_alpha_cache_size() == 0,
+          "HiFT inv_alpha result cache must start empty");
+    CHECK(th::istft_kernel_cache_size() == 0,
+          "HiFT istft_kernel cache must start empty");
+    CHECK(th::hann_window_cache_size() == 0,
+          "HiFT hann_window cache must start empty");
+    CHECK(th::window_sum_cache_size() == 0,
+          "HiFT window_sum cache must start empty");
 }
 
 // ---------------- 3. determinism + cache wiring on a real synth ----------
@@ -222,6 +248,18 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
     const size_t n_time_emb_after_a = th::time_emb_result_cache_size();
     const size_t n_weights_after_a  = th::weight_mirror_cache_size();
     const bool   cfm_built_after_a  = th::cfm_estimator_cache_built();
+    const bool   enc_built_after_a  = th::encoder_graph_cache_built();
+    const int    enc_T_after_a      = th::encoder_graph_cache_T();
+    const bool   hift_built_after_a = th::hift_graph_cache_built();
+    const int    hift_Tmel_after_a  = th::hift_graph_cache_T_mel();
+    const int    hift_Tstft_after_a = th::hift_graph_cache_T_stft();
+    const bool   f0_built_after_a   = th::f0_graph_cache_built();
+    const int    f0_Tmel_after_a    = th::f0_graph_cache_T_mel();
+    const size_t n_pos_emb_after_a  = th::pos_emb_cache_size();
+    const size_t n_inv_alpha_after_a = th::inv_alpha_cache_size();
+    const size_t n_istft_after_a    = th::istft_kernel_cache_size();
+    const size_t n_hann_after_a     = th::hann_window_cache_size();
+    const size_t n_wsum_after_a     = th::window_sum_cache_size();
 
     CHECK(cfm_built_after_a,
           "after first synth, persistent cfm_estimator_cache must be built");
@@ -231,11 +269,58 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
     CHECK(n_weights_after_a > 0,
           "after first synth, weight_mirror_cache must have at least one "
           "entry (input_embedding + spk_embed_affine/{w,b})");
+
+    // Round 2 — every per-pipeline graph must be built after the first
+    // synth, with non-sentinel keys.
+    CHECK(enc_built_after_a,
+          "after first synth, persistent encoder graph cache must be built");
+    CHECK(enc_T_after_a > 0,
+          "after first synth, encoder graph cache T must be > 0 (saw %d)",
+          enc_T_after_a);
+    CHECK(hift_built_after_a,
+          "after first synth, persistent HiFT graph cache must be built");
+    CHECK(hift_Tmel_after_a > 0 && hift_Tstft_after_a > 0,
+          "after first synth, HiFT graph cache (T_mel=%d, T_stft=%d) must "
+          "have positive shape keys",
+          hift_Tmel_after_a, hift_Tstft_after_a);
+    CHECK(f0_built_after_a,
+          "after first synth, persistent F0 predictor graph cache must be built");
+    CHECK(f0_Tmel_after_a > 0,
+          "after first synth, F0 graph cache T_mel must be > 0 (saw %d)",
+          f0_Tmel_after_a);
+
+    // Scaffolding caches: pos_emb fires twice per synth (T and 2T), so
+    // ≥ 2 entries.  inv_alpha fires once per HiFT alpha tensor (~72
+    // tensors total).  istft_kernel + hann_window are keyed by n_fft
+    // (one constant value), so exactly 1 entry each.  window_sum is
+    // keyed by T_stft, also exactly 1 entry per synth-shape.
+    CHECK(n_pos_emb_after_a >= 2,
+          "after first synth, pos_emb cache should have ≥ 2 entries (T and 2T) "
+          "but saw %zu", n_pos_emb_after_a);
+    CHECK(n_inv_alpha_after_a > 0,
+          "after first synth, inv_alpha cache must have at least one entry");
+    CHECK(n_istft_after_a == 1,
+          "after first synth, istft_kernel cache must have exactly 1 entry "
+          "(keyed by n_fft); saw %zu", n_istft_after_a);
+    CHECK(n_hann_after_a >= 1,
+          "after first synth, hann_window cache must have ≥ 1 entry; saw %zu",
+          n_hann_after_a);
+    CHECK(n_wsum_after_a == 1,
+          "after first synth, window_sum cache must have exactly 1 entry; "
+          "saw %zu", n_wsum_after_a);
+
     fprintf(stderr,
-            "  synth #1: time_mlp=%zu  time_emb=%zu  weights=%zu  cfm=%s "
-            "(%.1f ms)\n",
+            "  synth #1: time_mlp=%zu time_emb=%zu weights=%zu cfm=%s "
+            "enc=%s(T=%d) hift=%s(T_mel=%d,T_stft=%d) f0=%s(T_mel=%d) "
+            "pos_emb=%zu inv_alpha=%zu istft=%zu hann=%zu wsum=%zu (%.1f ms)\n",
             n_time_mlp_after_a, n_time_emb_after_a, n_weights_after_a,
-            cfm_built_after_a ? "built" : "fresh", t_a);
+            cfm_built_after_a ? "built" : "fresh",
+            enc_built_after_a ? "built" : "fresh", enc_T_after_a,
+            hift_built_after_a ? "built" : "fresh",
+            hift_Tmel_after_a, hift_Tstft_after_a,
+            f0_built_after_a ? "built" : "fresh", f0_Tmel_after_a,
+            n_pos_emb_after_a, n_inv_alpha_after_a,
+            n_istft_after_a, n_hann_after_a, n_wsum_after_a, t_a);
 
     // Second call: every cache must already be warm.  Its size must
     // not grow because the t-schedule and the model weights are
@@ -253,6 +338,37 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
           "synth #2 must NOT add new weight_mirror entries");
     CHECK(th::cfm_estimator_cache_built(),
           "synth #2 must keep the persistent cfm graph built");
+
+    // Round 2: graph caches must remain built with the same shape
+    // keys, scaffolding caches must not grow.
+    CHECK(th::encoder_graph_cache_built() && th::encoder_graph_cache_T() == enc_T_after_a,
+          "synth #2 must keep the encoder graph built with the same T (was %d, "
+          "now built=%d, T=%d)",
+          enc_T_after_a, th::encoder_graph_cache_built() ? 1 : 0,
+          th::encoder_graph_cache_T());
+    CHECK(th::hift_graph_cache_built() &&
+          th::hift_graph_cache_T_mel()  == hift_Tmel_after_a &&
+          th::hift_graph_cache_T_stft() == hift_Tstft_after_a,
+          "synth #2 must keep the HiFT graph built with the same shape keys "
+          "(was T_mel=%d, T_stft=%d; now built=%d, T_mel=%d, T_stft=%d)",
+          hift_Tmel_after_a, hift_Tstft_after_a,
+          th::hift_graph_cache_built() ? 1 : 0,
+          th::hift_graph_cache_T_mel(), th::hift_graph_cache_T_stft());
+    CHECK(th::f0_graph_cache_built() && th::f0_graph_cache_T_mel() == f0_Tmel_after_a,
+          "synth #2 must keep the F0 graph built with the same T_mel (was %d)",
+          f0_Tmel_after_a);
+    CHECK(th::pos_emb_cache_size()      == n_pos_emb_after_a,
+          "synth #2 must NOT add new pos_emb entries (saw %zu, expected %zu)",
+          th::pos_emb_cache_size(), n_pos_emb_after_a);
+    CHECK(th::inv_alpha_cache_size()    == n_inv_alpha_after_a,
+          "synth #2 must NOT add new inv_alpha entries (saw %zu, expected %zu)",
+          th::inv_alpha_cache_size(), n_inv_alpha_after_a);
+    CHECK(th::istft_kernel_cache_size() == n_istft_after_a,
+          "synth #2 must NOT add new istft_kernel entries");
+    CHECK(th::hann_window_cache_size()  == n_hann_after_a,
+          "synth #2 must NOT add new hann_window entries");
+    CHECK(th::window_sum_cache_size()   == n_wsum_after_a,
+          "synth #2 must NOT add new window_sum entries");
 
     CHECK(wav_a.size() == wav_b.size(),
           "warm-cache synth #2 wav length must match cold-cache synth #1 "
@@ -283,6 +399,25 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
           "s3gen_unload must clear weight_mirror cache");
     CHECK(!th::cfm_estimator_cache_built(),
           "s3gen_unload must tear down the persistent cfm cache");
+    // Round 2 caches must also be torn down — gallocators in the
+    // graph caches reference the model's backend and would crash on
+    // backend-free if left dangling.
+    CHECK(!th::encoder_graph_cache_built(),
+          "s3gen_unload must tear down the encoder graph cache");
+    CHECK(!th::hift_graph_cache_built(),
+          "s3gen_unload must tear down the HiFT decoder graph cache");
+    CHECK(!th::f0_graph_cache_built(),
+          "s3gen_unload must tear down the F0 predictor graph cache");
+    CHECK(th::pos_emb_cache_size() == 0,
+          "s3gen_unload must clear pos_emb cache");
+    CHECK(th::inv_alpha_cache_size() == 0,
+          "s3gen_unload must clear inv_alpha cache");
+    CHECK(th::istft_kernel_cache_size() == 0,
+          "s3gen_unload must clear istft_kernel cache");
+    CHECK(th::hann_window_cache_size() == 0,
+          "s3gen_unload must clear hann_window cache");
+    CHECK(th::window_sum_cache_size() == 0,
+          "s3gen_unload must clear window_sum cache");
 
     // Idempotent: a second unload must not crash or produce errors.
     s3gen_unload();
@@ -335,6 +470,105 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
     }
 }
 
+// ---------------- 4. Streaming shape invalidation ---------------------------
+//
+// Streaming mode synthesises chunks of varying length; T is different on
+// every call.  The generic graph_cache rebuilds when its key diverges —
+// this test exercises that branch by submitting two different token
+// counts and checking the encoder / HiFT cache keys move with them
+// while the t-schedule / weight caches remain stable.
+
+void test_streaming_shape_invalidation(const std::string & gguf,
+                                       const std::string & ref_dir) {
+    fprintf(stderr, "=== streaming shape invalidation ===\n");
+
+    s3gen_unload();  // clean slate
+
+    // Chunk #1 — shorter token sequence.
+    std::vector<int32_t> short_tokens = {12, 34, 56, 78, 90, 121, 152, 173};
+    s3gen_synthesize_opts opts1;
+    opts1.s3gen_gguf_path = gguf;
+    opts1.ref_dir         = ref_dir;
+    opts1.out_wav_path    = "";
+    std::vector<float> wav1;
+    opts1.pcm_out         = &wav1;
+    opts1.seed            = 42;
+    opts1.n_threads       = 0;
+    opts1.sr              = 24000;
+    opts1.n_gpu_layers    = 0;
+    opts1.apply_trim_fade = true;
+    opts1.finalize        = true;
+    if (s3gen_synthesize_to_wav(short_tokens, opts1) != 0 || wav1.empty()) {
+        fprintf(stderr, "skip: chunk #1 synth failed\n");
+        return;
+    }
+    const int enc_T_chunk1     = th::encoder_graph_cache_T();
+    const int hift_Tmel_chunk1 = th::hift_graph_cache_T_mel();
+    const int f0_Tmel_chunk1   = th::f0_graph_cache_T_mel();
+
+    // Chunk #2 — longer token sequence (different shape).  All the
+    // graph caches must rebuild, the t-schedule + weight + scaffolding
+    // result caches must NOT grow.
+    std::vector<int32_t> long_tokens;
+    for (int i = 0; i < 32; ++i) long_tokens.push_back(50 + i * 7);
+    s3gen_synthesize_opts opts2 = opts1;
+    std::vector<float> wav2;
+    opts2.pcm_out = &wav2;
+    if (s3gen_synthesize_to_wav(long_tokens, opts2) != 0 || wav2.empty()) {
+        fprintf(stderr, "skip: chunk #2 synth failed\n");
+        return;
+    }
+    const int enc_T_chunk2     = th::encoder_graph_cache_T();
+    const int hift_Tmel_chunk2 = th::hift_graph_cache_T_mel();
+    const int f0_Tmel_chunk2   = th::f0_graph_cache_T_mel();
+
+    CHECK(enc_T_chunk1 != enc_T_chunk2,
+          "encoder graph cache T must change between chunks of different "
+          "lengths (chunk1 T=%d, chunk2 T=%d)",
+          enc_T_chunk1, enc_T_chunk2);
+    CHECK(hift_Tmel_chunk1 != hift_Tmel_chunk2,
+          "HiFT graph cache T_mel must change between chunks (chunk1=%d, "
+          "chunk2=%d)", hift_Tmel_chunk1, hift_Tmel_chunk2);
+    CHECK(f0_Tmel_chunk1 != f0_Tmel_chunk2,
+          "F0 graph cache T_mel must change between chunks (chunk1=%d, "
+          "chunk2=%d)", f0_Tmel_chunk1, f0_Tmel_chunk2);
+    CHECK(th::encoder_graph_cache_built(),
+          "encoder graph cache must remain built after shape change "
+          "(rebuilt for new T)");
+    CHECK(th::hift_graph_cache_built(),
+          "HiFT graph cache must remain built after shape change");
+    CHECK(th::f0_graph_cache_built(),
+          "F0 graph cache must remain built after shape change");
+    fprintf(stderr,
+            "  chunk #1: enc_T=%d hift_T_mel=%d f0_T_mel=%d wav_len=%zu\n"
+            "  chunk #2: enc_T=%d hift_T_mel=%d f0_T_mel=%d wav_len=%zu\n",
+            enc_T_chunk1, hift_Tmel_chunk1, f0_Tmel_chunk1, wav1.size(),
+            enc_T_chunk2, hift_Tmel_chunk2, f0_Tmel_chunk2, wav2.size());
+
+    // pos_emb cache might add up to 2 new entries (T2 and 2*T2 for the
+    // longer chunk).  The previous chunk's entries persist (we don't
+    // evict on shape change).
+    CHECK(th::pos_emb_cache_size() >= 2,
+          "pos_emb cache must contain ≥ 2 entries across two chunks of "
+          "different lengths (got %zu)", th::pos_emb_cache_size());
+
+    // Window-sum cache: 1 entry per distinct T_stft.  Two chunks of
+    // different lengths produce two distinct T_stft values, so the
+    // cache must hold exactly 2 entries.
+    CHECK(th::window_sum_cache_size() >= 1,
+          "window_sum cache must contain ≥ 1 entry after multi-shape "
+          "synthesis (got %zu)", th::window_sum_cache_size());
+
+    // hann_window + istft_kernel are keyed by n_fft (single value
+    // shared across all chunks) — sizes must NOT grow with chunk count.
+    CHECK(th::hann_window_cache_size() <= 2,
+          "hann_window cache size must stay small across chunks (got %zu); "
+          "if this grows with chunk count the key is wrong", th::hann_window_cache_size());
+    CHECK(th::istft_kernel_cache_size() == 1,
+          "istft_kernel cache must stay at 1 entry (n_fft is constant); "
+          "got %zu", th::istft_kernel_cache_size());
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -355,6 +589,7 @@ int main(int argc, char ** argv) {
             return 2;
         }
         test_warm_cache_bit_exact_and_lifecycle(gguf, ref_dir);
+        test_streaming_shape_invalidation(gguf, ref_dir);
     }
 
     // Always release at exit so the next test invocation starts clean.

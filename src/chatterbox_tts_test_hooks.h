@@ -63,4 +63,35 @@ uint64_t float_pair_cache_key(float t_val, float r_val);
 // t-value was actually warmed without re-entering compute_time_mlp.
 std::vector<float> peek_time_mlp_cached(float t_val);
 
+// ---------- Round 2 (PROGRESS.md §3.33): graph + scaffolding caches ----
+
+// Persistent encoder graph cache.  Built lazily by run_encoder() and
+// invalidated when its key (T) diverges from a streaming chunk.  False
+// before any synth and after s3gen_unload().
+bool encoder_graph_cache_built();
+
+// Cache key (input length T) currently held by the encoder graph
+// cache.  -1 if not built; otherwise the T from the most recent build.
+int  encoder_graph_cache_T();
+
+// Persistent HiFT decoder graph cache.  Built lazily by
+// run_hift_decode() and invalidated when (T_mel, T_stft) diverge.
+bool hift_graph_cache_built();
+int  hift_graph_cache_T_mel();
+int  hift_graph_cache_T_stft();
+
+// Persistent F0 predictor graph cache.  Built lazily by
+// run_f0_predictor(); keyed on T_mel.
+bool f0_graph_cache_built();
+int  f0_graph_cache_T_mel();
+
+// Sizes of the small scaffolding caches.  Each is process-wide; a
+// stable set of n_fft / hop / model parameters means the steady-state
+// size is small (1-2 entries each).
+size_t pos_emb_cache_size();
+size_t inv_alpha_cache_size();
+size_t istft_kernel_cache_size();
+size_t hann_window_cache_size();
+size_t window_sum_cache_size();
+
 }  // namespace tts_cpp::chatterbox::test_hooks
