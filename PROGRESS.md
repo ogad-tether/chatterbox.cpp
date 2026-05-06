@@ -1449,8 +1449,8 @@ Precision regressions are immediately visible: a change that drops rel to
 ## How to re-run everything
 
 ```bash
-ssh gianni@dev-linux-x64
-cd ~/chatterbox.cpp
+# (on whichever Linux/macOS box you have the GGUFs and reference dumps on)
+cd path/to/chatterbox.cpp
 
 # One-time: build the binaries
 cmake -S . -B build
@@ -4167,8 +4167,8 @@ per-call download cost saved.
 
 #### 6. Three HiFT `ggml_cont` sites removed (perf-neutral, code quality)
 
-Round-AUDIT (in the qvac monorepo's `FINDINGS_ROUND_AUDIT.md`)
-listed these as deferred; same methodology applied here:
+Round-AUDIT (kept in an internal findings doc, out-of-tree) listed
+these as deferred; same methodology applied here:
 
 | Site                                | Calls / inf | Direct consumer                              |
 |-------------------------------------|------------:|----------------------------------------------|
@@ -4191,9 +4191,9 @@ locked baseline — gallocator non-zero-offset view sensitivity).
 
 #### 7. G2 dump-script gap closure — `regress-tensor-compare.sh` end-to-end
 
-`regress-tensor-compare.sh` (in the qvac monorepo's
-`inputFilesForAI/qvac-17872-findings/bench-logs-vk-c1/`) was
-previously aborting at stage G2 with `cannot open cfm_concat.npy`.
+`regress-tensor-compare.sh` (kept in an internal benchmark log
+directory, out-of-tree) was previously aborting at stage G2 with
+`cannot open cfm_concat.npy`.
 Four files added to `scripts/dump-s3gen-reference.py`:
 
 - `cfm_concat.npy` (stage G2): replicates the
@@ -4235,8 +4235,8 @@ xc = ggml_concat(x_in, mu_in, spks_bc, cond_in);
 Skip-upload only works for inputs referenced **throughout** the
 graph (encoder `pos_emb` works, CFM `mu / spks / cond` doesn't).
 General rule for ggml's gallocator, kept as a comment in
-`synthesize()` and documented in
-`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_HIFT.md` §2-bis.4.
+`synthesize()` and documented in the internal HIFT-round findings
+doc (out-of-tree) §2-bis.4.
 
 #### Performance — RTX 5090, regress-tight aggregate, n=75 chunks, Turbo
 
@@ -4310,8 +4310,9 @@ public-API change.  Bit-exact-preserving on multilingual on Vulkan:
 locked invariants (single-shot `c65d98f15a59b8fe9cad98e46eb3fb30`,
 6-segment multi-synth `0b374c7474895a3387b9f1df10b3c1b8`) match
 byte-for-byte before and after the round-2 changes.  Test-first:
-`bench-logs-vk-mtl/regress-mtl-vk.sh` (in the qvac monorepo, out-of-tree)
-locks the pre-change snapshot then re-verifies after every cache.
+An internal `regress-mtl-vk.sh` reproduction harness (kept
+out-of-tree) locks the pre-change snapshot then re-verifies after
+every cache.
 
 **The seven new caches** (all sit alongside the existing
 `g_cfm_estimator_cache` / `g_time_mlp_results` / `g_time_emb_results` /
@@ -4375,7 +4376,7 @@ shader-side optimisation (e.g. tensor-core engagement via
 ##### Reproduction (test-first harness)
 
 ```bash
-cd inputFilesForAI/qvac-17872-findings/chatterbox.cpp
+cd chatterbox.cpp
 
 # 1. Build the round-2 binary
 bash scripts/setup-ggml.sh
@@ -4468,8 +4469,8 @@ to ~30 ms (cache hit) — the headline mobile / Mesa win.
 ##### Reproduction
 
 ```bash
-# PR build (this branch)
-cd inputFilesForAI/qvac-17872-findings/chatterbox.cpp
+# Build with the round-2 patch set applied
+cd chatterbox.cpp
 bash scripts/setup-ggml.sh
 cmake -S . -B build-vk-mtl-merged -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
 cmake --build build-vk-mtl-merged -j --target tts-cli
@@ -4517,9 +4518,9 @@ deletions are user-facing; the −98 lines reduce the per-synth
 `gallocr_new` / `ggml_init` / `ggml_gallocr_free` / `ggml_free`
 boilerplate that the cache infrastructure now subsumes.
 
-All `inputFilesForAI/qvac-17872-findings/FINDINGS_*.md` and
-`PR_DESCRIPTION_*.md` companion docs stay in the qvac monorepo
-(out-of-tree) — same arrangement as the multilingual-CPU cache work.
+The detailed FINDINGS_*.md companion docs stay out-of-tree
+(internal context only) — same arrangement as the multilingual-CPU
+cache work.
 
 #### Next
 
@@ -4562,9 +4563,9 @@ All `inputFilesForAI/qvac-17872-findings/FINDINGS_*.md` and
 
 ## OpenCL / Adreno bring-up (April 2026)
 
-Target: **Termux on Snapdragon / Adreno 830** using `GGML_OPENCL=ON`, with
-`LD_LIBRARY_PATH` including `/data/data/com.termux/files/home/lib` so the
-OpenCL loader and ggml DSOs resolve.
+Target: **Termux on Snapdragon / Adreno 830** using `GGML_OPENCL=ON`,
+with `LD_LIBRARY_PATH` including `$HOME/lib` so the OpenCL loader
+and ggml DSOs resolve.
 
 ### What was missing
 
@@ -4599,10 +4600,11 @@ sequence of blockers observed on-device was:
 
 ### Validation
 
-Remote build:
+Remote build (Android Termux; substitute your own
+`$HOME/chatterbox.cpp` path if it lives elsewhere):
 
 ```bash
-cd /data/data/com.termux/files/home/qvac-chatterbox.cpp
+cd $HOME/chatterbox.cpp
 git pull --ff-only
 ./scripts/setup-ggml.sh
 cmake -S . -B build-opencl -DCMAKE_BUILD_TYPE=Release -DGGML_OPENCL=ON
@@ -4612,10 +4614,10 @@ cmake --build build-opencl -j$(nproc) --target tts-cli
 Runtime command:
 
 ```bash
-export LD_LIBRARY_PATH="/data/data/com.termux/files/home/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$HOME/lib:${LD_LIBRARY_PATH:-}"
 ./build-opencl/tts-cli \
-  --model /data/data/com.termux/files/home/chatterbox.cpp/models/chatterbox-t3-turbo.gguf \
-  --s3gen-gguf /data/data/com.termux/files/home/chatterbox.cpp/models/chatterbox-s3gen.gguf \
+  --model $HOME/chatterbox.cpp/models/chatterbox-t3-turbo.gguf \
+  --s3gen-gguf $HOME/chatterbox.cpp/models/chatterbox-s3gen.gguf \
   --text "Hello" --n-gpu-layers 99 --verbose --out test-gpu.wav
 ```
 
