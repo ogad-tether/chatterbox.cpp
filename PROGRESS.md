@@ -4318,6 +4318,96 @@ infrastructure that is shared between Turbo and multilingual:
 4. **HiFT cont removals** — HiFT decoder code path is identical
    for both variants.
 
+#### Round 2 — encoder / HiFT / F0 graph caches + scaffolding caches (May 6, 2026)
+
+Targets the per-synth host-CPU overhead that round 1 / round-HIFT didn't
+address.  All host-side, model-agnostic, no GGUF-format change, no
+public-API change.  Bit-exact-preserving on multilingual on Vulkan:
+locked invariants (single-shot `c65d98f15a59b8fe9cad98e46eb3fb30`,
+6-segment multi-synth `0b374c7474895a3387b9f1df10b3c1b8`) match
+byte-for-byte before and after the round-2 changes.  Test-first:
+`bench-logs-vk-mtl/regress-mtl-vk.sh` (in the qvac monorepo, out-of-tree)
+locks the pre-change snapshot then re-verifies after every cache.
+
+**The seven new caches** (all sit alongside the existing
+`g_cfm_estimator_cache` / `g_time_mlp_results` / `g_time_emb_results` /
+`g_weight_cpu_mirror` from round 1):
+
+| Cache | Keyed on | What it stores | Why it's safe |
+|---|---|---|---|
+| `g_encoder_graph_cache` | `T` (encoder input length) | full `run_encoder` graph + `gallocator` | Streaming chunks at varying length still produce correct output (rebuilds on key change). |
+| `g_hift_graph_cache` (+ `g_hift_inv_alpha_entries` metadata) | `pack(T_mel, T_stft)` | full `run_hift_decode` graph + `gallocator` | Parallel `(graph-input-name, source-tensor-ptr)` metadata lets cache hits re-feed each alpha-input slot from `g_inv_alpha_results` without rebuilding. |
+| `g_f0_graph_cache` | `T_mel` | full `run_f0_predictor` graph + `gallocator` | Same pattern as encoder. |
+| `g_pos_emb_results` (`cached_pos_emb`) | `pack(T, D)` | `(2T-1, D)` F32 vector from `compute_pos_emb` | `compute_pos_emb` is pure compute (~`T × D × 5` trig ops).  Fired twice per encoder run (`T` and `2T`).  Multilingual `T~350+` and `D=512` makes this a real wedge of per-synth host time. |
+| `g_inv_alpha_results` (`cached_inv_alpha`) | `ggml_tensor *` (model-weight pointer) | `vector<float>` of inverted alphas | Alpha tensors are constant for the model lifetime; HiFT calls `invert_alpha_cpu` ~72× per synth (12 ResBlocks × 6 alphas).  Survives across HiFT graph rebuilds. |
+| `g_hann_window_cache` / `g_istft_kernel_cache` (`cached_*`) | `n_fft` | `vector<float>` | Pure functions of `n_fft` (constant 16 in the chatterbox HiFT path). |
+| `g_window_sum_cache` (`cached_window_sum`) | `pack(n_fft, hop, T_stft)` | `vector<float>` | `T_stft × n_fft` adds (`~T_stft` ms-class cost on long utterances).  Stable across same-shape synth calls. |
+
+A new `graph_cache` struct (used by encoder / HiFT / F0) and a
+`pack_hift_key` helper centralise the explicit `destroy()`-on-teardown
+pattern so future per-stage caches can plug in with one struct + one
+mutex acquisition.  The destroy path is unified into a renamed
+`s3gen_release_synth_caches()` (replaces the old
+`g_cfm_estimator_cache_destroy()`) called from `s3gen_model_cache_release`,
+the cache-miss backend-swap path, and the explicit `s3gen_unload()`.
+
+##### Negative result documented (bug caught and fixed during dev)
+
+First implementation of the HiFT cache hung indefinitely on the very
+first synth call.  Root cause: the alpha-input refresh loop held
+`g_synth_caches_mu` while calling `cached_inv_alpha`, which itself
+takes the same mutex internally → classic re-entrant deadlock.  Fix:
+snapshot `g_hift_inv_alpha_entries` under the mutex into a local
+vector, then iterate without the lock (`cached_inv_alpha` re-acquires
+the mutex per call but with no nesting).  General rule: never hold a
+cache-state mutex while calling any other `cached_*` helper.
+
+##### Performance — RTX 5090, multilingual auto-split, warm-state seg 2–6
+
+Within-process win on top of round 1 + round-HIFT (already shipped in
+this PR):
+
+| Metric          | Pre-round-2 (baseline-pre-r2.snap) | Post-round-2 |          Δ                |
+|-----------------|-----------------------------------:|-------------:|---------------------------:|
+| **S3GEN_INFER** |                          159.8 ms  | **140.8 ms** | **−19.0 ms (−11.9 %)**    |
+| **cfm_total**   |                          122.2 ms  |    118.7 ms  | **−3.5 ms (−2.9 %)**      |
+| **cfm_step0**   |                           13.24 ms |     13.18 ms |  unchanged (already cached round 1) |
+| **hift_total**  |                           17.96 ms |     16.3 ms  | **−1.7 ms (−9.4 %)**      |
+
+Combined cumulative win vs `upstream/multilingual_merged` baseline
+(round 1 + round-HIFT + round 2):
+
+| Metric          | upstream/multilingual_merged | this PR (full) |          Δ                |
+|-----------------|-----------------------------:|---------------:|---------------------------:|
+| **S3GEN_INFER** |                     169.9 ms |  **140.8 ms**  | **−29.1 ms (−17.1 %)**    |
+| **cfm_total**   |                     132.5 ms |  **118.7 ms**  | **−13.8 ms (−10.4 %)**    |
+| **cfm_step0**   |                      24.1 ms |   **13.2 ms**  | **−10.9 ms (−45.2 %)**    |
+
+The biggest remaining single piece of `S3GEN_INFER` (~120 ms cfm) is
+the actual GPU CFM compute — it's not host-cacheable and would need
+shader-side optimisation (e.g. tensor-core engagement via
+`cooperative_matrix2`, deferred — see "Next" below).
+
+##### Reproduction (test-first harness)
+
+```bash
+cd inputFilesForAI/qvac-17872-findings/chatterbox.cpp
+
+# 1. Build the round-2 binary
+bash scripts/setup-ggml.sh
+cmake -S . -B build-vk-mtl-merged -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+cmake --build build-vk-mtl-merged -j --target tts-cli
+
+# 2. Verify bit-exact vs the locked pre-round-2 baseline.  3/3 invariants
+#    must PASS (multilingual single-shot, multilingual 6-segment
+#    multi-synth, Turbo single-shot).
+bash ../bench-logs-vk-mtl/regress-mtl-vk.sh build-vk-mtl-merged final verify
+
+# Optional: re-lock if the binary is intentionally producing different
+# output (e.g. after an explicit numerical change).
+# bash ../bench-logs-vk-mtl/regress-mtl-vk.sh build-vk-mtl-merged my-baseline lock
+```
+
 #### Multilingual verification (May 6, 2026)
 
 The May 4 squashed port was measured on Turbo because the
@@ -4429,9 +4519,19 @@ md5sum /tmp/mtl-pr.wav /tmp/mtl-base.wav  # MUST match
 | `patches/README.md`                        |       +13 / -8  |
 | `scripts/setup-ggml.sh`                    |       +20 / -8  |
 | `scripts/dump-s3gen-reference.py`          |             +65 |
-| `src/chatterbox_tts.cpp`                   |     +252 / -19  |
+| `src/chatterbox_tts.cpp`                   |     +625 / -98  |
 | `src/test_s3gen.cpp`                       |              +6 |
-| **Total**                                  | **+593 / -22**  |
+| **Total**                                  | **+966 / -101** |
+
+The +373 lines added in round 2 (over the +252 already shipped in
+round-1 / round-HIFT) are entirely the new cache infrastructure:
+`graph_cache` struct, the seven new cache globals, the
+`s3gen_release_synth_caches()` lifecycle hook, the five `cached_*`
+scaffolding helpers, and the build_graph / cache-hit branches in
+`run_encoder` / `run_hift_decode` / `run_f0_predictor`.  No source
+deletions are user-facing; the −98 lines reduce the per-synth
+`gallocr_new` / `ggml_init` / `ggml_gallocr_free` / `ggml_free`
+boilerplate that the cache infrastructure now subsumes.
 
 All `inputFilesForAI/qvac-17872-findings/FINDINGS_*.md` and
 `PR_DESCRIPTION_*.md` companion docs stay in the qvac monorepo
@@ -4449,15 +4549,25 @@ All `inputFilesForAI/qvac-17872-findings/FINDINGS_*.md` and
   conversion path to `multilingual_merged`'s
   `ggml_dup_tensor + ggml_backend_alloc_ctx_tensors` `load_s3gen_gguf`
   layout, plus new locked MD5 baselines (NVIDIA + AMD, F32 + F16).
-- **HiFT graph caching on `multilingual_merged`**: that branch's
-  `run_hift_decode` allocates `ggml_gallocr_t + ggml_context *` fresh
-  on every call (no `g_hift_cache` equivalent) — same persistent-
-  cache pattern would save another ~5–10 ms / chunk on multilingual.
+- ~~**HiFT graph caching on `multilingual_merged`**~~: ✅ **DONE in round 2**
+  (May 6, 2026).  Added `g_hift_graph_cache` keyed on
+  `pack(T_mel, T_stft)` with parallel `g_hift_inv_alpha_entries`
+  metadata.  Within-process warm-state win: −9.4 % `hift_total` on
+  multilingual.  See "Round 2 — encoder / HiFT / F0 graph caches" subsection above.
+- ~~**Encoder + F0 + scaffolding caches**~~: ✅ **DONE in round 2** (May 6,
+  2026).  Added `g_encoder_graph_cache`, `g_f0_graph_cache`, plus
+  `cached_pos_emb` / `cached_inv_alpha` / `cached_hann_window` /
+  `cached_istft_kernel` / `cached_window_sum`.  Combined with HiFT
+  graph cache: −11.9 % `S3GEN_INFER` on multilingual.
 - **Round-4 / 6 QKV fusion composition with multilingual_merged's
   strided 3D views** — our batched `mul_mat` (originally landed on
   `main`) and their zero-cont strided views (`849507a`) are
   alternative optimisations targeting the same code; pick one
   approach and bench Vulkan `flash_attn_ext` stride tolerance.
+- **Tensor-core engagement for narrow CFM matmuls** (`cooperative_matrix2`):
+  the round-1 `main`-base CM2 Tier-3 close-out measured **−8.6 % cfm_total** on
+  RTX 5090.  Politically blocked behind a cmake flag pending
+  project-wide baseline-set sign-off.  See `FINDINGS_ROUND_CM2.md`.
 - **Mobile validation** (Adreno / Mali / Apple):
   hardware-bound; biggest remaining evidence gap.  AMD/RADV proxy
   refuted the original mobile-bandwidth projection on the
