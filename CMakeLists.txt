@@ -19,7 +19,7 @@ option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build the tts-cli executable + mel2wa
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
 option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use system-installed GGML library"                OFF)
-option(TTS_CPP_GGML_LIB_PREFIX   "tts-cpp: rename bundled ggml libraries to libtts-ggml-* (filename only; CMake target names and C symbols are unchanged). Prevents shared-library filename collisions when multiple consumers that vendor different ggml versions are loaded into the same host process. Has no effect when TTS_CPP_USE_SYSTEM_GGML=ON." ON)
+option(TTS_CPP_GGML_LIB_PREFIX   "tts-cpp: rename bundled ggml libraries to libspeech-ggml-* (filename only; CMake target names and C symbols are unchanged). Prevents shared-library filename collisions when several consumers that vendor different ggml versions are loaded into the same host process. The 'speech-' prefix is shared by parakeet.cpp, chatterbox.cpp, and the supertonic harnesses so the QVAC speech stack co-vendors a single ggml file set; flip to OFF to use stock upstream filenames. Has no effect when TTS_CPP_USE_SYSTEM_GGML=ON." ON)
 option(TTS_CPP_CCACHE            "tts-cpp: use ccache as compiler launcher if available"     ON)
 
 # ccache shaves ~30 % off iterative rebuild time on developer machines.
@@ -125,7 +125,7 @@ function(tts_cpp_apply_ggml_prefix target)
         set(_tcgp_old ${target})
     endif()
     set_target_properties(${target} PROPERTIES
-        OUTPUT_NAME "tts-${_tcgp_old}"
+        OUTPUT_NAME "speech-${_tcgp_old}"
     )
 endfunction()
 
@@ -141,17 +141,18 @@ if (TTS_CPP_GGML_LIB_PREFIX AND NOT TTS_CPP_USE_SYSTEM_GGML)
     # Renaming the .so/.dll files alone is not enough: ggml's runtime
     # backend loader (`ggml_backend_load_best`) hard-codes the
     # `libggml-` / `ggml-` filename prefix when scanning under
-    # GGML_BACKEND_DL=ON.  qvac-ext-ggml/speech absorbs the patch that
-    # adds GGML_BACKEND_DL_PROJECT_PREFIX; defining it here teaches the
-    # loader to look for our prefixed filenames at runtime.  Without
-    # it the renamed .so/.dll files exist on disk but Vulkan / OpenCL
-    # / CUDA backends silently fail to load on Android.
+    # GGML_BACKEND_DL=ON.  patches/ggml-backend-reg-filename-prefix.patch
+    # adds the `GGML_BACKEND_DL_PROJECT_PREFIX` macro; defining it here
+    # teaches the loader to look for our prefixed filenames at runtime.
+    # Without the macro the renamed .so/.dll files would exist on disk
+    # but Vulkan / OpenCL / CUDA backends would silently fail to load
+    # on Android.
     if (TARGET ggml)
         target_compile_definitions(ggml PRIVATE
-            GGML_BACKEND_DL_PROJECT_PREFIX="tts-"
+            GGML_BACKEND_DL_PROJECT_PREFIX="speech-"
         )
     endif()
-    message(STATUS "tts-cpp: bundled ggml libraries will be emitted as libtts-ggml-* (set TTS_CPP_GGML_LIB_PREFIX=OFF to keep upstream filenames)")
+    message(STATUS "tts-cpp: bundled ggml libraries will be emitted as libspeech-ggml-* (set TTS_CPP_GGML_LIB_PREFIX=OFF to keep upstream filenames)")
 endif()
 
 find_package(OpenMP)
@@ -329,7 +330,7 @@ if (TTS_CPP_BUILD_TESTS)
         set_property(TEST ${target} PROPERTY LABELS ${TCRT_LABEL})
         if (WIN32)
             # When ggml builds as shared (the MSVC default), test exes
-            # link against import libs and need to find tts-ggml-*.dll
+            # link against import libs and need to find speech-ggml-*.dll
             # at runtime.  Windows has no rpath, so we prepend the
             # build-tree DLL output dirs to PATH.  Both `bin/` (Ninja /
             # single-config) and `bin/<Config>/` (Visual Studio /
