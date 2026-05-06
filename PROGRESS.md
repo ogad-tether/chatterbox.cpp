@@ -470,7 +470,7 @@ After the fix, same prompt same seed:
 - per-0.5 s RMS windows: all 21 non-zero (3.3e-2 … 8.5e-2 range)
 - audible speech for the full 10.7 s
 
-Committed as [`bb0eb99`](https://github.com/gianni-cor/chatterbox.cpp/commit/bb0eb99).
+Committed as `bb0eb99`.
 
 ### Lesson
 
@@ -1057,7 +1057,7 @@ from `chatterbox.variant` GGUF metadata at load time; Turbo stays byte-
 identical to the pre-§3.19 builds.
 
 **What shipped (commit
-[3f0a8dac](https://github.com/gianni-cor/chatterbox.cpp/commit/3f0a8dac)):**
+`3f0a8dac`):**
 
 - `scripts/convert-t3-mtl-to-gguf.py` — packs `t3_mtl23ls_v2.safetensors`
   (30-layer Llama-520M + cond_enc perceiver + emotion_adv + learned pos
@@ -1471,7 +1471,7 @@ cmake -S . -B build
 cmake --build build -j10 --target tts-cli test-s3gen mel2wav
 
 # One-time: convert weights + built-in conditionals
-. ~/chatterbox-ref/.venv/bin/activate
+. path/to/chatterbox-ref/.venv/bin/activate
 python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
 python scripts/convert-s3gen-to-gguf.py    --out models/chatterbox-s3gen.gguf
 
@@ -2046,7 +2046,7 @@ region (`t < 500`) and diverged wildly in the speech region (`t ≥ 500`)
 — exactly the "receptive field of the prompt/speech boundary" pattern
 we were chasing.
 
-Fix (commit [`2e82cce`](https://github.com/gianni-cor/chatterbox.cpp/commit/2e82cce)
+Fix (commit `2e82cce`
 and the follow-up in this section):
 - Replace the `torch.randn_like` capture with a wrapper around
   `CausalConditionalCFM.basic_euler` that records the full `x` tensor
@@ -3169,7 +3169,7 @@ rms_diff=69.334   rms_base=1332.522
 max_abs_diff=1702.0   gate: FAIL (threshold > 0.9998; got 0.998647)
 ```
 
-Parakeet could absorb this drift (PR #1 §15.8 shipped it at exact token-ID
+Parakeet could absorb this drift (the parakeet port shipped it at exact token-ID
 parity across 95 tokens). Chatterbox cannot. Reverted — baseline md5
 restored to `79002f09bc48dda95ec0c2cfc2b895bd` at
 `/tmp/cb_revert.wav == /tmp/cb_base_1.wav`.
@@ -4054,10 +4054,10 @@ scp + run on any M4 / M3 / M2 box.
 - If M4 results confirm the prediction: update the §3.27 / §3.28 / §3.30 sections with the M4 numbers alongside M3U.
 - If M4 results contradict the prediction: file a follow-up to revisit the fusion costs on smaller Apple silicon.
 
-### 3.32  Vulkan multilingual port — `VkPipelineCache` + chatterbox-side persistent caches (QVAC-17872)
+### 3.32  Vulkan multilingual port — `VkPipelineCache` + chatterbox-side persistent caches
 
 Ports the Vulkan-side optimisation work originally landed on
-`upstream/main` (closed PR #1) onto the `multilingual_merged` base.
+`upstream/main` onto the `multilingual_merged` base.
 Two `ggml-vulkan` patches + four host-side optimisations in
 `src/chatterbox_tts.cpp`.  All bit-exact-preserving (F32 invariants
 on both NVIDIA and AMD/RADV); model-agnostic by construction so they
@@ -4066,12 +4066,10 @@ CFM with CFG) variants.  No public-API change, no GGUF format
 change, no new build-system requirement.
 
 The full per-round investigation (eight rounds + AMD validation +
-LunarG SDK / `cooperative_matrix2` Tier-3 close-out) lives in the
-qvac monorepo at
-`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND*.md` and
-`inputFilesForAI/qvac-17872-findings/PR_DESCRIPTION_FULL.md` for
-context.  This squashed port carries only the optimisations that
-remain measurable on the `multilingual_merged` base — many of the
+LunarG SDK / `cooperative_matrix2` Tier-3 close-out) was kept in
+internal findings docs (out-of-tree) for context.  This squashed
+port carries only the optimisations that remain measurable on the
+`multilingual_merged` base — many of the
 original rounds (notably the round-4 / round-6 Q/K/V batched matmul
 fusion) overlap with `multilingual_merged`'s own zero-cont strided
 Q/K/V views (commit `849507a`) and were deferred rather than
@@ -4207,9 +4205,9 @@ locked baseline — gallocator non-zero-offset view sensitivity).
 
 #### 7. G2 dump-script gap closure — `regress-tensor-compare.sh` end-to-end
 
-`regress-tensor-compare.sh` (in the qvac monorepo's
-`inputFilesForAI/qvac-17872-findings/bench-logs-vk-c1/`) was
-previously aborting at stage G2 with `cannot open cfm_concat.npy`.
+`regress-tensor-compare.sh` (kept in an internal benchmark log
+directory, out-of-tree) was previously aborting at stage G2 with
+`cannot open cfm_concat.npy`.
 Four files added to `scripts/dump-s3gen-reference.py`:
 
 - `cfm_concat.npy` (stage G2): replicates the
@@ -4251,14 +4249,14 @@ xc = ggml_concat(x_in, mu_in, spks_bc, cond_in);
 Skip-upload only works for inputs referenced **throughout** the
 graph (encoder `pos_emb` works, CFM `mu / spks / cond` doesn't).
 General rule for ggml's gallocator, kept as a comment in
-`synthesize()` and documented in
-`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_HIFT.md` §2-bis.4.
+`synthesize()` and documented in the internal HIFT-round findings
+doc (out-of-tree) §2-bis.4.
 
 #### Performance — RTX 5090, regress-tight aggregate, n=75 chunks, Turbo
 
 The May 4 port was measured on Turbo because the multilingual GGUF
-was not available locally at the time.  After §3.34 (the QVAC-18422
-companion PR) ships the converted-from-source
+was not available locally at the time.  After the §3.34 companion
+work ships the converted-from-source
 `chatterbox-s3gen-mtl-q4_0.gguf`, multilingual measurement is a
 follow-up.
 
@@ -4391,7 +4389,7 @@ shader-side optimisation (e.g. tensor-core engagement via
 ##### Reproduction (test-first harness)
 
 ```bash
-cd inputFilesForAI/qvac-17872-findings/chatterbox.cpp
+cd chatterbox.cpp
 
 # 1. Build the round-2 binary
 bash scripts/setup-ggml.sh
@@ -4412,7 +4410,7 @@ bash ../bench-logs-vk-mtl/regress-mtl-vk.sh build-vk-mtl-merged final verify
 
 The May 4 squashed port was measured on Turbo because the
 multilingual GGUF was not available locally then.  After the
-QVAC-18422 §3.34 companion work shipped a converter from the
+§3.34 companion work shipped a converter from the
 public `ResembleAI/chatterbox` HuggingFace repo
 (`chatterbox-s3gen-mtl-q4_0.gguf` 788 MB +
 `chatterbox-t3-mtl-q4_0.gguf` 345 MB), this section captures the
@@ -4471,7 +4469,7 @@ win is below the Turbo wins shown above because:
 ##### Cold-start (first segment of a fresh process)
 
 Within a single process, the **first** segment pays a one-time
-cache-warm-up overhead: PR 210–236 ms vs baseline 195–241 ms
+cache-warm-up overhead: with-caches 210–236 ms vs baseline 195–241 ms
 (no statistically significant first-segment penalty given
 run-to-run variance).  Subsequent segments are where the
 caches actually pay off and the win is consistently visible.
@@ -4484,8 +4482,8 @@ to ~30 ms (cache hit) — the headline mobile / Mesa win.
 ##### Reproduction
 
 ```bash
-# PR build (this branch)
-cd inputFilesForAI/qvac-17872-findings/chatterbox.cpp
+# Build with the round-2 patch set applied
+cd chatterbox.cpp
 bash scripts/setup-ggml.sh
 cmake -S . -B build-vk-mtl-merged -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
 cmake --build build-vk-mtl-merged -j --target tts-cli
@@ -4533,9 +4531,9 @@ deletions are user-facing; the −98 lines reduce the per-synth
 `gallocr_new` / `ggml_init` / `ggml_gallocr_free` / `ggml_free`
 boilerplate that the cache infrastructure now subsumes.
 
-All `inputFilesForAI/qvac-17872-findings/FINDINGS_*.md` and
-`PR_DESCRIPTION_*.md` companion docs stay in the qvac monorepo
-(out-of-tree) — same arrangement as the QVAC-18422 work.
+The detailed FINDINGS_*.md companion docs stay out-of-tree
+(internal context only) — same arrangement as the multilingual-CPU
+cache work.
 
 #### Next
 
@@ -4689,7 +4687,7 @@ flash_attn_f32_f16            ~102 ms
 Next experiments should target the core Q4_0 batched GEMM math itself
 (`kernel_mul_mm_q4_0_f32_l4_lm`), not epilogue/add fusion.
 
-### 3.32  CPU multilingual persistent caches (QVAC-18422)
+### 3.32  CPU multilingual persistent caches
 
 §3.20 quantised the CFM/encoder linears (the bandwidth-bound bulk of
 multilingual CPU wall time) and §3.21–3.31 took the Metal MTL path
@@ -4813,7 +4811,7 @@ a dependency on cache layout.
   multilingual-on-CPU bit-exact verification is a follow-up gated on
   having the multilingual GGUFs locally.
 
-### 3.33  CPU multilingual round-2 caches (QVAC-18422)
+### 3.33  CPU multilingual round-2 caches
 
 Round 1 (§3.32) targeted the dominant 10-step CFM bottlenecks
 (`compute_time_mlp` graph submissions, the local-scope
@@ -4934,7 +4932,7 @@ src/test_cpu_caches.cpp                  extended  (+49 round-2 checks)
 PROGRESS.md                              this section
 ```
 
-### 3.34  Multilingual verification + round-3 micro-optimisation (QVAC-18422)
+### 3.34  Multilingual verification + round-3 micro-optimisation
 
 The §3.32 / §3.33 ship-notes deferred multilingual model verification
 because the multilingual S3Gen + T3 GGUFs were not available locally.
@@ -5100,7 +5098,7 @@ are listed in `.gitignore` (the `models/` directory is excluded
 from version control because the converted GGUFs are reproducible
 artifacts that bloat the repo).
 
-### 3.35  T3 step-graph cache (QVAC-18422 round 4 — opt-in, server-mode win)
+### 3.35  T3 step-graph cache (round 4 — opt-in, server-mode win)
 
 §3.34 closed out the host-CPU envelope on chatterbox.cpp's S3Gen
 side.  Round 4 attacks the **biggest remaining T3-side gap** that
