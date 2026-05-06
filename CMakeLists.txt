@@ -122,26 +122,26 @@ if (TTS_CPP_BUILD_EXECUTABLES)
 endif()
 
 if (TTS_CPP_BUILD_TESTS)
-    add_executable(test-s3gen src/test_s3gen.cpp)
+    add_executable(test-s3gen test/test_s3gen.cpp)
     target_link_libraries(test-s3gen PRIVATE ggml)
     target_include_directories(test-s3gen PRIVATE ggml/include src)
 
     add_executable(test-voice-features
-        src/test_voice_features.cpp
+        test/test_voice_features.cpp
         src/voice_features.cpp
         src/mel_extract_stft.cpp)
     target_link_libraries(test-voice-features PRIVATE ggml)
     target_include_directories(test-voice-features PRIVATE ggml/include src)
 
     add_executable(test-resample
-        src/test_resample.cpp
+        test/test_resample.cpp
         src/voice_features.cpp
         src/mel_extract_stft.cpp)
     target_link_libraries(test-resample PRIVATE ggml)
     target_include_directories(test-resample PRIVATE src)
 
     add_executable(test-voice-encoder
-        src/test_voice_encoder.cpp
+        test/test_voice_encoder.cpp
         src/voice_encoder.cpp
         src/voice_features.cpp
         src/mel_extract_stft.cpp)
@@ -149,7 +149,7 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-voice-encoder PRIVATE ggml/include src)
 
     add_executable(test-campplus
-        src/test_campplus.cpp
+        test/test_campplus.cpp
         src/campplus.cpp)
     target_link_libraries(test-campplus PRIVATE ggml)
     target_include_directories(test-campplus PRIVATE ggml/include src)
@@ -158,14 +158,14 @@ if (TTS_CPP_BUILD_TESTS)
     endif()
 
     add_executable(test-fbank
-        src/test_fbank.cpp
+        test/test_fbank.cpp
         src/voice_features.cpp
         src/mel_extract_stft.cpp)
     target_link_libraries(test-fbank PRIVATE ggml)
     target_include_directories(test-fbank PRIVATE ggml/include src)
 
     add_executable(test-voice-embedding
-        src/test_voice_embedding.cpp
+        test/test_voice_embedding.cpp
         src/campplus.cpp
         src/voice_features.cpp
         src/mel_extract_stft.cpp)
@@ -176,23 +176,23 @@ if (TTS_CPP_BUILD_TESTS)
     endif()
 
     add_executable(test-s3tokenizer
-        src/test_s3tokenizer.cpp
+        test/test_s3tokenizer.cpp
         src/s3tokenizer.cpp)
     target_link_libraries(test-s3tokenizer PRIVATE ggml)
     target_include_directories(test-s3tokenizer PRIVATE ggml/include src)
 
-    add_executable(test-mtl-tokenizer src/test_mtl_tokenizer.cpp)
+    add_executable(test-mtl-tokenizer test/test_mtl_tokenizer.cpp)
     target_link_libraries(test-mtl-tokenizer PRIVATE mtl_tokenizer)
     target_include_directories(test-mtl-tokenizer PRIVATE src)
 
-    add_executable(test-t3-mtl src/test_t3_mtl.cpp)
+    add_executable(test-t3-mtl test/test_t3_mtl.cpp)
     target_link_libraries(test-t3-mtl PRIVATE tts-cpp ggml)
     target_include_directories(test-t3-mtl PRIVATE ggml/include src include)
     if (GGML_METAL)
         target_compile_definitions(test-t3-mtl PRIVATE GGML_USE_METAL)
     endif()
 
-    add_executable(test-t3-mtl-stages src/test_t3_mtl_stages.cpp)
+    add_executable(test-t3-mtl-stages test/test_t3_mtl_stages.cpp)
     target_link_libraries(test-t3-mtl-stages PRIVATE tts-cpp ggml)
     target_include_directories(test-t3-mtl-stages PRIVATE ggml/include src include)
     if (GGML_METAL)
@@ -200,12 +200,12 @@ if (TTS_CPP_BUILD_TESTS)
     endif()
 
     add_executable(test-streaming
-        src/test_streaming.cpp
+        test/test_streaming.cpp
         src/chatterbox_tts.cpp)
     target_link_libraries(test-streaming PRIVATE ggml)
     target_include_directories(test-streaming PRIVATE ggml/include src include)
 
-    add_executable(test-metal-ops src/test_metal_ops.cpp)
+    add_executable(test-metal-ops test/test_metal_ops.cpp)
     target_link_libraries(test-metal-ops PRIVATE ggml)
     target_include_directories(test-metal-ops PRIVATE ggml/include src)
     if (GGML_METAL)
@@ -222,17 +222,17 @@ if (TTS_CPP_BUILD_TESTS)
         target_include_directories(${target} PRIVATE ggml/include src include)
     endfunction()
 
-    add_supertonic_harness(test-supertonic-preprocess src/test_supertonic_preprocess.cpp)
-    add_supertonic_harness(test-supertonic-vocoder src/test_supertonic_vocoder.cpp)
-    add_supertonic_harness(test-supertonic-vocoder-trace src/test_supertonic_vocoder_trace.cpp)
-    add_supertonic_harness(test-supertonic-vocoder-pointwise src/test_supertonic_vocoder_pointwise.cpp)
-    add_supertonic_harness(test-supertonic-duration src/test_supertonic_duration.cpp)
-    add_supertonic_harness(test-supertonic-duration-trace src/test_supertonic_duration_trace.cpp)
-    add_supertonic_harness(test-supertonic-text-encoder src/test_supertonic_text_encoder.cpp)
-    add_supertonic_harness(test-supertonic-text-encoder-trace src/test_supertonic_text_encoder_trace.cpp)
-    add_supertonic_harness(test-supertonic-vector src/test_supertonic_vector.cpp)
-    add_supertonic_harness(test-supertonic-vector-trace src/test_supertonic_vector_trace.cpp)
-    add_supertonic_harness(test-supertonic-pipeline src/test_supertonic_pipeline.cpp)
+    add_supertonic_harness(test-supertonic-preprocess test/test_supertonic_preprocess.cpp)
+    add_supertonic_harness(test-supertonic-vocoder test/test_supertonic_vocoder.cpp)
+    add_supertonic_harness(test-supertonic-vocoder-trace test/test_supertonic_vocoder_trace.cpp)
+    add_supertonic_harness(test-supertonic-vocoder-pointwise test/test_supertonic_vocoder_pointwise.cpp)
+    add_supertonic_harness(test-supertonic-duration test/test_supertonic_duration.cpp)
+    add_supertonic_harness(test-supertonic-duration-trace test/test_supertonic_duration_trace.cpp)
+    add_supertonic_harness(test-supertonic-text-encoder test/test_supertonic_text_encoder.cpp)
+    add_supertonic_harness(test-supertonic-text-encoder-trace test/test_supertonic_text_encoder_trace.cpp)
+    add_supertonic_harness(test-supertonic-vector test/test_supertonic_vector.cpp)
+    add_supertonic_harness(test-supertonic-vector-trace test/test_supertonic_vector_trace.cpp)
+    add_supertonic_harness(test-supertonic-pipeline test/test_supertonic_pipeline.cpp)
     add_supertonic_harness(supertonic-bench src/supertonic_bench.cpp)
 endif()
 
