@@ -1730,13 +1730,14 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
         x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
-    // QVAC-17872 round-HIFT (2026-05-04): drop the cont before the
-    // classifier matmul.  ggml_mul_mat src1 (xp here) is the activations
-    // input; Vulkan / Metal / CUDA mul_mat shaders all iterate by stride
-    // and accept strided src1 for f32 matmul.  Saves 1 dispatch / HiFT
-    // decode.  Verified bit-exact across all RTX 5090 + AMD/RADV
-    // invariants in the round-HIFT companion FINDINGS doc.
-    ggml_tensor * xp = ggml_permute(ctx, x, 1, 0, 2, 3);
+    // ggml-cpu's mul_mat asserts nb10 == ggml_type_size(src1->type) — the
+    // CPU backend rejects a permuted src1 even for f32 matmul, so the cont
+    // here is required for CPU correctness.  Vulkan / Metal / CUDA shaders
+    // do iterate by stride and would accept the bare permute (which is what
+    // PR #8 / QVAC-17872 round-HIFT optimised for); restoring the cont
+    // unconditionally trades one dispatch on those backends for not aborting
+    // on CPU.  A backend-conditional fast path can revisit this later.
+    ggml_tensor * xp = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     ggml_tensor * cw = find_tensor(m, "hift/f0_predictor/classifier/weight");
     ggml_tensor * cb = find_tensor(m, "hift/f0_predictor/classifier/bias");
     ggml_tensor * y = ggml_mul_mat(ctx, cw, xp);
