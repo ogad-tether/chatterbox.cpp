@@ -4054,6 +4054,303 @@ scp + run on any M4 / M3 / M2 box.
 - If M4 results confirm the prediction: update the §3.27 / §3.28 / §3.30 sections with the M4 numbers alongside M3U.
 - If M4 results contradict the prediction: file a follow-up to revisit the fusion costs on smaller Apple silicon.
 
+### 3.32  Vulkan multilingual port — `VkPipelineCache` + chatterbox-side persistent caches (QVAC-17872)
+
+Ports the Vulkan-side optimisation work originally landed on
+`upstream/main` (closed PR #1) onto the `multilingual_merged` base.
+Two `ggml-vulkan` patches + four host-side optimisations in
+`src/chatterbox_tts.cpp`.  All bit-exact-preserving (F32 invariants
+on both NVIDIA and AMD/RADV); model-agnostic by construction so they
+benefit **both** the Turbo (meanflow) and the multilingual (standard
+CFM with CFG) variants.  No public-API change, no GGUF format
+change, no new build-system requirement.
+
+The full per-round investigation (eight rounds + AMD validation +
+LunarG SDK / `cooperative_matrix2` Tier-3 close-out) lives in the
+qvac monorepo at
+`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND*.md` and
+`inputFilesForAI/qvac-17872-findings/PR_DESCRIPTION_FULL.md` for
+context.  This squashed port carries only the optimisations that
+remain measurable on the `multilingual_merged` base — many of the
+original rounds (notably the round-4 / round-6 Q/K/V batched matmul
+fusion) overlap with `multilingual_merged`'s own zero-cont strided
+Q/K/V views (commit `849507a`) and were deferred rather than
+double-applied.  C1 (F16 CFM matmul weights) was also deferred —
+`multilingual_merged`'s `load_s3gen_gguf` uses
+`ggml_dup_tensor + ggml_backend_alloc_ctx_tensors` and would need a
+separate adaption pass plus new locked MD5 baselines.
+
+#### 1. `patches/ggml-vulkan-pipeline-cache.patch` — persistent `VkPipelineCache` (199 lines)
+
+Adds an opt-in persistent shader cache to ggml-vulkan, keyed by
+`<vendorID>-<deviceID>-<driverVersion>` and rooted at
+`$GGML_VK_PIPELINE_CACHE_DIR` →
+`$XDG_CACHE_HOME/ggml/vulkan` → `$HOME/.cache/ggml/vulkan`.
+Disabled by setting the env var to the empty string (byte-identical
+to upstream).  Recovers ~91 % of the cold→warm gap on the first warm
+run.
+
+```text
+fresh-process wall, RTX 5090 + NVIDIA 590.48 + Vulkan 1.4.325:
+  both caches cold (fresh machine / Mesa)  : ~2 690 ms
+  ggml cache warm, NVIDIA cache cold       :  ~250 ms     ← round-1 alone
+  both caches warm (steady state)          :  ~225 ms
+```
+
+The headline mobile / Mesa win — there's no per-driver shader cache
+to fall back on outside of NVIDIA's binary-blob path.
+
+#### 2. `patches/ggml-vulkan-eager-cache-save.patch` — crash-safe pipeline-cache flush (104 lines)
+
+Stacks on the first patch.  Writes back the pipeline-cache blob
+after every `compiles.wait()` batch in `ggml_vk_load_shaders`, with
+a `pipeline_cache_last_size` guard so warm-cache hits skip the disk
+write (caught a +90 ms regression during dev).  Crash-safety only;
+perf-neutral on warm runs.
+
+#### 3. Persistent CFM estimator graph cache (`g_cfm_estimator_cache`)
+
+`cfm_estimator_cache` was the last graph-builder still local-scope
+in `s3gen_synthesize_to_wav` — every synth call paid the full
+~50 ms graph rebuild cost (256 MB buf alloc + ~5500-node CFM
+graph build + `ggml_gallocr_reserve`).  Refactored to follow the
+same explicit-`destroy()` global-lifetime pattern as the existing
+`thread_local time_mlp_cache` / `g_encoder_cache` / per-stage
+caches.
+
+Both batch=1 (Turbo / meanflow) and batch=2 (multilingual CFG)
+paths reuse the same cache; the `cache.b2` flag triggers a rebuild
+when the mode changes.  Cache cleared in `s3gen_model_cache_release`
+**before** the backend is freed (Vulkan / Metal device-teardown
+ordering matters), and in `s3gen_model_cache_get` cache-miss
+(backend swap).
+
+```text
+per-step verbose verification, 5 utterances × 16 chunks (Turbo, RTX 5090):
+  chunk 1 (cold): cfm_step0 = 64 ms, cfm_step1 = 15 ms,  cfm_total = 80 ms
+  chunks 2..16  : cfm_step0 = 15 ms, cfm_step1 = 15 ms,  cfm_total = 30 ms
+```
+
+Also eliminates a latent process-exit crash risk: the previous
+`~cfm_estimator_cache()` destructor fired *after* the Vulkan dylib's
+static destructor (residency-set non-empty assert pattern).  The
+new explicit `destroy()` runs *before* the backend is freed.
+
+#### 4. Time-embedding result memoisation (`g_time_mlp_results`, `g_time_emb_results`)
+
+Both Turbo (`t_span = [0, 0.5, 1]`) and multilingual (cosine-
+scheduled, default 10 steps) emit the same set of t-values across
+all subsequent synth calls.  Each tiny graph (3 dispatches,
+~18 µs GPU compute) pays ~700 µs of fixed cmd-buffer + submit +
+sync + `tensor_get` overhead — per-graph fixed cost is **30× actual
+compute**.
+
+Two-layer cache:
+- `g_time_mlp_results` — keyed by `uint32_t` bitcast of `t_val`
+- `g_time_emb_results` — keyed by `uint64_t = (kt << 32) | kr`
+  (Turbo only; multilingual skips the mixer)
+
+`compute_time_mlp_cached` + `compute_time_emb_cached` wrappers at
+the synthesize call site collapse the 3-line `t_mlp / r_mlp /
+t_mixed` sequence to one line.  6 graph submissions / inference →
+0 after first inference for Turbo; 9–19 → 0 for the multilingual
+10-step schedule.  Caches cleared in `s3gen_model_cache_release`
+alongside the graph caches.
+
+#### 5. CPU mirror cache for large per-synth weight downloads (`g_weight_cpu_mirror`)
+
+`s3gen_synthesize_to_wav` reads three large model tensors via
+`ggml_backend_tensor_get` on every call:
+
+| Tensor                          | Turbo size | Multilingual size |
+|---------------------------------|-----------:|------------------:|
+| `flow/input_embedding`          | 13.4 MB    | ~28 MB            |
+| `flow/spk_embed_affine/w`       | 60 KB      | 60 KB             |
+| `flow/spk_embed_affine/b`       | 320 B      | 320 B             |
+
+On a GPU backend each is a real device→host transfer plus sync.
+~600–1000 µs per call for `input_embedding` alone on RTX 5090.
+These weights are **constant for the model lifetime** — cache them.
+
+New `cached_cpu_weights_f32(t)` helper + `g_weight_cpu_mirror` map
+(keyed by `ggml_tensor *`).  Cleared in `s3gen_model_cache_release`
+and on `s3gen_model_cache_get` cache-miss because the tensor
+pointers belong to the soon-to-be-freed model context.
+
+The multilingual variant benefits *more* than Turbo here because
+the larger `input_embedding` (~28 MB vs 13.4 MB) doubles the
+per-call download cost saved.
+
+#### 6. Three HiFT `ggml_cont` sites removed (perf-neutral, code quality)
+
+Round-AUDIT (in the qvac monorepo's `FINDINGS_ROUND_AUDIT.md`)
+listed these as deferred; same methodology applied here:
+
+| Site                                | Calls / inf | Direct consumer                              |
+|-------------------------------------|------------:|----------------------------------------------|
+| `conv_transpose_1d_f32` exit cont   | 3           | `ggml_add(x, reshape_2d(bias))` strided OK   |
+| ISTFT `y_trim` exit cont            | 1           | `ggml_clamp` element-wise → fresh contig     |
+| `f0_predictor` `xp` permute cont    | 1           | `ggml_mul_mat` `src1` (Vulkan f32 strided OK)|
+
+At ~3 µs per cont dispatch this is ~15 µs / inference theoretical;
+below the noise floor by design.  Same code-quality + future-
+proofing rationale as upstream §3.14 / §3.15.  CONT total in HiFT
+is only ~0.13 % of HiFT runtime per the perf logger, so further
+chatterbox-side cont reduction is perf-irrelevant.
+
+Three additional cont sites investigated but **kept** with inline
+comments explaining the failure mode for future investigators:
+`layer_norm_on_channel` exit (downstream `im2col`/`concat` needs
+contig src), and STFT `mag_log` / `ph_in` exits (single-shot
+bit-exact passes but multi-synth identical-chunks PCM diverges from
+locked baseline — gallocator non-zero-offset view sensitivity).
+
+#### 7. G2 dump-script gap closure — `regress-tensor-compare.sh` end-to-end
+
+`regress-tensor-compare.sh` (in the qvac monorepo's
+`inputFilesForAI/qvac-17872-findings/bench-logs-vk-c1/`) was
+previously aborting at stage G2 with `cannot open cfm_concat.npy`.
+Four files added to `scripts/dump-s3gen-reference.py`:
+
+- `cfm_concat.npy` (stage G2): replicates the
+  `pack([x, mu, spks_bc, cond])` logic from
+  `ConditionalDecoder.forward` directly in
+  `estimator_forward_capture` (first-call only).
+- `cfm_h_conv.npy` (stage G2): output of `block1.block[0]`
+  (`CausalConv1d`).  New `make_first_call_hook` helper.
+- `cfm_h_ln.npy` (stage G2): output of `block1.block[3]`
+  (Transpose back to `(B, C, T)` after LayerNorm).
+- `hift_s_stft.npy` (stages H3 + H4): output of `hift._stft`
+  followed by `cat([real, imag], dim=1)`.  Monkeypatched
+  `hift._stft`, restored in `finally`.
+
+Plus a one-line C++ fix in `src/test_s3gen.cpp`'s `stage_G2`: add
+`ggml_set_output(xc)` so the gallocator preserves the diagnostic
+intermediate (was returning garbage because `xc`'s slot was reused
+by downstream intermediates after the conv1d consumer completed).
+
+Full pipeline now runs end-to-end through G2 / G3 / G4 / H1 / H3 /
+H4 / H5; max relative error 7.92e-3 on STFT (PyTorch FFT vs
+hand-built DFT, expected, not a regression), max ≤ 4.7e-5
+everywhere else; final waveform `max_abs = 8.20e-08`.
+
+#### Negative result documented (inline comment in `synthesize`)
+
+Tried adding pointer-equality skip-upload of `mu` / `spks` / `cond`
+across `cfm_steps` within one `synthesize` call.  F32 single-shot
+WAV diverged immediately (got `c63c19...`, expected `454b4cc1...`).
+Root cause: ggml's gallocator **reuses** input-tensor buffer slots
+once their consumers complete.  In CFM:
+
+```cpp
+xc = ggml_concat(x_in, mu_in, spks_bc, cond_in);
+// ^ last use of mu / spks / cond — their slots are now free for
+//   the gallocator to reuse for downstream intermediates.
+```
+
+Skip-upload only works for inputs referenced **throughout** the
+graph (encoder `pos_emb` works, CFM `mu / spks / cond` doesn't).
+General rule for ggml's gallocator, kept as a comment in
+`synthesize()` and documented in
+`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_HIFT.md` §2-bis.4.
+
+#### Performance — RTX 5090, regress-tight aggregate, n=75 chunks, Turbo
+
+The May 4 port was measured on Turbo because the multilingual GGUF
+was not available locally at the time.  After §3.34 (the QVAC-18422
+companion PR) ships the converted-from-source
+`chatterbox-s3gen-mtl-q4_0.gguf`, multilingual measurement is a
+follow-up.
+
+```text
+metric        | upstream/multilingual_merged |  + this §3.32  |          Δ
+S3GEN_INFER   |                      76.6 ms |       65.4 ms  | -11.2 ms (-14.6 %)
+cfm_total     |                      40.3 ms |       28.7 ms  | -11.6 ms (-28.8 %)
+encoder       |                      19.9 ms |       20.7 ms  | noise
+hift_decode   |                      10.9 ms |       11.6 ms  | noise
+```
+
+`cfm_total` ranges fully separated on n=120 samples
+(base `[38.3, 42.8]` vs final `[27.1, 30.1]`).  Smaller absolute
+saving than on the original `upstream/main` base (where the same
+work measured −45 ms / −41 % S3GEN_INFER) because
+`multilingual_merged` already contains the
+zero-cont strided Q/K/V views, the reduced 256 MB → 64 MB CFM buf,
+the `thread_local time_mlp_cache`, and the dropped redundant
+`gallocr_reserve` in HiFT/`time_mlp` — all of which originally
+contributed to the larger headline number on the main base.
+
+#### Bit-exactness
+
+| Backend                | F32 single-shot | F32 multi-synth identical | F32 multi-synth varied |
+|------------------------|:---------------:|:-------------------------:|:----------------------:|
+| RTX 5090 + 590.48      |       ✓         |             ✓             |           ✓            |
+| AMD iGPU (RADV, Mesa)  |       ✓         |             ✓             |           ✓            |
+
+F16 invariants are not in this commit (C1 deferred).
+
+#### Why this is model-agnostic by construction
+
+All four host-side optimisations target generic per-synth
+infrastructure that is shared between Turbo and multilingual:
+
+1. **CFM estimator cache** — the `cache.b2` flag handles the
+   Turbo (batch=1, meanflow) ↔ multilingual (batch=2, CFG) mode
+   switch transparently.  Same struct, same teardown.
+2. **t-emb caching** — multilingual's default `n_timesteps = 10`
+   means **more** distinct t-values per inference (10 vs Turbo's
+   2–3), so the cache hit-count ratio improves linearly with steps.
+3. **CPU weight mirror** — `flow/input_embedding` is **larger**
+   on multilingual (vocab=13632 vs Turbo's 6561), so the saved
+   per-call download is roughly twice as large.
+4. **HiFT cont removals** — HiFT decoder code path is identical
+   for both variants.
+
+#### Files touched
+
+| File                                       |          Change |
+|--------------------------------------------|----------------:|
+| `patches/ggml-vulkan-pipeline-cache.patch` |       new (199) |
+| `patches/ggml-vulkan-eager-cache-save.patch` |     new (104) |
+| `patches/README.md`                        |       +13 / -8  |
+| `scripts/setup-ggml.sh`                    |       +20 / -8  |
+| `scripts/dump-s3gen-reference.py`          |             +65 |
+| `src/chatterbox_tts.cpp`                   |     +252 / -19  |
+| `src/test_s3gen.cpp`                       |              +6 |
+| **Total**                                  | **+593 / -22**  |
+
+All `inputFilesForAI/qvac-17872-findings/FINDINGS_*.md` and
+`PR_DESCRIPTION_*.md` companion docs stay in the qvac monorepo
+(out-of-tree) — same arrangement as the QVAC-18422 work.
+
+#### Next
+
+- **Multilingual GGUF cross-validation**: re-run the regress harness
+  against `chatterbox-s3gen-mtl-q4_0.gguf` (converted from the
+  HuggingFace public `ResembleAI/chatterbox` repo per the §3.34
+  converter) once that GGUF is available on the Vulkan host.  By
+  construction every cache should hit ≥ as often as on Turbo;
+  measurable wins should be ≥ those reported here.
+- **C1 port to `multilingual_merged`** (F16 CFM matmul weights,
+  opt-in `CHATTERBOX_F16_CFM`): needs ~100 lines adapting our F32→F16
+  conversion path to `multilingual_merged`'s
+  `ggml_dup_tensor + ggml_backend_alloc_ctx_tensors` `load_s3gen_gguf`
+  layout, plus new locked MD5 baselines (NVIDIA + AMD, F32 + F16).
+- **HiFT graph caching on `multilingual_merged`**: that branch's
+  `run_hift_decode` allocates `ggml_gallocr_t + ggml_context *` fresh
+  on every call (no `g_hift_cache` equivalent) — same persistent-
+  cache pattern would save another ~5–10 ms / chunk on multilingual.
+- **Round-4 / 6 QKV fusion composition with multilingual_merged's
+  strided 3D views** — our batched `mul_mat` (originally landed on
+  `main`) and their zero-cont strided views (`849507a`) are
+  alternative optimisations targeting the same code; pick one
+  approach and bench Vulkan `flash_attn_ext` stride tolerance.
+- **Mobile validation** (Adreno / Mali / Apple):
+  hardware-bound; biggest remaining evidence gap.  AMD/RADV proxy
+  refuted the original mobile-bandwidth projection on the
+  per-round work; real mobile runs would either confirm the
+  ship-on-merit framing or force its revision.
+
 ---
 
 ## OpenCL / Adreno bring-up (April 2026)
