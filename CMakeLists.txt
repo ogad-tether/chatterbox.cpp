@@ -305,10 +305,6 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_link_libraries(tts-cli PRIVATE tts-cpp)
     tts_cpp_apply_ccache(tts-cli)
 
-    add_executable(chatterbox src/cli_main.cpp)
-    target_link_libraries(chatterbox PRIVATE tts-cpp)
-    tts_cpp_apply_ccache(chatterbox)
-
     add_executable(mel2wav src/mel2wav.cpp)
     target_link_libraries(mel2wav PRIVATE ggml)
     target_include_directories(mel2wav PRIVATE ggml/include src)

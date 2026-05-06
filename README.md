@@ -369,7 +369,7 @@ override with `-D<flag>=...` at configure time):
 |------|---------|---------|
 | `TTS_CPP_BUILD_LIBRARY` | `ON` | Build the `tts-cpp` library target itself (linkage controlled by `TTS_CPP_BUILD_SHARED`, not `BUILD_SHARED_LIBS` — see below) |
 | `TTS_CPP_BUILD_SHARED` | `OFF` | Build `tts-cpp` as `SHARED` instead of `STATIC`. Decoupled from `BUILD_SHARED_LIBS` because ggml's own CMake declares its own `option(BUILD_SHARED_LIBS)` defaulting to `ON` on Windows non-MinGW; using a project-namespaced option keeps the two independent. The supertonic test/bench harnesses link against `tts-cpp` directly and use detail-namespaced symbols outside the `TTS_CPP_API` public surface, so `SHARED` builds hide them and disable those targets — leave OFF for development, flip ON only for downstream packaging where the test harnesses aren't built |
-| `TTS_CPP_BUILD_EXECUTABLES` | `ON` standalone / `OFF` subdir | `tts-cli` (binary `tts-cli` + back-compat alias `chatterbox`), `mel2wav`, `supertonic-cli`, `supertonic-bench` |
+| `TTS_CPP_BUILD_EXECUTABLES` | `ON` standalone / `OFF` subdir | `tts-cli`, `mel2wav`, `supertonic-cli`, `supertonic-bench` |
 | `TTS_CPP_BUILD_TESTS` | `ON` standalone / `OFF` subdir | `test-*` parity / unit harnesses, registered with CTest (label-filterable via `ctest -L unit` / `ctest -L fixture` / `ctest -L gpu`) |
 | `TTS_CPP_INSTALL` | `ON` | Generate `install` rules + the `tts-cpp` CMake package config so consumers can `find_package(tts-cpp CONFIG REQUIRED)` |
 | `TTS_CPP_USE_SYSTEM_GGML` | `OFF` | Replace the bundled `add_subdirectory(ggml)` with `find_package(ggml CONFIG REQUIRED)` — the path consumers in the qvac speech stack take to pull ggml from the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech) port instead of the local `./ggml/` clone. See [**Alternative: consume ggml from vcpkg**](#alternative-consume-ggml-from-vcpkg-tts_cpp_use_system_ggml) below |
@@ -390,13 +390,12 @@ auto-marked `DISABLED` (they still appear in `ctest -N` output but
 return `Not Run` instead of failing), so a fresh checkout still gives
 a green `ctest` run on the harnesses whose fixtures it does have.
 
-This produces the end-to-end binary, a back-compat alias of the same
-code, and a set of per-stage validation harnesses:
+This produces the end-to-end binary plus a set of per-stage validation
+harnesses:
 
 | Binary | What it does |
 |--------|--------------|
 | `build/tts-cli`            | End-to-end Chatterbox text → speech tokens (T3) → wav (S3Gen + HiFT), plus Supertonic text → wav. Handles Chatterbox voice cloning via `--reference-audio`, autodetects Chatterbox Turbo/Multilingual from `chatterbox.variant`, and autodetects Supertonic from `supertonic.arch`. |
-| `build/chatterbox`         | Identical second binary kept for backward compatibility with pre-rename scripts; same source as `tts-cli`. |
 | `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
 | `build/supertonic-cli`        | Supertonic-only end-to-end CLI (text → wav) — the same engine `tts-cli` invokes when it sees a Supertonic GGUF, exposed standalone for scripting and parity work |
 | `build/supertonic-bench`      | Per-stage Supertonic benchmark harness (`--text` / `--out` / `--runs`); machine-readable RTF + per-stage timings |
