@@ -14,6 +14,7 @@
 
 #include "gpt2_bpe.h"
 #include "mtl_tokenizer.h"
+#include "tts-cpp/log.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
@@ -851,9 +852,14 @@ int tts_cpp_cli_main(int argc, char ** argv) {
     }
 
     // Apply the log filter BEFORE any ggml_backend_*_init() runs, otherwise
-    // Metal / Vulkan device-init messages leak out.
+    // Metal / Vulkan device-init messages leak out.  The CLI installs
+    // chatterbox_log_cb via the public tts_cpp_log_set hook so that
+    // (a) the same path a downstream consumer would take is exercised
+    // here, and (b) the verbose-or-error gating in chatterbox_log_cb
+    // continues to apply without the Engine ctor having to clobber the
+    // process-global sink for everyone.
     g_log_verbose = params.verbose ? 1 : 0;
-    ggml_log_set(chatterbox_log_cb, nullptr);
+    tts_cpp_log_set(chatterbox_log_cb, nullptr);
 
     try {
         const cli_model_family family = file_exists(params.model)

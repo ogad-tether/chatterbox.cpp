@@ -79,7 +79,12 @@ struct Engine::Impl {
 
         ggml_time_init();
         g_log_verbose = opts.verbose ? 1 : 0;
-        ggml_log_set(chatterbox_log_cb, nullptr);
+        // Note: we deliberately do NOT call ggml_log_set here.  The
+        // process-global sink is owned by the host application via
+        // tts_cpp_log_set (see <tts-cpp/log.h>); installing one
+        // unconditionally per Engine ctor would clobber whatever
+        // structured-logging callback the host (Bare addon, telemetry
+        // pipeline, ...) already registered for the process.
 
         if (!opts.reference_audio.empty() &&
             !validate_reference_audio(opts.reference_audio)) {
