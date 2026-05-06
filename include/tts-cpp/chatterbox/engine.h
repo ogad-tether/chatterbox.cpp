@@ -38,6 +38,8 @@
 // Implemented in src/chatterbox_engine.cpp on top of the library-internal
 // helpers in src/chatterbox_t3_internal.h.
 
+#include "tts-cpp/export.h"
+
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -155,7 +157,7 @@ struct SynthesisResult {
     int    audio_samples = 0;
 };
 
-class Engine {
+class TTS_CPP_API Engine {
 public:
     // Loads T3, kicks off the S3Gen preload, bakes voice conditioning if
     // reference_audio / voice_dir is set.  Throws std::runtime_error on

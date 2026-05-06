@@ -72,6 +72,17 @@ if (WIN32 AND NOT MINGW)
     endif()
 endif()
 
+# Snapshot the user's BUILD_SHARED_LIBS intent BEFORE add_subdirectory(ggml).
+# ggml's own CMake declares its own option(BUILD_SHARED_LIBS ...) with
+# Windows-non-MinGW default = ON, so any later `if (DEFINED BUILD_SHARED_LIBS)`
+# check sees the variable as defined regardless of what the user passed.
+# We capture the user's explicit pre-ggml setting here and use that to drive
+# the tts-cpp library linkage default.
+set(_tts_cpp_user_set_shared FALSE)
+if (DEFINED BUILD_SHARED_LIBS OR DEFINED CACHE{BUILD_SHARED_LIBS})
+    set(_tts_cpp_user_set_shared TRUE)
+endif()
+
 if (NOT TARGET ggml)
     if (TTS_CPP_USE_SYSTEM_GGML)
         find_package(ggml CONFIG REQUIRED)
@@ -159,11 +170,28 @@ set(TTS_CPP_LIB_SOURCES
 )
 
 add_library(mtl_tokenizer STATIC src/mtl_tokenizer.cpp)
-target_include_directories(mtl_tokenizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# $<BUILD_INTERFACE:...> so the source-tree path stays out of any
+# INTERFACE_INCLUDE_DIRECTORIES that would otherwise leak into the
+# install(EXPORT) and trip CMake's source-prefix check.
+target_include_directories(mtl_tokenizer PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 set_target_properties(mtl_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if (TTS_CPP_BUILD_LIBRARY)
-    add_library(tts-cpp STATIC ${TTS_CPP_LIB_SOURCES})
+    # Honour BUILD_SHARED_LIBS only when the *user* set it; otherwise
+    # default to STATIC even though ggml's own CMake declares an
+    # option(BUILD_SHARED_LIBS ...) that flips the variable to ON on
+    # Windows non-MinGW.  Static is the right default here because the
+    # supertonic test harnesses link against tts-cpp directly and use
+    # detail-namespaced symbols (declared in src/supertonic_internal.h)
+    # that aren't part of the TTS_CPP_API public surface; a SHARED
+    # library would hide them and the tests would fail to link.
+    # Consumers that want a SHARED tts-cpp pass -DBUILD_SHARED_LIBS=ON
+    # explicitly and accept the export-surface restriction.
+    if (_tts_cpp_user_set_shared)
+        add_library(tts-cpp ${TTS_CPP_LIB_SOURCES})
+    else()
+        add_library(tts-cpp STATIC ${TTS_CPP_LIB_SOURCES})
+    endif()
     add_library(tts-cpp::tts-cpp ALIAS tts-cpp)
 
     target_include_directories(tts-cpp
@@ -178,6 +206,18 @@ if (TTS_CPP_BUILD_LIBRARY)
     target_compile_features(tts-cpp PUBLIC cxx_std_17)
     target_link_libraries(tts-cpp PUBLIC ggml)
     target_link_libraries(tts-cpp PRIVATE mtl_tokenizer)
+
+    # Symbol-export contract for shared builds.  Standard llama-style
+    # PAIR: PUBLIC define so consumers see the import side of TTS_CPP_API
+    # (declspec(dllimport) on Windows / visibility("default") elsewhere),
+    # PRIVATE define inside the library's TUs to flip Windows from
+    # dllimport to dllexport.  Both no-ops in static builds (the
+    # default), so static consumers see exactly the same surface.
+    get_target_property(_tts_cpp_type tts-cpp TYPE)
+    if (_tts_cpp_type STREQUAL "SHARED_LIBRARY")
+        target_compile_definitions(tts-cpp PUBLIC  TTS_CPP_SHARED)
+        target_compile_definitions(tts-cpp PRIVATE TTS_CPP_BUILD)
+    endif()
 
     if (OpenMP_CXX_FOUND)
         target_link_libraries(tts-cpp PRIVATE OpenMP::OpenMP_CXX)
@@ -380,58 +420,91 @@ else()
 endif()
 
 if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
-    if (TTS_CPP_USE_SYSTEM_GGML)
-        # Full install(EXPORT) flow.  Only reachable when `ggml` is an
-        # imported target from `find_package(ggml CONFIG REQUIRED)` — the
-        # standalone `add_subdirectory(ggml)` path would fail
-        # install(EXPORT) because its ggml target isn't in an export set.
-        include(CMakePackageConfigHelpers)
+    include(CMakePackageConfigHelpers)
 
-        install(TARGETS tts-cpp
-            EXPORT tts-cppTargets
-            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-            INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-        )
-        install(DIRECTORY include/tts-cpp
-            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-            FILES_MATCHING PATTERN "*.h"
-        )
-        install(EXPORT tts-cppTargets
-            FILE tts-cppTargets.cmake
-            NAMESPACE tts-cpp::
-            DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
-        )
-        configure_package_config_file(
-            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tts-cppConfig.cmake.in
-            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfig.cmake
-            INSTALL_DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
-        )
-        write_basic_package_version_file(
-            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfigVersion.cmake
-            VERSION ${PROJECT_VERSION}
-            COMPATIBILITY SameMinorVersion
-        )
-        install(FILES
-            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfig.cmake
-            ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfigVersion.cmake
-            DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
-        )
-    else()
-        # Standalone build: install the archive + headers, but skip the
-        # Config.cmake / Targets.cmake export set since the in-tree
-        # `ggml` target can't be exported without also exporting its
-        # whole subdirectory.  Downstream library-first consumers build
-        # with TTS_CPP_USE_SYSTEM_GGML=ON and get the full Config.cmake.
-        install(TARGETS tts-cpp
+    # Re-install the bundled ggml targets into a `ggml-targets` export
+    # set so install(EXPORT tts-cppTargets) can resolve the
+    # `tts-cpp PUBLIC ggml` link as the namespaced `ggml::ggml`.  Without
+    # this, CMake refuses to generate tts-cppTargets.cmake because the
+    # in-tree `ggml` target is not part of any export set.  Replicates
+    # the standard install(TARGETS ggml ggml-base EXPORT ggml-targets)
+    # pattern that downstream ggml-based projects ship in their own
+    # CMake (e.g. llama.cpp); we add it here at the tts-cpp level
+    # because the upstream ggml at the pinned commit installs ggml
+    # without an EXPORT clause.  The bundled ggml's hand-written
+    # ggml-config.cmake (find_library + UNKNOWN IMPORTED) still ships
+    # and is what's loaded via find_dependency(ggml) — we don't replace
+    # it; the new ggml-targets.cmake just carries the export so
+    # CMake's cross-package reference check passes here.
+    if (NOT TTS_CPP_USE_SYSTEM_GGML)
+        set(_tts_cpp_ggml_export_targets ggml ggml-base)
+        if (DEFINED GGML_AVAILABLE_BACKENDS)
+            list(APPEND _tts_cpp_ggml_export_targets ${GGML_AVAILABLE_BACKENDS})
+        endif()
+        # No PUBLIC_HEADER DESTINATION here: the bundled ggml's own
+        # install(TARGETS ggml LIBRARY PUBLIC_HEADER) already copies the
+        # ggml/include/*.h headers into the install tree.  Duplicating
+        # the rule here re-resolves the same relative paths against the
+        # tts-cpp source dir and `cmake --install` fails with
+        # "file INSTALL cannot find <root>/include/ggml.h: File exists".
+        # Keep this rule minimal: EXPORT + library destinations only,
+        # so tts-cppTargets can resolve the namespaced ggml::ggml link
+        # without rebuilding the headers install.
+        install(TARGETS ${_tts_cpp_ggml_export_targets}
+            EXPORT ggml-targets
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         )
-        install(DIRECTORY include/tts-cpp
-            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-            FILES_MATCHING PATTERN "*.h"
+        install(EXPORT ggml-targets
+            FILE ggml-targets.cmake
+            NAMESPACE ggml::
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/ggml
         )
+        unset(_tts_cpp_ggml_export_targets)
     endif()
+
+    # Export the tts-cpp target via an install(EXPORT) set so the
+    # generated tts-cppTargets.cmake carries the correct shape for
+    # whatever linkage the build produced (STATIC vs SHARED, with
+    # IMPORTED_IMPLIB on Windows shared builds, etc.).
+    #
+    # mtl_tokenizer is a private STATIC dep of tts-cpp; for static
+    # archives, the PRIVATE link bleeds into the export interface
+    # (static archives don't carry transitive PRIVATE deps the way
+    # shared libs do), so the exporter would otherwise refuse with
+    # "requires target mtl_tokenizer that is not in any export set".
+    # Add it to the same export so consumers get a self-contained set.
+    install(TARGETS tts-cpp mtl_tokenizer
+        EXPORT tts-cppTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+    install(DIRECTORY include/tts-cpp
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h"
+    )
+    install(EXPORT tts-cppTargets
+        FILE tts-cppTargets.cmake
+        NAMESPACE tts-cpp::
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+    )
+
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tts-cppConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfig.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+    )
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion
+    )
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/tts-cppConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
+    )
 endif()

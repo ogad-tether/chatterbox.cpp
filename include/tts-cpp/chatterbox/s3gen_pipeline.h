@@ -6,6 +6,8 @@
 //
 // Implementation in src/chatterbox_tts.cpp.
 
+#include "tts-cpp/export.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -164,7 +166,7 @@ struct s3gen_synthesize_opts {
 
 // Runs encoder + CFM + HiFT on the given T3 speech tokens and writes a WAV.
 // Returns 0 on success, non-zero on error.
-int s3gen_synthesize_to_wav(
+TTS_CPP_API int s3gen_synthesize_to_wav(
     const std::vector<int32_t> & speech_tokens,
     const s3gen_synthesize_opts & opts);
 
@@ -174,7 +176,7 @@ int s3gen_synthesize_to_wav(
 // after the T3 GGUF load) while T3 is still inferring, then the first
 // streamed chunk is available as soon as T3 emits its first N tokens.
 // Returns 0 on success.
-int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers);
+TTS_CPP_API int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers);
 
 // Release the internal S3Gen cache (weights + backend + allocator).  Long-
 // running processes that cycle through models, as well as wrappers that
@@ -184,4 +186,4 @@ int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers);
 // via static destructors, after which the ggml-metal global device may
 // have already been finalised — tripping its resource-leak assertion.
 // Idempotent; safe to call when the cache is empty.
-void s3gen_unload();
+TTS_CPP_API void s3gen_unload();

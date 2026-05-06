@@ -20,11 +20,13 @@
 //   2. Lower-level per-engine APIs, e.g. the Chatterbox S3Gen + HiFT
 //      back-half in <tts-cpp/chatterbox/s3gen_pipeline.h>.
 
+#include "tts-cpp/export.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int tts_cpp_cli_main(int argc, char ** argv);
+TTS_CPP_API int tts_cpp_cli_main(int argc, char ** argv);
 
 #ifdef __cplusplus
 }

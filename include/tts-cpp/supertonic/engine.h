@@ -1,5 +1,7 @@
 #pragma once
 
+#include "tts-cpp/export.h"
+
 #include <string>
 #include <vector>
 
@@ -29,6 +31,6 @@ struct SynthesisResult {
     float duration_s = 0.0f;
 };
 
-SynthesisResult synthesize(const EngineOptions & opts, const std::string & text);
+TTS_CPP_API SynthesisResult synthesize(const EngineOptions & opts, const std::string & text);
 
 } // namespace tts_cpp::supertonic
