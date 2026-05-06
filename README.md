@@ -81,6 +81,71 @@ quantisation pass that ships in this repo (§3.20)).
 
 ---
 
+## API overview
+
+The two high-level entry points exported through the `TTS_CPP_API`
+public surface (defined in
+[`include/tts-cpp/export.h`](include/tts-cpp/export.h)):
+
+| Surface | Role |
+|---------|------|
+| `tts_cpp::chatterbox::Engine::synthesize` | One-shot text → 24 kHz PCM for the Chatterbox pipeline (T3 + S3Gen + HiFT). Loads the T3 + S3Gen GGUFs once at construction, optionally bakes a voice-cloning profile from a reference wav, and reuses everything across calls. Header: [`<tts-cpp/chatterbox/engine.h>`](include/tts-cpp/chatterbox/engine.h). Variant (Turbo / Multilingual) is autodetected from `chatterbox.variant` GGUF metadata. |
+| `tts_cpp::supertonic::synthesize` | One-shot text → 44.1 kHz PCM for the Supertonic CPU TTS family. Header: [`<tts-cpp/supertonic/engine.h>`](include/tts-cpp/supertonic/engine.h). |
+
+Lower-level helpers also exposed via `TTS_CPP_API`, useful when
+embedding into a host that already manages model lifetime:
+**`s3gen_synthesize_to_wav`** (file-output S3Gen path,
+[`<tts-cpp/chatterbox/s3gen_pipeline.h>`](include/tts-cpp/chatterbox/s3gen_pipeline.h)),
+**`s3gen_preload`** / **`s3gen_unload`** (host-side weight pre-staging
++ explicit teardown — required for long-running processes that cycle
+through models or that need deterministic teardown before destroying
+their own ggml backend), and **`tts_cpp_cli_main`** (the same
+entry point used by the `tts-cli` / `chatterbox` binaries — useful for
+embedding the end-to-end CLI into a downstream binary without forking
+[`src/cli_main.cpp`](src/cli_main.cpp)).  Anything outside the
+`TTS_CPP_API`-annotated surface (in particular the
+`tts_cpp::supertonic::detail::*` and `tts_cpp::chatterbox::*_internal`
+helpers reachable from the supertonic / chatterbox test harnesses) is
+**not** part of the public API and is hidden from `SHARED` builds.
+
+### Consumer integration
+
+Downstream projects in the QVAC speech stack consume `tts-cpp`
+through the
+[`qvac-ext-lib-whisper.cpp`](https://github.com/tetherto/qvac-ext-lib-whisper.cpp)
+wrapper port, which pulls ggml from the
+[`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
+branch directly (Metal / OpenCL / Vulkan patches included).  The
+integrated port does **not** ship `scripts/setup-ggml.sh` or
+`patches/` — those are standalone-development tools maintained in
+this repo only.  Once the wrapper has installed the `ggml-speech` and
+`tts-cpp` ports through vcpkg, integration on the consumer side is
+one `find_package` call:
+
+```cmake
+find_package(tts-cpp CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE tts-cpp::tts-cpp)
+```
+
+```cpp
+#include <tts-cpp/chatterbox/engine.h>
+
+tts_cpp::chatterbox::EngineOptions opts;
+opts.t3_gguf_path    = "models/chatterbox-t3-turbo.gguf";
+opts.s3gen_gguf_path = "models/chatterbox-s3gen.gguf";
+opts.n_gpu_layers    = 99;
+tts_cpp::chatterbox::Engine engine(opts);
+auto result = engine.synthesize("Hello, world.");
+// result.pcm is 24 kHz mono float32 PCM ready to be written as wav.
+```
+
+The supertonic test/bench harnesses link against `tts-cpp` directly
+and use detail-namespaced symbols outside the `TTS_CPP_API` public
+surface, so the integrated port keeps the default
+`TTS_CPP_BUILD_SHARED=OFF` and `TTS_CPP_BUILD_TESTS=OFF`.  See
+[**Useful CMake options**](#useful-cmake-options) below for the full
+flag table.
+
 ## Pipeline at a glance
 
 ```
@@ -277,9 +342,18 @@ commit pinned in `GGML_COMMIT`, and applies
 [`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch)
 then
 [`patches/ggml-opencl-chatterbox-ops.patch`](patches/ggml-opencl-chatterbox-ops.patch).
-Re-running is safe: any local edits under `./ggml` are discarded.  Bump
-`GGML_COMMIT` and regenerate the patches when moving to a newer upstream
-ggml.
+Re-running is idempotent and **destructive**: any local edits under
+`./ggml` are reset to the pinned commit before patches are reapplied,
+so use a separate clone if you're hacking on ggml itself.  Bump
+`GGML_COMMIT` and regenerate the patches when moving to a newer
+upstream ggml.
+
+`scripts/setup-ggml.sh` and the `patches/` directory are
+**standalone-development tools**.  The qvac speech-stack
+integrated port consumes ggml from the
+[`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
+branch directly and does not carry these files — see
+[**Consumer integration**](#consumer-integration) above.
 
 To enable GPU acceleration, add the matching backend flag at configure
 time: `-DGGML_METAL=ON` on Apple Silicon, `-DGGML_VULKAN=ON` on
@@ -289,6 +363,36 @@ Linux/Windows with a Vulkan loader, `-DGGML_OPENCL=ON` for OpenCL
 runtime to actually use the GPU. See `patches/README.md` for what the
 patches do and why.
 
+### Useful CMake options
+
+Project-namespaced flags (all default to a sensible standalone build;
+override with `-D<flag>=...` at configure time):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `TTS_CPP_BUILD_LIBRARY` | `ON` | Build the `tts-cpp` library target itself (linkage controlled by `TTS_CPP_BUILD_SHARED`, not `BUILD_SHARED_LIBS` — see below) |
+| `TTS_CPP_BUILD_SHARED` | `OFF` | Build `tts-cpp` as `SHARED` instead of `STATIC`. Decoupled from `BUILD_SHARED_LIBS` because ggml's own CMake declares its own `option(BUILD_SHARED_LIBS)` defaulting to `ON` on Windows non-MinGW; using a project-namespaced option keeps the two independent. The supertonic test/bench harnesses link against `tts-cpp` directly and use detail-namespaced symbols outside the `TTS_CPP_API` public surface, so `SHARED` builds hide them and disable those targets — leave OFF for development, flip ON only for downstream packaging where the test harnesses aren't built |
+| `TTS_CPP_BUILD_EXECUTABLES` | `ON` standalone / `OFF` subdir | `tts-cli` (binary `tts-cli` + back-compat alias `chatterbox`), `mel2wav`, `supertonic-cli`, `supertonic-bench` |
+| `TTS_CPP_BUILD_TESTS` | `ON` standalone / `OFF` subdir | `test-*` parity / unit harnesses, registered with CTest (label-filterable via `ctest -L unit` / `ctest -L fixture` / `ctest -L gpu`) |
+| `TTS_CPP_INSTALL` | `ON` | Generate `install` rules + the `tts-cpp` CMake package config so consumers can `find_package(tts-cpp CONFIG REQUIRED)` |
+| `TTS_CPP_USE_SYSTEM_GGML` | `OFF` | Replace the bundled `add_subdirectory(ggml)` with `find_package(ggml CONFIG REQUIRED)` — the path consumers in the qvac speech stack take to pull ggml from the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech) port instead of the local `./ggml/` clone. See [**Alternative: consume ggml from vcpkg**](#alternative-consume-ggml-from-vcpkg-tts_cpp_use_system_ggml) below |
+| `TTS_CPP_GGML_LIB_PREFIX` | `ON` | Rename bundled ggml libraries to `libtts-ggml-*` (filename only; CMake target names and C symbols are unchanged). Prevents shared-library filename collisions when several consumers that vendor different ggml versions are loaded into the same host process. The integrated qvac speech-stack port is expected to override this to `speech-` so all four speech libraries (whisper, parakeet, chatterbox, supertonic) share one ggml file set. No-op when `TTS_CPP_USE_SYSTEM_GGML=ON` |
+| `TTS_CPP_CCACHE` | `ON` | Use ccache as compiler launcher for `tts-cpp`'s own targets when `find_program(ccache)` succeeds. Scoped per target; ggml's independent `GGML_CCACHE` option handles the ggml subdirectory |
+
+When tests are enabled, the build also exposes three cache-overridable
+fixture roots that the registered ctest entries resolve against:
+
+| CACHE PATH | Default | Used by |
+|------------|---------|---------|
+| `TTS_CPP_TEST_MODEL_DIR` | `${CMAKE_CURRENT_SOURCE_DIR}/models`               | GGUF checkpoints (produced by `scripts/convert-*-to-gguf.py` or `bash scripts/setup-supertonic2.sh`) |
+| `TTS_CPP_TEST_AUDIO_DIR` | `${CMAKE_CURRENT_SOURCE_DIR}/test/reference-audio` | Reference WAV fixtures (e.g. `test/reference-audio/jfk.wav`) |
+| `TTS_CPP_TEST_REF_DIR`   | `${CMAKE_CURRENT_SOURCE_DIR}/artifacts`            | `.npy` reference dumps from `scripts/dump-{s3gen,supertonic,t3-mtl}-reference.py` |
+
+Tests whose required fixtures don't exist at configure time are
+auto-marked `DISABLED` (they still appear in `ctest -N` output but
+return `Not Run` instead of failing), so a fresh checkout still gives
+a green `ctest` run on the harnesses whose fixtures it does have.
+
 This produces the end-to-end binary, a back-compat alias of the same
 code, and a set of per-stage validation harnesses:
 
@@ -297,6 +401,8 @@ code, and a set of per-stage validation harnesses:
 | `build/tts-cli`            | End-to-end Chatterbox text → speech tokens (T3) → wav (S3Gen + HiFT), plus Supertonic text → wav. Handles Chatterbox voice cloning via `--reference-audio`, autodetects Chatterbox Turbo/Multilingual from `chatterbox.variant`, and autodetects Supertonic from `supertonic.arch`. |
 | `build/chatterbox`         | Identical second binary kept for backward compatibility with pre-rename scripts; same source as `tts-cli`. |
 | `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
+| `build/supertonic-cli`        | Supertonic-only end-to-end CLI (text → wav) — the same engine `tts-cli` invokes when it sees a Supertonic GGUF, exposed standalone for scripting and parity work |
+| `build/supertonic-bench`      | Per-stage Supertonic benchmark harness (`--text` / `--out` / `--runs`); machine-readable RTF + per-stage timings |
 | `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
 | `build/test-resample`         | Round-trip SNR of the C++ Kaiser-windowed sinc resampler |
 | `build/test-voice-features`   | 24 kHz 80-ch mel parity (prompt_feat) |
@@ -309,16 +415,26 @@ code, and a set of per-stage validation harnesses:
 | `build/test-mtl-tokenizer`    | Multilingual grapheme tokenizer parity vs the HF reference |
 | `build/test-t3-mtl`           | End-to-end MTL T3 (Llama-520M) forward-pass parity |
 | `build/test-t3-mtl-stages`    | Staged MTL T3 parity (cond/text/inputs/layers/head) |
+| `build/test-cpu-caches`       | CPU-side persistent-cache validation (time_mlp / time_emb / cfm_estimator / weight_mirror caches that amortise per-synth overhead on the multilingual CPU path); no-arg invocation runs the bit-cast cache-key + initial-state checks, GGUF arg runs the warm-cache + bit-exact pipeline check |
+| `build/test-t3-caches`        | T3 step-graph cache validation (no-arg = initial-state, GGUF arg = warm-cache + bit-exact end-to-end check) |
+| `build/test-supertonic-*`     | Per-stage Supertonic parity harnesses (`preprocess`, `vocoder` ± `trace` / `pointwise`, `duration` ± `trace`, `text-encoder` ± `trace`, `vector` ± `trace`, `pipeline`); each takes `MODEL.gguf REF_DIR` |
 | `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
 
 You'll normally only need `build/tts-cli`; the `test-*` binaries are
-there for the staged-verification methodology in `PROGRESS.md`.
+there for the staged-verification methodology in `PROGRESS.md`, and
+register with CTest so you can run `ctest -C Release -L unit` /
+`ctest -C Release -L fixture` from the build directory after fixtures
+are in place.
 
 ### Alternative: consume ggml from vcpkg (`TTS_CPP_USE_SYSTEM_GGML`)
 
-Downstream projects that already vendor ggml through vcpkg can skip
-`setup-ggml.sh` and instead point the build at a pre-installed ggml
-package:
+This is the build path the qvac speech-stack
+[**Consumer integration**](#consumer-integration) story takes —
+documented here in CMake-mechanic detail.  Downstream projects that
+already vendor ggml through vcpkg (for example the
+[`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
+port) can skip `setup-ggml.sh` and instead point the build at a
+pre-installed ggml package:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -330,9 +446,11 @@ When `TTS_CPP_USE_SYSTEM_GGML=ON`, the top-level `CMakeLists.txt`
 swaps `add_subdirectory(ggml)` for `find_package(ggml CONFIG REQUIRED)`
 and aliases the imported `ggml::ggml` target onto the plain `ggml` name
 that the rest of the build uses.  The local `./ggml/` tree is never
-read.  The imported package is expected to provide the same Metal
-patch carried under `patches/`.  This shape mirrors
-`stable-diffusion.cpp`'s `SD_USE_SYSTEM_GGML`.
+read.  The imported package is expected to provide the equivalent of
+the patches carried under `patches/` (the `qvac-ext-ggml/speech`
+branch ships them pre-applied so consumers don't have to maintain a
+patch trail).  This shape mirrors `stable-diffusion.cpp`'s
+`SD_USE_SYSTEM_GGML`.
 
 The default (`TTS_CPP_USE_SYSTEM_GGML=OFF`) preserves the standalone
 flow above untouched, so this is purely an opt-in escape hatch for
