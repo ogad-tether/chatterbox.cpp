@@ -1,8 +1,10 @@
+#define TTS_CPP_BUILD
 #include "tts-cpp/supertonic/engine.h"
 
 #include "supertonic_internal.h"
 #include "npy.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -107,28 +109,66 @@ private:
 
 } // namespace
 
-SynthesisResult synthesize(const EngineOptions & opts, const std::string & text) {
-    if (opts.model_gguf_path.empty()) throw std::runtime_error("Supertonic model_gguf_path is required");
-    if (text.empty()) throw std::runtime_error("Supertonic text is empty");
-    if (!std::filesystem::exists(opts.model_gguf_path)) {
-        throw std::runtime_error(supertonic_setup_hint(opts.model_gguf_path));
-    }
-
+struct Engine::Impl {
+    EngineOptions    opts;
     supertonic_model model;
-    if (!load_supertonic_gguf(opts.model_gguf_path, model, opts.n_gpu_layers, false)) {
-        throw std::runtime_error("failed to load Supertonic GGUF: " + opts.model_gguf_path);
-    }
-    supertonic_set_n_threads(model, opts.n_threads);
+    std::atomic<bool> cancel_flag{false};
 
-    try {
-        const std::string voice = opts.voice.empty() ? model.hparams.default_voice : opts.voice;
-        const int steps = opts.steps > 0 ? opts.steps : model.hparams.default_steps;
+    explicit Impl(const EngineOptions & o)
+        : opts(o) {
+        if (opts.model_gguf_path.empty()) {
+            throw std::runtime_error("Supertonic Engine: model_gguf_path is required");
+        }
+        if (!std::filesystem::exists(opts.model_gguf_path)) {
+            throw std::runtime_error(supertonic_setup_hint(opts.model_gguf_path));
+        }
+        if (!load_supertonic_gguf(opts.model_gguf_path, model, opts.n_gpu_layers, false)) {
+            throw std::runtime_error("Supertonic Engine: failed to load GGUF: " +
+                                     opts.model_gguf_path);
+        }
+        try {
+            supertonic_set_n_threads(model, opts.n_threads);
+
+            // Validate voice up front so we throw at construction
+            // rather than mid-synthesize().
+            const std::string voice = opts.voice.empty()
+                ? model.hparams.default_voice
+                : opts.voice;
+            if (model.voices.find(voice) == model.voices.end()) {
+                throw std::runtime_error("Supertonic Engine: unknown voice: " + voice);
+            }
+        } catch (...) {
+            free_supertonic_model(model);
+            throw;
+        }
+    }
+
+    ~Impl() {
+        free_supertonic_model(model);
+    }
+
+    Impl(const Impl &)             = delete;
+    Impl & operator=(const Impl &) = delete;
+
+    SynthesisResult synthesize(const std::string & text) {
+        if (text.empty()) {
+            throw std::runtime_error("Supertonic Engine: text is empty");
+        }
+
+        const std::string voice = opts.voice.empty()
+            ? model.hparams.default_voice
+            : opts.voice;
+        const int   steps = opts.steps > 0 ? opts.steps : model.hparams.default_steps;
         const float speed = opts.speed > 0.0f ? opts.speed : model.hparams.default_speed;
-        if (steps <= 0) throw std::runtime_error("Supertonic steps must be positive");
-        if (speed <= 0.0f) throw std::runtime_error("Supertonic speed must be positive");
+        if (steps <= 0) throw std::runtime_error("Supertonic Engine: steps must be positive");
+        if (speed <= 0.0f) throw std::runtime_error("Supertonic Engine: speed must be positive");
 
         auto vit = model.voices.find(voice);
-        if (vit == model.voices.end()) throw std::runtime_error("unknown Supertonic voice: " + voice);
+        if (vit == model.voices.end()) {
+            // Re-validated here in case opts.voice was hot-swapped after
+            // construction (not currently supported but guard anyway).
+            throw std::runtime_error("Supertonic Engine: unknown voice: " + voice);
+        }
         std::vector<float> style_ttl = read_tensor_f32(vit->second.ttl);
         std::vector<float> style_dp  = read_tensor_f32(vit->second.dp);
 
@@ -136,18 +176,23 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
         std::string normalized;
         std::string error;
         if (!supertonic_text_to_ids(model, text, opts.language, text_ids_i32, &normalized, &error)) {
-            throw std::runtime_error("text preprocessing failed: " + error);
+            throw std::runtime_error("Supertonic Engine: text preprocessing failed: " + error);
         }
         std::vector<int64_t> text_ids(text_ids_i32.begin(), text_ids_i32.end());
+
+        if (cancel_flag.load(std::memory_order_acquire)) {
+            throw std::runtime_error("Supertonic Engine: cancelled before duration");
+        }
 
         float duration_raw = 0.0f;
         if (!supertonic_duration_forward_ggml(model, text_ids.data(), (int) text_ids.size(),
                                               style_dp.data(), duration_raw, &error)) {
-            throw std::runtime_error("duration failed: " + error);
+            throw std::runtime_error("Supertonic Engine: duration failed: " + error);
         }
-        const float duration_s = duration_raw / speed;
-        const int sample_rate = model.hparams.sample_rate;
-        const int chunk = model.hparams.base_chunk_size * model.hparams.ttl_chunk_compress_factor;
+        const float duration_s  = duration_raw / speed;
+        const int   sample_rate = model.hparams.sample_rate;
+        const int   chunk = model.hparams.base_chunk_size *
+                            model.hparams.ttl_chunk_compress_factor;
         int wav_len = (int) (duration_s * sample_rate);
         int latent_len = std::max(1, (wav_len + chunk - 1) / chunk);
 
@@ -156,7 +201,7 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
             npy_array noise = npy_load(opts.noise_npy_path);
             if (noise.dtype != "<f4" || noise.shape.size() != 3 || noise.shape[0] != 1 ||
                 noise.shape[1] != model.hparams.latent_channels) {
-                throw std::runtime_error("noise npy must be float32 [1, latent_channels, L]");
+                throw std::runtime_error("Supertonic Engine: noise npy must be float32 [1, latent_channels, L]");
             }
             latent_len = (int) noise.shape[2];
             wav_len = latent_len * chunk;
@@ -168,40 +213,88 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
             for (float & v : latent) v = rng.standard_normal();
         }
 
+        if (cancel_flag.load(std::memory_order_acquire)) {
+            throw std::runtime_error("Supertonic Engine: cancelled before text encoder");
+        }
+
         std::vector<float> text_emb;
         if (!supertonic_text_encoder_forward_ggml(model, text_ids.data(), (int) text_ids.size(),
                                                   style_ttl.data(), text_emb, &error)) {
-            throw std::runtime_error("text encoder failed: " + error);
+            throw std::runtime_error("Supertonic Engine: text encoder failed: " + error);
         }
 
         std::vector<float> latent_mask((size_t) latent_len, 1.0f);
 
         std::vector<float> next;
         for (int step = 0; step < steps; ++step) {
+            if (cancel_flag.load(std::memory_order_acquire)) {
+                throw std::runtime_error("Supertonic Engine: cancelled at vector step "
+                                         + std::to_string(step));
+            }
             if (!supertonic_vector_step_ggml(model, latent.data(), latent_len,
                                              text_emb.data(), (int) text_ids.size(),
                                              style_ttl.data(), latent_mask.data(),
                                              step, steps, next, &error)) {
-                throw std::runtime_error("vector estimator failed: " + error);
+                throw std::runtime_error("Supertonic Engine: vector estimator failed: " + error);
             }
             latent.swap(next);
         }
 
+        if (cancel_flag.load(std::memory_order_acquire)) {
+            throw std::runtime_error("Supertonic Engine: cancelled before vocoder");
+        }
+
         std::vector<float> wav_full;
         if (!supertonic_vocoder_forward_ggml(model, latent.data(), latent_len, wav_full, &error)) {
-            throw std::runtime_error("vocoder failed: " + error);
+            throw std::runtime_error("Supertonic Engine: vocoder failed: " + error);
         }
 
         SynthesisResult result;
         result.sample_rate = sample_rate;
-        result.duration_s = duration_s;
-        result.pcm.assign(wav_full.begin(), wav_full.begin() + std::min((size_t) wav_len, wav_full.size()));
-        free_supertonic_model(model);
+        result.duration_s  = duration_s;
+        result.pcm.assign(wav_full.begin(),
+                          wav_full.begin() + std::min((size_t) wav_len, wav_full.size()));
         return result;
-    } catch (...) {
-        free_supertonic_model(model);
-        throw;
     }
+
+    std::string backend_name() const {
+        if (!model.backend) return "(unknown)";
+        if (const char * name = ggml_backend_name(model.backend)) {
+            return std::string(name);
+        }
+        return "(unknown)";
+    }
+};
+
+Engine::Engine(const EngineOptions & opts)
+    : pimpl_(std::make_unique<Impl>(opts)) {}
+
+Engine::~Engine() = default;
+
+Engine::Engine(Engine &&) noexcept            = default;
+Engine & Engine::operator=(Engine &&) noexcept = default;
+
+SynthesisResult Engine::synthesize(const std::string & text) {
+    return pimpl_->synthesize(text);
+}
+
+void Engine::cancel() {
+    pimpl_->cancel_flag.store(true, std::memory_order_release);
+}
+
+const EngineOptions & Engine::options() const {
+    return pimpl_->opts;
+}
+
+std::string Engine::backend_name() const {
+    return pimpl_->backend_name();
+}
+
+// Convenience one-shot wrapper.  Pays the full GGUF load + free per
+// call; use Engine directly for repeated synthesis.
+SynthesisResult synthesize(const EngineOptions & opts, const std::string & text) {
+    Engine engine(opts);
+    return engine.synthesize(text);
 }
 
 } // namespace tts_cpp::supertonic
