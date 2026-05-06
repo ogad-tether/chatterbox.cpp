@@ -10,7 +10,7 @@ Writes:
 
 Example:
 
-    . ~/chatterbox-ref/.venv/bin/activate
+    . path/to/chatterbox-ref/.venv/bin/activate
     python scripts/dump-campplus-reference.py REF.wav --out /tmp/camp_ref
 """
 

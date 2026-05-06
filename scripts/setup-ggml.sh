@@ -41,15 +41,16 @@ git apply "$REPO_ROOT/patches/ggml-metal-chatterbox-ops.patch"
 echo "  → applying patches/ggml-opencl-chatterbox-ops.patch"
 git apply "$REPO_ROOT/patches/ggml-opencl-chatterbox-ops.patch"
 
-# QVAC-17872 round-1: persistent VkPipelineCache across processes.  Eliminates
-# the ~1-3 s shader-compile cost on every fresh chatterbox process when
-# building with -DGGML_VULKAN=ON.  Inert when configuring without Vulkan.
+# Persistent VkPipelineCache across processes.  Eliminates the
+# ~1-3 s shader-compile cost on every fresh chatterbox process when
+# building with -DGGML_VULKAN=ON.  Inert when configuring without
+# Vulkan.
 echo "  → applying patches/ggml-vulkan-pipeline-cache.patch"
 git apply "$REPO_ROOT/patches/ggml-vulkan-pipeline-cache.patch"
 
-# QVAC-17872 round-2: write back the pipeline cache after each
-# ggml_vk_load_shaders compile batch (crash-safety against SIGKILL/abort
-# losing freshly compiled pipelines).  Stacks on round-1's patch.
+# Write the pipeline cache back to disk after each ggml_vk_load_shaders
+# compile batch (crash-safety against SIGKILL/abort losing freshly
+# compiled pipelines).  Stacks on the persistent-cache patch above.
 echo "  → applying patches/ggml-vulkan-eager-cache-save.patch"
 git apply "$REPO_ROOT/patches/ggml-vulkan-eager-cache-save.patch"
 
