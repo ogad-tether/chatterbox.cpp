@@ -2267,13 +2267,29 @@ int s3gen_synthesize_to_wav(
     std::vector<float>   pf_data;
     int pf_rows = 0;  // mel_len1
 
-    if (ref_dir.empty() && opts.embedding_override.empty() && opts.prompt_feat_override.empty()
-        && opts.prompt_token_override.empty()) {
+    // The view fields take precedence over the *_override vectors so a
+    // streaming host (chatterbox::Engine) doesn't re-copy MB-sized
+    // prompt_feat / embedding tensors per chunk; the vectors stay
+    // around for callers that hold their data on the opts struct
+    // itself (tts-cli).
+    const bool has_prompt_token = (opts.prompt_token_view_data && opts.prompt_token_view_size > 0)
+                                  || !opts.prompt_token_override.empty();
+    const bool has_embedding    = (opts.embedding_view_data && opts.embedding_view_size > 0)
+                                  || !opts.embedding_override.empty();
+    const bool has_prompt_feat  = (opts.prompt_feat_view_data && opts.prompt_feat_view_size > 0)
+                                  || !opts.prompt_feat_override.empty();
+
+    if (ref_dir.empty() && !has_embedding && !has_prompt_feat && !has_prompt_token) {
         vlog("No --ref-dir given; loading built-in voice from GGUF.\n");
     } else {
         if (!ref_dir.empty()) vlog("Loading ref dict from %s\n", ref_dir.c_str());
 
-        if (!opts.prompt_token_override.empty()) {
+        if (opts.prompt_token_view_data && opts.prompt_token_view_size > 0) {
+            pt_data.assign(opts.prompt_token_view_data,
+                           opts.prompt_token_view_data + opts.prompt_token_view_size);
+            vlog("  prompt_token: using C++ override view (%zu tokens, no copy)\n",
+                    pt_data.size());
+        } else if (!opts.prompt_token_override.empty()) {
             pt_data = opts.prompt_token_override;
             vlog("  prompt_token: using C++ override (S3TokenizerV2, %zu tokens)\n",
                     pt_data.size());
@@ -2283,7 +2299,12 @@ int s3gen_synthesize_to_wav(
                            (const int32_t*)pt_npy.data.data() + pt_npy.n_elements());
         }
 
-        if (!opts.embedding_override.empty()) {
+        if (opts.embedding_view_data && opts.embedding_view_size > 0) {
+            emb_data.assign(opts.embedding_view_data,
+                            opts.embedding_view_data + opts.embedding_view_size);
+            vlog("  embedding: using C++ override view (%zu dims, no copy)\n",
+                    emb_data.size());
+        } else if (!opts.embedding_override.empty()) {
             emb_data = opts.embedding_override;
             vlog("  embedding: using C++ override (CAMPPlus, %zu dims)\n", emb_data.size());
         } else {
@@ -2292,7 +2313,12 @@ int s3gen_synthesize_to_wav(
                             (const float*)emb_npy.data.data() + emb_npy.n_elements());
         }
 
-        if (!opts.prompt_feat_override.empty()) {
+        if (opts.prompt_feat_view_data && opts.prompt_feat_view_size > 0) {
+            pf_data.assign(opts.prompt_feat_view_data,
+                           opts.prompt_feat_view_data + opts.prompt_feat_view_size);
+            pf_rows = opts.prompt_feat_view_rows;
+            vlog("  prompt_feat: using C++ override view (%d mel frames, no copy)\n", pf_rows);
+        } else if (!opts.prompt_feat_override.empty()) {
             pf_data = opts.prompt_feat_override;
             pf_rows = opts.prompt_feat_rows_override;
             vlog("  prompt_feat: using C++ override (%d mel frames)\n", pf_rows);

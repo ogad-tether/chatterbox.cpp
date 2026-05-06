@@ -424,15 +424,23 @@ struct Engine::Impl {
         sopts.verbose         = opts.verbose;
         sopts.n_gpu_layers    = opts.n_gpu_layers;
 
+        // Use the non-owning view fields rather than the *_override
+        // vectors so the streaming path doesn't pay a per-chunk MB-
+        // sized value-copy.  Engine::Impl owns the underlying storage
+        // for the duration of the synthesize() / synthesize_streaming()
+        // call; the views are valid as long as 'this' is.
         if (!s3gen_prompt_feat.empty()) {
-            sopts.prompt_feat_override      = s3gen_prompt_feat;
-            sopts.prompt_feat_rows_override = s3gen_prompt_feat_rows;
+            sopts.prompt_feat_view_data = s3gen_prompt_feat.data();
+            sopts.prompt_feat_view_size = s3gen_prompt_feat.size();
+            sopts.prompt_feat_view_rows = s3gen_prompt_feat_rows;
         }
         if (!s3gen_embedding.empty()) {
-            sopts.embedding_override = s3gen_embedding;
+            sopts.embedding_view_data = s3gen_embedding.data();
+            sopts.embedding_view_size = s3gen_embedding.size();
         }
         if (!s3gen_prompt_token.empty()) {
-            sopts.prompt_token_override = s3gen_prompt_token;
+            sopts.prompt_token_view_data = s3gen_prompt_token.data();
+            sopts.prompt_token_view_size = s3gen_prompt_token.size();
         }
         // Cooperative-cancel hook so a single Engine::cancel() reaches
         // both the T3 decode loop (handled directly) and the S3Gen +

@@ -51,6 +51,10 @@ struct s3gen_synthesize_opts {
     // ref_dir/prompt_feat.npy or from s3gen/builtin. Layout is row-major
     // (T_mel, 80). Used by --reference-audio in main.cpp to inject a mel
     // computed natively in C++ from a reference wav.
+    //
+    // Owning storage; copied into / out of by callers that want full
+    // value semantics (e.g. tts-cli, where the override is built once
+    // and survives the s3gen_synthesize_to_wav call).
     std::vector<float> prompt_feat_override;
     int prompt_feat_rows_override = 0;
 
@@ -64,6 +68,25 @@ struct s3gen_synthesize_opts {
     // tokens (`prompt_token`).  Populated from --reference-audio via
     // S3TokenizerV2 in main.cpp (Phase 2e).
     std::vector<int32_t> prompt_token_override;
+
+    // Non-owning views over the same data.  Streaming hosts that hold
+    // these tensors on a long-lived owner (e.g. chatterbox::Engine,
+    // which bakes the voice profile once at construction) point these
+    // at their internal storage to avoid the per-chunk MB-sized
+    // value-copy that the *_override vectors would otherwise force.
+    //
+    // Lifetime: the caller owns the underlying data; the views must
+    // stay valid for the duration of the s3gen_synthesize_to_wav call.
+    // When set (non-null + non-zero size), each view takes precedence
+    // over the matching *_override vector above; mixing the two for the
+    // same field is undefined (don't).
+    const float *   prompt_feat_view_data       = nullptr;
+    size_t          prompt_feat_view_size       = 0;
+    int             prompt_feat_view_rows       = 0;
+    const float *   embedding_view_data         = nullptr;
+    size_t          embedding_view_size         = 0;
+    const int32_t * prompt_token_view_data      = nullptr;
+    size_t          prompt_token_view_size      = 0;
 
     int  seed      = 42;
     int  n_threads = 0;          // 0 = hardware_concurrency
