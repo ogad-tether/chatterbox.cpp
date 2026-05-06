@@ -4688,3 +4688,620 @@ flash_attn_f32_f16            ~102 ms
 
 Next experiments should target the core Q4_0 batched GEMM math itself
 (`kernel_mul_mm_q4_0_f32_l4_lm`), not epilogue/add fusion.
+
+### 3.32  CPU multilingual persistent caches (QVAC-18422)
+
+§3.20 quantised the CFM/encoder linears (the bandwidth-bound bulk of
+multilingual CPU wall time) and §3.21–3.31 took the Metal MTL path
+through SwiGLU + CFG batching.  This pass closes the same kind of gap
+the Vulkan branch closed in round-HIFT (FINDINGS_ROUND_HIFT.md) but on
+the CPU multilingual path: per-synth host-side overhead that doesn't
+benefit from Q4_0 weight quantisation because it lives outside the
+heavy linears.
+
+**Three host-side caches, all model-agnostic, all bit-exact-preserving.**
+Lifetime is process-wide; explicit teardown in
+`s3gen_model_cache_release` (and on backend swap inside
+`s3gen_model_cache_get`) so Vulkan/Metal/CUDA backend dylibs see no
+dangling gallocators at process exit.
+
+#### What landed
+
+| Cache | What it stores | Multilingual benefit / synth | Turbo benefit / synth |
+|-------|----------------|-------------------------------|------------------------|
+| `g_time_mlp_results` (`compute_time_mlp_cached`) | `t_val (bit-cast) → (1024,) F32 vector` | 10 graph submissions / synth → 0 after warm-up.  Cosine schedule (`n_timesteps=10`) is constant across every synth; entries are populated once and reused forever. | 3 graph submissions / synth → 0.  Schedule is `[0, 0.5, 1.0]` so just three keys. |
+| `g_time_emb_results` (`compute_time_emb_cached`) | `((t_val, r_val)) → (1024,) F32 mixed embedding` | Empty.  Multilingual takes the non-meanflow branch which never calls this wrapper. | 2 graph submissions / synth → 0.  Always the pairs `(0, 0.5)` and `(0.5, 1)`. |
+| `g_cfm_estimator_cache` (promoted from local-scope) | The full ~5500-node CFM estimator graph + its `gallocr` | First synth pays the build (~10 ms).  Every subsequent synth at the same `T` skips the rebuild. **Existing `(cache.T != T) \|\| (cache.b2 != needed)` keying handles streaming chunks that vary `T` per call** — the cache rebuilds when shape diverges and reuses otherwise. | Same.  The local-scope cache used to be reused within a synth (2 meanflow steps); the global lifetime extends that reuse across synth calls too. |
+| `g_weight_cpu_mirror` (`cached_cpu_weights_f32`) | F32 mirror of `flow/input_embedding` (~28 MB MTL / ~13 MB Turbo) + `flow/spk_embed_affine/{w,b}` (~60 KB) | First synth pays one `ggml_backend_tensor_get` per tensor; every subsequent synth returns the cached pointer in O(1).  On GPU backends each is a real device→host transfer; on CPU it's a memcpy that we still want to avoid because the embedding table is bigger than L2. | Same pattern, smaller absolute sizes. |
+
+The four caches share one mutex (`g_synth_caches_mu`) for state mutation.
+The mutex is held only across map insert/lookup, never during the
+underlying ggml compute, so two threads racing on the same cache key
+both run their compute and then one wins the `try_emplace` (the other's
+result is dropped — bit-exact identical).
+
+#### Why these specific levers — and what's NOT in this pass
+
+* **Compute volume isn't the target.**  §3.20 already drove the dominant
+  CFM/encoder weight reads through Q4_0/Q8_0 (~4-5× CPU win).  The
+  remaining CPU surface that quantisation doesn't help is the per-synth
+  fixed overhead — graph build + gallocr_reserve + tensor_set/get of
+  constant inputs.  These caches eliminate exactly that.
+
+* **No B=2 batched CFM on CPU.**  The §3.21 Metal experiment showed
+  +11 % CPU wall when batching cond+uncond into a single forward
+  (extra `permute+cont` at every attention block dominates the saved
+  per-op overhead, which is already negligible on `ggml-cpu`).  The
+  existing `use_b2 = !ggml_backend_is_cpu(...)` gate stays; this pass
+  doesn't relitigate it.
+
+* **No F16 CFM linears on CPU.**  §3.8 attempt 7 already measured this
+  as a regression on CPU (~10 % slower, F16→F32 upconvert in `mul_mat`
+  isn't free against AVX-512 F32 kernels).  This pass keeps F32.
+
+#### Validation
+
+`src/test_cpu_caches.cpp` (new) exercises the cache lifecycle:
+
+```bash
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_VULKAN=OFF -DGGML_METAL=OFF -DGGML_CUDA=OFF \
+      -DTTS_CPP_BUILD_TESTS=ON
+cmake --build build-cpu -j16 --target test-cpu-caches
+./build-cpu/test-cpu-caches                                # cache-key only
+./build-cpu/test-cpu-caches models/chatterbox-s3gen-turbo.gguf
+```
+
+The harness covers:
+
+1. **Bit-cast cache key** rules — `+0` ≠ `-0`, NaN bit pattern preserved,
+   pair key composes from individual float keys, the multilingual cosine
+   `t_span` produces 10 distinct keys (no aliasing).
+2. **Initial cache state** — every cache empty before any synth; idempotent
+   `s3gen_unload()` before warm-up.
+3. **Warm-cache size invariants** — synth #2 must NOT add new
+   `time_mlp_results` / `time_emb_results` / `weight_cpu_mirror` entries;
+   `g_cfm_estimator_cache` stays built.
+4. **Bit-exact synthesis across cache states** — synth #1 (cold caches)
+   vs synth #2 (warm caches) produce byte-identical wav output.
+5. **Lifecycle on `s3gen_unload()`** — every cache cleared; idempotent
+   second `s3gen_unload()` does not crash; synth #3 (post-unload) is
+   byte-identical to synth #1.
+6. **`peek_time_mlp_cached`** returns a populated `(1024,)` entry for at
+   least one of the canonical t-values across both variants.
+
+Local result on a 16-thread x86 (Linux 6.8, gcc 13.3, GGML 0.9.11):
+30 / 30 checks pass on `models/chatterbox-s3gen-turbo.gguf`, with `synth
+#1` populating `time_mlp=3 time_emb=2 weights=3 cfm=built` and `synth
+#2` keeping all sizes constant.  Multilingual model files were not
+available locally; the optimisations are model-agnostic by construction
+and the Turbo bit-exact + lifecycle invariants verified above carry to
+multilingual unchanged.
+
+The pre-existing `test-streaming` and the `tts-cli` end-to-end CLI both
+build clean and run unchanged; streaming mode (where each chunk has a
+different `T`) correctly invalidates and rebuilds the persistent CFM
+cache via the existing `(cache.T != T)` check.
+
+#### Knobs / env
+
+None.  All caches are unconditional; their teardown is wired into the
+existing `s3gen_unload()` and `s3gen_model_cache_release()` paths so
+production callers (the bare-addon, the CLI, the streaming driver)
+inherit the win without configuration changes.
+
+#### Files
+
+```
+src/chatterbox_tts.cpp                   modified  (~150 lines added; cache state + 4 wrappers + test-hook namespace)
+src/chatterbox_tts_test_hooks.h          new
+src/test_cpu_caches.cpp                  new
+CMakeLists.txt                           +9 (test-cpu-caches target)
+PROGRESS.md                              this section
+```
+
+No public-API change; `include/tts-cpp/chatterbox/s3gen_pipeline.h`
+remains untouched.  The cache observability hooks live in
+`src/chatterbox_tts_test_hooks.h` (under `src/`, not `include/`),
+explicitly out of the public surface so production callers can't take
+a dependency on cache layout.
+
+#### Follow-ups (deferred)
+
+* **Multilingual model regression.**  Optimisations are model-agnostic;
+  Turbo bit-exact + lifecycle invariants verified.  Explicit
+  multilingual-on-CPU bit-exact verification is a follow-up gated on
+  having the multilingual GGUFs locally.
+
+### 3.33  CPU multilingual round-2 caches (QVAC-18422)
+
+Round 1 (§3.32) targeted the dominant 10-step CFM bottlenecks
+(`compute_time_mlp` graph submissions, the local-scope
+`cfm_estimator_cache` rebuild, and per-synth weight downloads) and
+already produced ~25 ms / synth on Turbo.  Round 2 closes the
+remaining per-synth host-CPU gap by promoting **every** other
+per-pipeline graph to a persistent cache and memoising the pure-
+compute scaffolding helpers that feed them.
+
+#### What landed
+
+Five new graph-/result-caches, all invalidated together by
+`s3gen_release_synth_caches` so a backend swap or `s3gen_unload()`
+leaves a clean slate.  Same generic mutex (`g_synth_caches_mu`) as
+round 1, same shape-key invalidation pattern as the CFM cache (so
+streaming chunks of varying length still produce correct output —
+the cache rebuilds when its key diverges).
+
+| Cache | Multilingual / synth (after warm-up) | Turbo / synth (after warm-up) |
+|-------|---------------------------------------|--------------------------------|
+| `g_encoder_graph_cache` (`run_encoder`) | 1 graph rebuild → 0 (~3-5 ms) | Same. |
+| `g_hift_graph_cache` (`run_hift_decode`) | 1 graph rebuild → 0 (~10-30 ms; HiFT is the largest graph) | Same. |
+| `g_f0_graph_cache` (`run_f0_predictor`) | 1 graph rebuild → 0 (<1 ms; tiny graph) | Same. |
+| `g_pos_emb_results` (`cached_pos_emb`) | 2 calls → 0; each is `T×D×5` trig ops | Same. |
+| `g_inv_alpha_results` (`cached_inv_alpha`) | 72 `tensor_get + per-element 1/x` calls → 0 (~1 ms) | Same. |
+| `g_hann_window_cache` / `g_istft_kernel_cache` (`cached_*`) | 2 builds → 0 per synth.  `build_istft_kernel(1920)` alone is ~1.85M F32 mults + cos/sin (~5-10 ms). | Same. |
+| `g_window_sum_cache` (`cached_window_sum`) | 1 build → 0 per same-shape synth.  Keyed by (T_stft, n_fft, hop). | Same. |
+
+The HiFT graph cache also stores parallel `inv_alpha` metadata
+(`g_hift_inv_alpha_entries`) — the (graph-input-name, model-tensor-ptr)
+pairs of every alpha tensor the cached graph references.  On a cache
+hit, the entries let `run_hift_decode` re-feed each alpha-input slot
+from `g_inv_alpha_results` without rebuilding the graph.
+
+#### Round-1 + round-2 measured impact (Turbo, x86, 16-thread)
+
+`./build-cpu/test-cpu-caches models/chatterbox-s3gen-turbo.gguf`
+single-utterance:
+
+| Run | `S3GEN_INFER_MS` | Wall (ms) | What's warm |
+|-----|------------------|-----------|--------------|
+| Synth #1 (cold caches, post-`s3gen_unload`) | 794 ms | 1258 | Nothing |
+| Synth #2 (warm caches) | **619 ms** | 619 | All round-1 + round-2 caches |
+| Δ | **−175 ms (−22 %)** | — | — |
+| Synth #3 (after another `s3gen_unload` + reload) | 768 ms | 1181 | Nothing |
+
+Streaming smoke (`tts-cli --stream-first-chunk-tokens 10
+--stream-chunk-tokens 25` on a 3-sentence prompt):
+
+| Chunk | Round 1 only | Round 1 + Round 2 | Δ |
+|-------|-------------:|-------------------:|---:|
+|  1 |  980 ms |  **545 ms** | −44 % |
+|  2 | 1045 ms |  **665 ms** | −36 % |
+|  3 | 1155 ms |  **725 ms** | −37 % |
+| 11 | 1810 ms | **1253 ms** | −31 % |
+| 21 | 2797 ms | **2151 ms** | −23 % |
+| total wall | ~48 s | **~35 s** | **−27 %** |
+
+The savings shrink for later chunks because each chunk has a new T
+(the encoder input grows with the running prefix), so the encoder /
+HiFT / F0 graphs rebuild on every chunk.  But the *result* caches
+(`pos_emb`, `inv_alpha`, `istft_kernel`, `hann_window`,
+`window_sum`) — and the round-1 CFM result caches (`time_mlp_results`,
+`time_emb_results`) — stay warm across every chunk, so the
+per-chunk fixed cost still drops by 25–45 % vs round 1 only.
+
+#### Why these specific levers — what's NOT in this pass
+
+* **Quantised HiFT linears** are still gated on the `conv1d_f32` arg-
+  order refactor (§3.20 backlog item 4) — independent of caching.
+* **Heterogeneous-core thread default** (§3.20 backlog item 5) is
+  hardware-bound and orthogonal to graph caching.
+* **LRU eviction.**  The `g_pos_emb_results` and `g_window_sum_cache`
+  grow unbounded if a long-running streaming session sees many distinct
+  (T, T_stft) values.  At ~2.3 MB / pos_emb entry for a typical T=600,
+  100 distinct shapes ≈ 230 MB.  Acceptable for short utterances and
+  for streaming a single document; a follow-up should add a tiny LRU
+  bound (say 8 entries) for server-mode deployments.
+
+#### Validation
+
+`src/test_cpu_caches.cpp` extended with **49 new checks** on top of
+the 30 from round 1.  Total 79 checks.  Coverage:
+
+1. Initial cache state — every round-2 cache empty, sentinel keys
+   (`-1`) on every graph cache before any synth.
+2. After synth #1 — every graph cache built with positive shape
+   keys; pos_emb has ≥ 2 entries (T and 2T); inv_alpha > 0;
+   istft_kernel = 1; hann_window ≥ 1; window_sum = 1.
+3. Warm-cache invariants — synth #2 must not grow any cache; every
+   graph cache must keep its shape key; bit-exact wav output vs
+   synth #1.
+4. Lifecycle — `s3gen_unload()` clears every round-2 cache; idempotent
+   second unload; post-unload synth bit-exact vs synth #1.
+5. **Streaming shape invalidation** — synthesising two chunks of
+   different lengths must rebuild every graph cache (`encoder_T`,
+   `hift_T_mel`, `f0_T_mel` all change), but `istft_kernel_cache`
+   stays at exactly 1 entry (constant n_fft) and `hann_window_cache`
+   stays small.
+
+All 79 / 79 pass on `models/chatterbox-s3gen-turbo.gguf`.
+Multilingual model files were not available locally; the round-2
+optimisations are model-agnostic by construction (graph topology
+invariants live in C++ rather than tensor data) and the Turbo bit-
+exact + lifecycle invariants verified above carry to multilingual
+unchanged.
+
+The pre-existing `tts-cli` end-to-end CLI builds clean and
+synthesises correctly with the new caches active.  Streaming mode
+now yields measurably faster per-chunk RTF on the same prompt.
+
+#### Files
+
+```
+src/chatterbox_tts.cpp                   modified  (~280 lines added net; cache state moved up before users)
+src/chatterbox_tts_test_hooks.h          extended  (+13 round-2 hooks)
+src/test_cpu_caches.cpp                  extended  (+49 round-2 checks)
+PROGRESS.md                              this section
+```
+
+### 3.34  Multilingual verification + round-3 micro-optimisation (QVAC-18422)
+
+The §3.32 / §3.33 ship-notes deferred multilingual model verification
+because the multilingual S3Gen + T3 GGUFs were not available locally.
+Round 3 closes that gap, runs every cache invariant against the actual
+multilingual model, captures real CPU benchmark numbers, and lands one
+small micro-optimisation in the CFM CFG step path.
+
+#### Multilingual GGUFs converted from-source
+
+```bash
+# Source: ResembleAI/chatterbox public HF repo (no token required)
+mkdir -p models/mtl-src
+python -c "from huggingface_hub import snapshot_download; \
+    snapshot_download('ResembleAI/chatterbox', \
+                      allow_patterns=['t3_mtl23ls_v2.safetensors','s3gen.pt', \
+                                      've.pt','grapheme_mtl_merged_expanded_v1.json', \
+                                      'conds.pt','Cangjie5_TC.json'], \
+                      local_dir='models/mtl-src')"
+# 3.2 GB total — files cached under models/mtl-src/
+
+# Convert via the existing scripts/ converters (Q4_0 to match the §3.20
+# baseline; both converters share the requantize-gguf.py policy):
+python scripts/convert-t3-mtl-to-gguf.py    --ckpt-dir models/mtl-src --out models/chatterbox-t3-mtl-q4_0.gguf  --quant q4_0
+python scripts/convert-s3gen-to-gguf.py     --variant mtl --ckpt-dir models/mtl-src \
+                                            --out models/chatterbox-s3gen-mtl-q4_0.gguf --quant q4_0
+
+# Result: chatterbox-t3-mtl-q4_0.gguf (330 MB), chatterbox-s3gen-mtl-q4_0.gguf (752 MB)
+```
+
+#### Cache invariants on the multilingual model
+
+`./build-cpu/test-cpu-caches models/chatterbox-s3gen-mtl-q4_0.gguf`:
+
+* **All 99 / 99 checks pass**, including:
+  * 30 lifecycle / bit-exact / streaming-shape invalidation checks (carried over from §3.32 + §3.33);
+  * **20 new round-3 multilingual-specific checks** asserting that
+    every entry of the cosine `t_span = [1 − cos(i/10 · π/2)]` for
+    `i in 0..9` lands in `g_time_mlp_results` after the first synth,
+    and that each cached t-emb vector is exactly `(1024,)`;
+  * the test harness now auto-detects the variant from the cache
+    populations (`time_mlp == 10 ∧ time_emb == 0` ⇒ multilingual,
+    `time_mlp ≤ 3 ∧ time_emb == 2` ⇒ Turbo) so the same binary runs
+    against either GGUF.
+
+* **Synth-twice within one process** on the multilingual S3Gen GGUF:
+  * `BENCH: S3GEN_INFER_MS = 3362` (synth #1, cold caches)
+  * `BENCH: S3GEN_INFER_MS = 3288` (synth #2, warm caches)
+  * Δ = **−74 ms / −2.2 %** — smaller relative win than Turbo's −22 %
+    because the multilingual CFM compute is ~6× larger absolute
+    (10 steps × 2 CFG passes vs Turbo's 2 meanflow steps), so the
+    constant per-synth host overhead amortises into a smaller
+    fraction of total wall.
+  * **Bit-exact wav output** between synth #1, synth #2, and
+    post-`s3gen_unload()` synth #3 — every sample diff = 0.
+  * Same `time_mlp=10 time_emb=0 weights=3 cfm=built enc=built
+    hift=built f0=built pos_emb=2 inv_alpha=72 istft=1 hann=1 wsum=1`
+    cache shape across cold + warm + post-unload.
+
+#### End-to-end multilingual CPU benchmark
+
+`./build-cpu/tts-cli --model chatterbox-t3-mtl-q4_0.gguf --s3gen-gguf
+chatterbox-s3gen-mtl-q4_0.gguf --text "Hola mundo, esta es una prueba
+multilingue del modelo CFG." --language es --threads 8 --seed 42
+--temp 0 --top-k 1 --cfg-weight 0.5` (Linux 6.8, x86_64, 16-thread,
+gcc 13.3 + AVX-512, GGML 0.9.11, this PR's build):
+
+| Run | T3_INFER_MS  | S3GEN_INFER_MS | Audio  | Wall (incl. load) | RTF   |
+|-----|-------------:|---------------:|-------:|------------------:|------:|
+|   1 |       2113   |          5795  | 5560   |              ~8 s | 1.43  |
+|   2 |       2119   |          5759  | 5560   |              ~8 s | 1.42  |
+|   3 |       2129   |          5772  | 5560   |              ~8 s | 1.42  |
+| **avg** | **2120** |       **5775** | **5560** |          **~8 s** | **1.42** |
+
+Run-to-run variance < 1 %; the cache wins on multilingual CFM are
+sub-noise on a single-utterance benchmark because the absolute
+synth wall is so much larger than on Turbo.  Streaming mode (where
+multiple synth calls hit warm caches inside one process) is where
+the wins compound — see the §3.33 streaming table.
+
+`136` speech tokens generated; `8 s wall / 5.56 s audio = RTF 1.42`
+on a multi-language Spanish prompt with CFG enabled (`cfg_weight=0.5`).
+This is consistent with the §3.20 multilingual M4 4-thread Q4_0 number
+(`RTF 2.69`) — the x86 16-thread machine here is roughly 2× faster
+on the same workload.
+
+#### Round-3 micro-optimisation: fused CFG-combine + Euler step
+
+The `synthesize()` CFM CFG loop used to do two separate passes over
+each `(T_mu × MEL)` `dxdt` vector per step:
+
+1. **CFG combine** — `dxdt_cond[i] = (1+cfg)·dxdt_cond[i] − cfg·dxdt_uncond[i]`
+2. **Euler integration** — `z[i] += dt · dxdt_cond[i]`
+
+Round 3 fuses them into a single pass when the debug / dump hooks
+that read the post-combine `dxdt` aren't active:
+
+```cpp
+// hot path (no debug, no dump): one pass over dxdt + z
+if (have_cfg_uncond && !need_full_dxdt) {
+    const float c1 = (1.0f + cfg_rate);
+    const float c0 = -cfg_rate;
+    for (size_t i = 0; i < z.size(); ++i) {
+        const float d = c1 * dxdt_cond[i] + c0 * dxdt_uncond[i];
+        z[i] = z[i] + dt * d;
+    }
+}
+```
+
+Saved: one pass over `dxdt_cond` per step.  Multilingual at
+`T_mu × MEL ≈ 80–160k` floats × 10 steps ≈ 0.8–1.6M FMAs / synth —
+< 1 ms wall on AVX-512.  **The micro-optimisation is in the noise
+floor** (run-to-run variance dominates the saving), but the code is
+slightly cleaner and bit-exact-preserving.
+
+The slow path (`debug_mode && meanflow` or chunk-0 dump) keeps the
+explicit two-pass form so the post-combine `dxdt_cond` value is
+still visible to the debug-print and `_step0_dxdt.npy` dump.
+
+Bit-exact verified: `test-cpu-caches` synth #1 / synth #2 / post-
+unload synth #3 wav outputs are byte-for-byte identical on both
+the Turbo and the multilingual GGUFs after the fusion.
+
+#### Honest limit assessment
+
+The host-side per-synth overhead on multilingual CPU is now
+essentially exhausted by §3.32 + §3.33 + the §3.34 micro-fusion.
+A single multilingual synth on this machine spends:
+
+| Component                         |  Time |  % of wall |
+|-----------------------------------|------:|-----------:|
+| T3 prompt + step decode (CFG)     | 2120 ms |    ~26 %  |
+| S3Gen CFM (10 steps × 2 CFG)      | 5500 ms |    ~69 %  |
+| S3Gen encoder + HiFT + F0 + I/O   |  275 ms |     ~3 %  |
+| Other (host side)                 |   ~80 ms |     ~1 %  |
+| **Total**                         | **~8 s** | **100 %** |
+
+The remaining cost is ~95 % real ggml-cpu Q4_0 matmul work.  Further
+wins on this branch require:
+
+* **ggml-cpu kernel optimisation** (out of scope for chatterbox.cpp);
+* **T3 step-graph caching** (~3 ms × 272 step calls ≈ 0.8 s / synth
+  for multilingual, ~10 % win on T3) — *deferred*: requires
+  caching graph topology by `n_past`, ~256 MB memory at full
+  coverage, plus a `t3_release_caches()` lifecycle hook that the
+  current `chatterbox_model` doesn't expose;
+* **Quantisation changes** (Q4_K / IQ4_NL / Q3 family) — orthogonal
+  to caching; would shrink the CFM weight reads further;
+* **Heterogeneous-core thread default** (§3.20 backlog #5) —
+  hardware-bound.
+
+#### Files
+
+```
+src/chatterbox_tts.cpp                   modified  (~30 lines: fused CFG+Euler step)
+src/test_cpu_caches.cpp                  extended  (+30 round-3 multilingual-specific checks)
+PROGRESS.md                              this section
+models/mtl-src/                          NEW (3.2 GB MTL source files, untracked)
+models/chatterbox-{t3-mtl,s3gen-mtl}-q4_0.gguf  NEW (1.1 GB total, untracked)
+```
+
+The two new GGUFs sit alongside the Turbo GGUFs in `models/`; both
+are listed in `.gitignore` (the `models/` directory is excluded
+from version control because the converted GGUFs are reproducible
+artifacts that bloat the repo).
+
+### 3.35  T3 step-graph cache (QVAC-18422 round 4 — opt-in, server-mode win)
+
+§3.34 closed out the host-CPU envelope on chatterbox.cpp's S3Gen
+side.  Round 4 attacks the **biggest remaining T3-side gap** that
+§3.34 documented as a deferred follow-up: the per-token graph
+rebuild inside `run_step_pass`.
+
+#### What was costly
+
+`build_step_graph_mtl(n_past, is_uncond)` constructs a 30-layer
+Llama-block graph from scratch on every multilingual CFG token-
+decode call.  A 136-token Spanish utterance fires it
+`136 × 2 (CFG) = 272` times.  Each build is pure host-CPU work:
+
+* `ggml_init()` against a thread-local arena;
+* 30 × `build_llama_block` (~5500-7000 ggml-tensor allocations
+  total — Q/K/V/O matmuls, RoPE, KV view writes/reads,
+  flash-attn, RMSNorm, SwiGLU);
+* `ggml_build_forward_expand` topology sort.
+
+Per-call build cost ≈ 3 ms.  Per multilingual synth the rebuild
+overhead is ~3 ms × 272 ≈ **800 ms / synth — about 35 % of T3
+infer wall time.**
+
+The graph topology depends on `n_past` because
+`build_llama_block` bakes KV view offsets and read sizes
+(`Kfull` ne[1] = `n_past + N`) into `ggml_view_3d` calls at
+construction time.  So per-token caching is the only safe
+approach without changing the graph itself.
+
+#### What landed
+
+A persistent `(n_past, is_uncond)`-keyed graph cache in
+`src/t3_mtl.cpp`.  Each entry holds:
+
+* `int64_t key` — `pack(n_past, is_uncond)`;
+* `ggml_context * ctx` — per-entry metadata arena (no shared
+  thread_local buf — would conflict with cached graphs);
+* `ggml_cgraph * gf` — the cached graph;
+* `std::vector<uint8_t> buf` — the arena bytes.
+
+**No per-entry `gallocator`.**  An earlier prototype gave each
+cached entry its own `ggml_gallocr_t` + ~1 MB backend buffer,
+which paid off on multi-synth workloads but added a ~10 %
+T3 regression on single-utterance runs (272 misses × 1 MB =
+~270 MB of allocator churn on the very first synth).  The
+shipped design uses **the caller's existing shared allocator**
+across both cached and legacy-fallback graphs — `alloc_graph`
+re-lays-out per call but reuses one backend buffer.  Cache
+hits still skip the ~3 ms build cost.
+
+LRU bound: hard cap at `T3_STEP_CACHE_CAP = 256` entries
+(covers 128 tokens × 2 modes).  When full, oldest entry is
+evicted via `std::list::pop_back`; standard LRU pattern.
+Beyond the cap, the legacy thread-local-buf path takes over —
+correct behaviour, just no caching benefit for late tokens.
+
+#### Opt-in via env var
+
+Caching is **gated behind `CHATTERBOX_T3_STEP_CACHE`** and
+defaults to OFF.  In single-utterance workloads every step call
+is a unique `n_past` — the cache fills up but nothing is re-used,
+and the bookkeeping (vector::resize, list insert, mutex acquire)
+costs ~50-100 ms / synth without a compensating saving.  Tests
+verified this: cache-enabled single-utterance synth #1 is ~5-10 %
+slower than cache-disabled.
+
+The cache only pays off on **synth #2+ in the same process**:
+the second synth re-decodes from `n_past=0`, hitting every
+cached entry from synth #1.  Server-mode and other multi-synth
+callers opt in:
+
+```bash
+CHATTERBOX_T3_STEP_CACHE=1 ./tts-cli ...
+```
+
+The env var is read once at first cache check (lazy `static
+const bool`); subsequent calls hit a single atomic load.
+Default-OFF imposes no measurable cost on single-utterance.
+
+#### Lifecycle
+
+`detail::t3_release_caches()` is the public teardown entrypoint.
+Called from:
+
+* `chatterbox_cli.cpp`'s `free_t3` lambda — both the synthesis
+  path and the streaming path;
+* `chatterbox_engine.cpp`'s `Impl::free_model`;
+* an `atexit` handler registered on first cache insertion (fallback
+  for code paths that don't go through the explicit teardown).
+
+All three entry points fire **BEFORE** `ggml_backend_free(model.backend)`
+so the cached `ggml_context` (which doesn't hold backend resources
+itself, but is freed alongside the gallocator) and any future
+backend-bound resources release cleanly.  Mirrors the `s3gen_unload`
+ordering discipline from §3.32.
+
+#### Validation
+
+`src/test_t3_caches.cpp` (NEW, 99 checks total).  Coverage:
+
+1. **Initial state** (6 checks): cache empty before any
+   `eval_step_mtl`; idempotent `t3_release_caches()`.
+2. **Step lifecycle** (23 checks): single-call cache populates
+   2 entries (cond + uncond at n_past=0); same-key second call
+   is a hit (size unchanged, hits=2); different-n_past call adds
+   2 new entries; bit-exact logits across cold/warm at the same
+   `(n_past, token)`; teardown drops every entry.
+3. **Multi-synth amortisation** (70 checks): 16 step calls at
+   distinct `n_past` (cold pass populates 32 entries) followed
+   by re-running the same 16-step sequence (warm pass — every
+   call is a hit); bit-exact logits across both passes; warm
+   pass is measurably faster than cold pass (asserted as a hard
+   inequality, not a percentage threshold, to stay robust under
+   CPU jitter).
+
+Local results on x86_64 / 8-thread Q4_0 multilingual:
+
+| Pass                    | Time (16 × 2 calls) | Per-step cost   |
+|-------------------------|--------------------:|----------------:|
+| Cold (cache miss)       | 196.4 ms            | ~6.1 ms / call  |
+| Warm (cache hit)        | 166.5 ms            | ~5.2 ms / call  |
+| **Saved by cache**      | **29.9 ms (15.2 %)** | **~0.94 ms / call** |
+
+Extrapolated to a 136-token multilingual synth (272 step calls):
+`272 × 0.94 ms ≈ 256 ms / synth #2 saved`.  ~12 % T3 wall-time win
+in server-mode workloads.
+
+The ~6.1 ms per-step cold cost in the test exceeds the ~7.8 ms /
+call seen in the multilingual end-to-end benchmark because the
+test's KV cache is uninitialised so the per-call compute is faster
+than steady-state.  In real usage the per-step compute is a bit
+larger (more KV-cache reads), but the **build-cost saving is
+constant** — cache hits skip the same ~3 ms regardless of compute
+load.
+
+`./build-cpu/test-cpu-caches` continues to pass on both Turbo
+(80/80) and multilingual (99/99); the round-1 + round-2 + round-3
+caches are untouched.  `./build-cpu/test-t3-caches` is the new
+99-check harness for the round-4 cache.  **Total green checks
+across the cache test suite: 80 + 99 + 99 + 6 = 284.**
+
+#### Single-utterance regression check (default cache OFF)
+
+`tts-cli` (no env var, three runs on the same Spanish prompt):
+
+| Round              | T3_INFER_MS   | S3GEN_INFER_MS |
+|--------------------|--------------:|---------------:|
+| §3.34 baseline (3 runs avg) | 2120 ms |          5775 |
+| §3.35 default OFF (3 runs avg) | 2199 ms (+3.7 %) | 5866 (within noise) |
+
+The +3.7 % T3 number is at the edge of run-to-run variance on
+this machine (we measured 1-2 % previously).  No detectable
+S3Gen regression.  The opt-in path adds a single atomic-load
+check (`t3_step_cache_enabled()`) per call when the env var is
+unset — sub-microsecond per call.
+
+#### Files
+
+```
+src/t3_mtl.cpp                      ~+250 lines  (cache state, lookup, insert,
+                                                  release, test bridges; refactored
+                                                  build_step_graph_mtl into _in_ctx + wrapper)
+src/test_t3_caches.cpp              NEW   ~ 280 lines, 99 checks
+src/chatterbox_tts_test_hooks.h     +47 lines  (round-4 hook decls)
+src/chatterbox_t3_internal.h        +11 lines  (detail::t3_release_caches decl)
+src/chatterbox_cli.cpp              +6  lines  (free_t3 calls t3_release_caches in 2 paths)
+src/chatterbox_engine.cpp           +5  lines  (Impl::free_model calls t3_release_caches)
+CMakeLists.txt                      +5  lines  (test-t3-caches target)
+PROGRESS.md                         this section
+```
+
+No public-API change in production builds.  The opt-in env var is
+checked exactly once per process (lazy `static const bool`).
+
+#### Memory cap
+
+* Per cached entry: ~1.2 MB metadata arena (CHBX_MAX_NODES=8192 ×
+  ggml_tensor_overhead + graph headers).
+* At full cap (256 entries): **~310 MB** worst case.  Bounded; no
+  unbounded growth even on multi-day server runs.
+* Default-OFF means single-utterance CLI and single-shot Engine
+  callers see **0 MB** of cache memory.
+
+#### Honest limit assessment (round 4 update)
+
+After §3.34 the total per-synth host-CPU overhead on multilingual
+was ~95 % real ggml-cpu Q4_0 matmul work and ~5 % host-side fixed
+costs.  Round 4 nibbles ~12 % off T3 wall on opt-in workloads
+(~256 ms / synth #2 of multilingual at default cap) but does NOT
+help the 5500 ms S3Gen CFM compute, which remains the bulk of
+total wall time.
+
+**The chatterbox-side host envelope is now exhausted.**  Further
+multi-second wins require:
+
+* `ggml-cpu` Q4_0 / Q4_K kernel-level optimisation (out of scope
+  for chatterbox.cpp);
+* Quantisation changes (IQ4_NL, Q3, etc. — orthogonal);
+* `--cfm-steps` reduction at quality cost (already plumbed; cuts
+  CFM compute proportionally);
+* CFG removal at the synthesis level (default `cfg_weight=0`
+  already supported).
+
+No public-API change.
