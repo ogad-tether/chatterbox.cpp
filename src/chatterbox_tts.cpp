@@ -177,6 +177,16 @@ struct s3gen_cache_entry { std::string path; int gpu = 0; std::unique_ptr<model_
 static std::mutex                            g_s3gen_cache_mu;
 static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
 static double                                g_s3gen_cache_last_load_ms = 0.0;
+
+// Refcount over the cache so multi-Engine hosts that share an S3Gen
+// GGUF (e.g. two chatterbox::Engine instances backing two
+// ChatterboxModels in the same Bare addon, both ::std::make_shared<>()d
+// per load()) don't have one Engine's destructor clobber the other
+// Engine's cached weights.  Bumped by s3gen_preload(), decremented
+// by s3gen_unload(); the actual cache release runs only when the
+// count reaches zero.  Independent of the mutex below so the unload
+// fast-path doesn't take it.
+static std::atomic<int>                      g_s3gen_cache_refcount{0};
 }  // namespace
 
 // Forward declaration: clear all per-synth caches.  The persistent
@@ -2879,6 +2889,7 @@ int s3gen_synthesize_to_wav(
 int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
     try {
         (void)s3gen_model_cache_get(s3gen_gguf_path, n_gpu_layers, /*verbose=*/false);
+        g_s3gen_cache_refcount.fetch_add(1, std::memory_order_acq_rel);
         return 0;
     } catch (const std::exception & e) {
         fprintf(stderr, "s3gen_preload: %s\n", e.what());
@@ -2887,6 +2898,23 @@ int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
 }
 
 void s3gen_unload() {
+    // Refcount-protected.  Multiple Engine instances can share the
+    // cache via repeated s3gen_preload calls; only the last unload
+    // actually releases the backend / weights.  Underflow (unload
+    // with no matching preload) is clamped at zero and runs a release
+    // anyway, which keeps idempotency for callers that follow the
+    // historical 'preload-once / unload-once-no-matter-what' pattern.
+    int prev = g_s3gen_cache_refcount.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev > 1) {
+        return;
+    }
+    if (prev <= 0) {
+        // Reset to zero so subsequent preload/unload pairs continue to
+        // work cleanly; without this, a second underflow would push
+        // the count further negative and a future preload would never
+        // be able to drive it back to zero.
+        g_s3gen_cache_refcount.store(0, std::memory_order_release);
+    }
     s3gen_model_cache_release();
 }
 
