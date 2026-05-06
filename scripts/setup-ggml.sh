@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-# Clone ggml into ./ggml, check out the commit this repo is pinned against,
-# and apply the Chatterbox Metal + (optional) OpenCL patches.  Re-running
-# resets the ggml worktree to the pin and reapplies both — local edits under
-# ./ggml are discarded.
+# Clone ggml into ./ggml at the commit this repo is pinned against, and
+# apply every patch under patches/ in lexicographic order.  Idempotent:
+# safe to re-run; local edits under ./ggml are discarded before patches
+# are re-applied.
 #
-# Update GGML_COMMIT when patches are re-generated against a newer upstream
-# ggml; this file is the single source of truth for the pin.
+# Update GGML_COMMIT here whenever the pin is bumped; this file is the
+# single source of truth for which upstream ggml chatterbox.cpp builds
+# against.  See patches/README.md for what each patch does.
 
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# The upstream ggml commit that patches/ggml-metal-chatterbox-ops.patch and
-# patches/ggml-opencl-chatterbox-ops.patch are authored against.
-# -----------------------------------------------------------------------------
 GGML_COMMIT="58c38058"
 GGML_URL="https://github.com/ggml-org/ggml.git"
 
@@ -26,38 +23,72 @@ if [ ! -d ggml/.git ]; then
     git clone "$GGML_URL" ggml
 fi
 
+# Find every patch under patches/ matching ggml-*.patch, sorted.
+shopt -s nullglob
+PATCHES=( "$REPO_ROOT"/patches/ggml-*.patch )
+shopt -u nullglob
+
 cd ggml
 
-echo "  → resetting to ${GGML_COMMIT} (discarding uncommitted changes under ./ggml)"
-git fetch origin 2>/dev/null || true
-git reset --hard "$GGML_COMMIT"
-# Remove untracked files (e.g. left over from a previously applied patch) so
-# reapply is deterministic; ggml/ is not intended for long-lived local work.
-git clean -fdq
+CURRENT="$(git rev-parse --short=8 HEAD 2>/dev/null || echo '')"
+NEED_CHECKOUT="0"
+if [ "$CURRENT" != "$GGML_COMMIT" ]; then
+    NEED_CHECKOUT="1"
+fi
 
-echo "  → applying patches/ggml-metal-chatterbox-ops.patch"
-git apply "$REPO_ROOT/patches/ggml-metal-chatterbox-ops.patch"
+if [ "$NEED_CHECKOUT" = "1" ]; then
+    git checkout -- . 2>/dev/null || true
+    git checkout "$GGML_COMMIT"
+    echo "  → ok, at $(git rev-parse --short=8 HEAD)"
+fi
 
-echo "  → applying patches/ggml-opencl-chatterbox-ops.patch"
-git apply "$REPO_ROOT/patches/ggml-opencl-chatterbox-ops.patch"
+# Apply patches.  We always reset to the pinned commit before applying so
+# this is fully idempotent: re-running the script never stacks patches on
+# top of patches.  We bail loudly on a real failure (CRLF in working
+# tree, conflict, ...) instead of silently linking against unpatched ggml.
+if [ ${#PATCHES[@]} -gt 0 ]; then
+    if [ "$NEED_CHECKOUT" = "0" ]; then
+        # Same commit as last run, but patches may already be applied;
+        # reset to pristine before re-applying.
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "  → resetting ggml worktree to pristine ${GGML_COMMIT}"
+            git checkout -- .
+        fi
+    fi
+    for patch in "${PATCHES[@]}"; do
+        name="$(basename "$patch")"
+        # Detect whether the patch has already been applied (idempotent
+        # re-run of the script). `git apply --reverse --check` succeeds
+        # iff every hunk reverses cleanly, which only happens when the
+        # patch is currently applied to the working tree.
+        if git apply --reverse --check "$patch" 2>/dev/null; then
+            echo "  → $name: already applied, skipping"
+            continue
+        fi
 
-# Persistent VkPipelineCache across processes.  Eliminates the
-# ~1-3 s shader-compile cost on every fresh chatterbox process when
-# building with -DGGML_VULKAN=ON.  Inert when configuring without
-# Vulkan.
-echo "  → applying patches/ggml-vulkan-pipeline-cache.patch"
-git apply "$REPO_ROOT/patches/ggml-vulkan-pipeline-cache.patch"
+        # Strip CR line endings from the patch on the fly. Windows checkouts
+        # with `core.autocrlf=true` (git's default on Windows) leave the
+        # patch as CRLF in the working tree even though it is LF in the
+        # index, and `git apply` then refuses with a context-mismatch
+        # error.  This converts on read instead of mutating the file.
+        sanitized="$(mktemp)"
+        # shellcheck disable=SC2064
+        trap "rm -f '$sanitized'" EXIT
+        tr -d '\r' < "$patch" > "$sanitized"
 
-# Write the pipeline cache back to disk after each ggml_vk_load_shaders
-# compile batch (crash-safety against SIGKILL/abort losing freshly
-# compiled pipelines).  Stacks on the persistent-cache patch above.
-echo "  → applying patches/ggml-vulkan-eager-cache-save.patch"
-git apply "$REPO_ROOT/patches/ggml-vulkan-eager-cache-save.patch"
+        echo "  → applying $name"
+        if ! git apply --check "$sanitized" 2>/tmp/setup-ggml-apply.err; then
+            echo "    ERROR: patch '$name' does not apply against ggml@${GGML_COMMIT}." >&2
+            sed 's/^/    /' /tmp/setup-ggml-apply.err >&2
+            echo "    Aborting so the build does not silently link unpatched ggml." >&2
+            rm -f /tmp/setup-ggml-apply.err
+            exit 1
+        fi
+        rm -f /tmp/setup-ggml-apply.err
+        git apply "$sanitized"
+    done
+fi
 
-N_METAL="$(git status --porcelain src/ggml-metal/ 2>/dev/null | wc -l | tr -d ' ')"
-N_OPENCL="$(git status --porcelain include/ggml-opencl.h src/ggml-opencl/ 2>/dev/null | wc -l | tr -d ' ')"
-N_VULKAN="$(git status --porcelain src/ggml-vulkan/ 2>/dev/null | wc -l | tr -d ' ')"
-echo "  → ok (Metal: ${N_METAL} paths touched, OpenCL: ${N_OPENCL} paths touched, Vulkan: ${N_VULKAN} paths touched under ggml/)"
 echo
 echo "ggml is ready.  Next:"
 echo "  Metal:   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON"
