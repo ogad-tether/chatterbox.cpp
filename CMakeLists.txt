@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.20)
 project(tts-cpp LANGUAGES C CXX VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -246,6 +246,31 @@ if (TTS_CPP_BUILD_LIBRARY)
     if (_tts_cpp_type STREQUAL "SHARED_LIBRARY")
         target_compile_definitions(tts-cpp PUBLIC  TTS_CPP_SHARED)
         target_compile_definitions(tts-cpp PRIVATE TTS_CPP_BUILD)
+    endif()
+
+    # Versioning: VERSION drives the SONAME suffix on Linux/macOS shared
+    # builds; SOVERSION 0 keeps the load-time name (libtts-cpp.so.0)
+    # stable across patch releases so consumers don't relink on every
+    # bump.  No effect on static / Windows builds.  Mirrors parakeet.cpp.
+    set_target_properties(tts-cpp PROPERTIES
+        VERSION   ${PROJECT_VERSION}
+        SOVERSION 0
+    )
+
+    # Release-mode optimisation flags.  GCC/clang use -O3 in CMake's
+    # default Release config already, but ffast-math + funroll-loops
+    # buy ~5-15% on the T3-dominated CPU path (~80% of wall time on
+    # M3 CPU per README's benchmarks).  Conditioned on non-MSVC; the
+    # MSVC default /O2 is good enough and these are GCC-syntax flags.
+    if (NOT MSVC AND (CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE))
+        target_compile_options(tts-cpp PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-O3>
+            $<$<COMPILE_LANGUAGE:C>:-O3>
+            $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>
+            $<$<COMPILE_LANGUAGE:C>:-ffast-math>
+            $<$<COMPILE_LANGUAGE:CXX>:-funroll-loops>
+            $<$<COMPILE_LANGUAGE:C>:-funroll-loops>
+        )
     endif()
 
     if (OpenMP_CXX_FOUND)
