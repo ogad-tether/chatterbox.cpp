@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(GNUInstallDirs)
+include(CheckIncludeFileCXX)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(TTS_CPP_STANDALONE_DEFAULT ON)
@@ -44,6 +45,13 @@ set(TTS_CPP_LIB_SOURCES
     src/campplus.cpp
     src/s3tokenizer.cpp
     src/t3_mtl.cpp
+    src/supertonic_gguf.cpp
+    src/supertonic_preprocess.cpp
+    src/supertonic_vocoder.cpp
+    src/supertonic_duration.cpp
+    src/supertonic_text_encoder.cpp
+    src/supertonic_vector_estimator.cpp
+    src/supertonic_engine.cpp
 )
 
 add_library(mtl_tokenizer STATIC src/mtl_tokenizer.cpp)
@@ -61,6 +69,7 @@ if (TTS_CPP_BUILD_LIBRARY)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src
     )
     target_compile_features(tts-cpp PUBLIC cxx_std_17)
     target_link_libraries(tts-cpp PUBLIC ggml)
@@ -103,6 +112,9 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     add_executable(mel2wav src/mel2wav.cpp)
     target_link_libraries(mel2wav PRIVATE ggml)
     target_include_directories(mel2wav PRIVATE ggml/include src)
+
+    add_executable(supertonic-cli src/supertonic_cli.cpp)
+    target_link_libraries(supertonic-cli PRIVATE tts-cpp)
 endif()
 
 if (TTS_CPP_BUILD_TESTS)
@@ -194,6 +206,62 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-metal-ops PRIVATE ggml/include src)
     if (GGML_METAL)
         target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
+    endif()
+
+    if (NOT TTS_CPP_BUILD_LIBRARY)
+        message(FATAL_ERROR "Supertonic tests require TTS_CPP_BUILD_LIBRARY=ON")
+    endif()
+
+    function(add_supertonic_harness target source)
+        add_executable(${target} ${source})
+        target_link_libraries(${target} PRIVATE tts-cpp)
+        target_include_directories(${target} PRIVATE ggml/include src include)
+    endfunction()
+
+    add_supertonic_harness(test-supertonic-preprocess src/test_supertonic_preprocess.cpp)
+    add_supertonic_harness(test-supertonic-vocoder src/test_supertonic_vocoder.cpp)
+    add_supertonic_harness(test-supertonic-vocoder-trace src/test_supertonic_vocoder_trace.cpp)
+    add_supertonic_harness(test-supertonic-vocoder-pointwise src/test_supertonic_vocoder_pointwise.cpp)
+    add_supertonic_harness(test-supertonic-duration src/test_supertonic_duration.cpp)
+    add_supertonic_harness(test-supertonic-duration-trace src/test_supertonic_duration_trace.cpp)
+    add_supertonic_harness(test-supertonic-text-encoder src/test_supertonic_text_encoder.cpp)
+    add_supertonic_harness(test-supertonic-text-encoder-trace src/test_supertonic_text_encoder_trace.cpp)
+    add_supertonic_harness(test-supertonic-vector src/test_supertonic_vector.cpp)
+    add_supertonic_harness(test-supertonic-vector-trace src/test_supertonic_vector_trace.cpp)
+    add_supertonic_harness(test-supertonic-pipeline src/test_supertonic_pipeline.cpp)
+    add_supertonic_harness(supertonic-bench src/supertonic_bench.cpp)
+endif()
+
+set(TTS_CPP_POINTWISE_ACCEL_TARGETS
+    tts-cpp
+    test-supertonic-vector
+    test-supertonic-vector-trace
+    test-supertonic-vocoder
+    test-supertonic-vocoder-trace
+    test-supertonic-vocoder-pointwise
+    test-supertonic-pipeline
+    supertonic-bench)
+
+if (APPLE)
+    find_library(TTS_CPP_ACCELERATE_FRAMEWORK Accelerate)
+    if (TTS_CPP_ACCELERATE_FRAMEWORK)
+        foreach(_tts_accel_target ${TTS_CPP_POINTWISE_ACCEL_TARGETS})
+            if (TARGET ${_tts_accel_target})
+                target_link_libraries(${_tts_accel_target} PRIVATE ${TTS_CPP_ACCELERATE_FRAMEWORK})
+                target_compile_definitions(${_tts_accel_target} PRIVATE TTS_CPP_USE_ACCELERATE)
+            endif()
+        endforeach()
+    endif()
+else()
+    check_include_file_cxx(cblas.h TTS_CPP_HAS_CBLAS_H)
+    find_package(BLAS)
+    if (TTS_CPP_HAS_CBLAS_H AND BLAS_FOUND)
+        foreach(_tts_cblas_target ${TTS_CPP_POINTWISE_ACCEL_TARGETS})
+            if (TARGET ${_tts_cblas_target})
+                target_link_libraries(${_tts_cblas_target} PRIVATE ${BLAS_LIBRARIES})
+                target_compile_definitions(${_tts_cblas_target} PRIVATE TTS_CPP_USE_CBLAS)
+            endif()
+        endforeach()
     endif()
 endif()
 

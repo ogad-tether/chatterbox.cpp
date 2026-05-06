@@ -56,6 +56,7 @@
 
 #include "tts-cpp/tts-cpp.h"
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
+#include "tts-cpp/supertonic/engine.h"
 #include "chatterbox_t3_internal.h"
 #include "t3_mtl.h"
 #include "npy.h"
@@ -321,6 +322,7 @@ struct cli_params {
     bool    verbose        = false;  // --verbose: per-stage profile timings (human-readable)
     bool    dump_tokens_only = false;
     int32_t seed           = 0;
+    bool    seed_set       = false;
     int32_t n_threads      = std::min(4, (int32_t) std::thread::hardware_concurrency());
     int32_t n_predict      = 1000;   // matches Python's default-ish output budget for paragraph-length text
     int32_t n_ctx          = 0;
@@ -346,6 +348,15 @@ struct cli_params {
     float       min_p        = 0.05f;  // minimum-probability warp (0 = off)
     std::string language;              // tier-1 lang code when variant = t3_mtl
     float       exaggeration = 0.5f;   // emotion_adv scalar (0..1)
+
+    // Supertonic-only knobs.  Supertonic stores built-in voices and default
+    // steps/speed in its single GGUF, so these are only meaningful when
+    // --model points at a GGUF with `supertonic.arch` metadata.
+    std::string supertonic_voice;
+    int32_t     supertonic_steps = 0;
+    float       supertonic_speed = 0.0f;
+    std::string supertonic_noise_npy;
+    bool        has_supertonic_options = false;
 
     // Streaming synthesis (PROGRESS.md B1).  When > 0, speech tokens from
     // T3 are fed to S3Gen+HiFT in chunks of this size, with `cache_source`
@@ -423,10 +434,10 @@ static int32_t sample_next_token(
 static void print_usage(const char * argv0) {
     fprintf(stderr, "usage: %s --model MODEL.gguf [--text TEXT | --tokens-file tokens.txt] [options]\n", argv0);
     fprintf(stderr, "\noptions:\n");
-    fprintf(stderr, "  --model PATH            GGUF model produced by convert-t3-turbo-to-gguf.py\n");
-    fprintf(stderr, "                          (must embed tokenizer.ggml.* metadata; produced by the\n");
-    fprintf(stderr, "                          current converter)\n");
-    fprintf(stderr, "  --text TEXT             Input text (uses the GPT-2 BPE tokenizer embedded in GGUF)\n");
+    fprintf(stderr, "  --model PATH            GGUF model. Chatterbox T3 GGUFs use --s3gen-gguf for\n");
+    fprintf(stderr, "                          full text -> wav; Supertonic GGUFs are all-in-one and\n");
+    fprintf(stderr, "                          autodetected from supertonic.arch metadata.\n");
+    fprintf(stderr, "  --text TEXT             Input text.\n");
     fprintf(stderr, "  --tokens-file PATH      Pre-tokenized text token ids (alternative to --text).\n");
     fprintf(stderr, "                          With --s3gen-gguf this is interpreted as *speech* tokens\n");
     fprintf(stderr, "                          and the T3 step is skipped.\n");
@@ -469,6 +480,12 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "multilingual (variant=t3_mtl) options:\n");
     fprintf(stderr, "  --language CODE         Required for t3_mtl GGUFs. Tier-1: en, es, fr, de, it,\n");
     fprintf(stderr, "                          pt, nl, pl, tr, sv, da, fi, no, el, ms, sw, ar, ko.\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Supertonic options (when --model has supertonic.arch metadata):\n");
+    fprintf(stderr, "  --voice NAME            Built-in Supertonic voice name. Defaults to GGUF metadata.\n");
+    fprintf(stderr, "  --steps N               Denoising steps. Defaults to GGUF metadata.\n");
+    fprintf(stderr, "  --speed X               Duration speed multiplier. Defaults to GGUF metadata.\n");
+    fprintf(stderr, "  --noise-npy PATH        Fixed initial noise tensor for parity/debug runs.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --stream-chunk-tokens N Synthesize the wav in streaming chunks of N speech\n");
     fprintf(stderr, "                          tokens each (~1 s audio per 25-token chunk).  With\n");
@@ -572,7 +589,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--save-voice")     { auto v = next("--save-voice");     if (!v) return false; params.save_voice_dir = v; }
         else if (arg == "--debug")          { params.debug = true; }
         else if (arg == "--verbose" || arg == "-v") { params.verbose = true; }
-        else if (arg == "--seed")           { if (!parse_int  ("--seed",           params.seed))           return false; }
+        else if (arg == "--seed")           { if (!parse_int  ("--seed",           params.seed))           return false; params.seed_set = true; }
         else if (arg == "--threads")        { if (!parse_int  ("--threads",        params.n_threads))      return false; }
         else if (arg == "--n-predict")      { if (!parse_int  ("--n-predict",      params.n_predict))      return false; }
         else if (arg == "--context")        { if (!parse_int  ("--context",        params.n_ctx))          return false; }
@@ -603,6 +620,10 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
             }
         }
         else if (arg == "--language")       { auto v = next("--language");       if (!v) return false; params.language = v; }
+        else if (arg == "--voice")          { auto v = next("--voice");          if (!v) return false; params.supertonic_voice = v; params.has_supertonic_options = true; }
+        else if (arg == "--steps")          { if (!parse_int  ("--steps",          params.supertonic_steps)) return false; params.has_supertonic_options = true; }
+        else if (arg == "--speed")          { if (!parse_float("--speed",          params.supertonic_speed)) return false; params.has_supertonic_options = true; }
+        else if (arg == "--noise-npy")      { auto v = next("--noise-npy");      if (!v) return false; params.supertonic_noise_npy = v; params.has_supertonic_options = true; }
         else if (arg == "--cfm-f16-kv-attn") { params.cfm_f16_kv_attn = true; }
         else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
@@ -716,6 +737,95 @@ static void write_token_file(const std::string & path, const std::vector<int32_t
 // --------------------------------------------------------------------------
 // GGUF helpers
 
+enum class cli_model_family {
+    unknown,
+    chatterbox,
+    supertonic,
+};
+
+static cli_model_family detect_model_family(const std::string & path) {
+    if (path.empty()) return cli_model_family::unknown;
+    gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) return cli_model_family::unknown;
+
+    cli_model_family family = cli_model_family::unknown;
+    if (gguf_find_key(g, "supertonic.arch") >= 0) {
+        family = cli_model_family::supertonic;
+    } else if (gguf_find_key(g, KEY_VARIANT) >= 0 ||
+               gguf_find_key(g, KEY_TEXT_VOCAB_SIZE) >= 0 ||
+               gguf_find_key(g, "tokenizer.ggml.tokens") >= 0) {
+        family = cli_model_family::chatterbox;
+    }
+    gguf_free(g);
+    return family;
+}
+
+static bool path_looks_supertonic(const std::string & path) {
+    std::string lower = path;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return (char) std::tolower(c); });
+    return lower.find("supertonic") != std::string::npos;
+}
+
+static int run_supertonic_cli_path(const cli_params & params) {
+    if (!params.tokens_file.empty()) {
+        fprintf(stderr, "error: Supertonic does not support --tokens-file; pass --text instead.\n");
+        return 1;
+    }
+    if (!params.output.empty()) {
+        fprintf(stderr, "error: Supertonic does not support --output token files; use --out PATH.wav.\n");
+        return 1;
+    }
+    if (!params.s3gen_gguf.empty() || !params.ref_dir.empty() || !params.reference_audio.empty() ||
+        !params.save_voice_dir.empty() || params.debug || !params.input_file.empty() ||
+        params.stream_chunk_tokens > 0 || params.stream_first_chunk_tokens > 0 ||
+        params.stream_cfm_steps > 0 || params.dump_tokens_only) {
+        fprintf(stderr,
+                "error: Supertonic GGUFs are all-in-one models; --s3gen-gguf, voice-cloning,\n"
+                "       token streaming, --input-file, and debug reference-directory modes are\n"
+                "       Chatterbox-only in tts-cli.\n");
+        return 1;
+    }
+    if (params.text.empty()) {
+        fprintf(stderr, "error: Supertonic requires --text TEXT\n");
+        return 1;
+    }
+    if (params.out_wav.empty()) {
+        fprintf(stderr, "error: Supertonic requires --out PATH.wav\n");
+        return 1;
+    }
+    if (params.out_wav == "-") {
+        fprintf(stderr, "error: Supertonic does not support --out - streaming yet; pass a wav path.\n");
+        return 1;
+    }
+    if (params.supertonic_steps < 0) {
+        fprintf(stderr, "error: --steps must be >= 0 for Supertonic\n");
+        return 1;
+    }
+    if (params.supertonic_speed < 0.0f) {
+        fprintf(stderr, "error: --speed must be >= 0 for Supertonic\n");
+        return 1;
+    }
+
+    tts_cpp::supertonic::EngineOptions opts;
+    opts.model_gguf_path = params.model;
+    opts.voice = params.supertonic_voice;
+    opts.language = params.language.empty() ? "en" : params.language;
+    opts.steps = params.supertonic_steps;
+    opts.speed = params.supertonic_speed;
+    if (params.seed_set) opts.seed = params.seed;
+    opts.n_threads = params.n_threads;
+    opts.n_gpu_layers = params.n_gpu_layers;
+    opts.noise_npy_path = params.supertonic_noise_npy;
+
+    auto result = tts_cpp::supertonic::synthesize(opts, params.text);
+    stream_write_wav(params.out_wav, result.pcm, result.sample_rate);
+    fprintf(stderr, "wrote %s (%.2fs @ %d Hz, %zu samples)\n",
+            params.out_wav.c_str(), result.duration_s, result.sample_rate, result.pcm.size());
+    return 0;
+}
+
 int tts_cpp_cli_main(int argc, char ** argv) {
     ggml_time_init();
     cli_params params;
@@ -734,6 +844,20 @@ int tts_cpp_cli_main(int argc, char ** argv) {
     ggml_log_set(chatterbox_log_cb, nullptr);
 
     try {
+        const cli_model_family family = file_exists(params.model)
+            ? detect_model_family(params.model)
+            : cli_model_family::unknown;
+        if (family == cli_model_family::supertonic ||
+            (family == cli_model_family::unknown && path_looks_supertonic(params.model))) {
+            return run_supertonic_cli_path(params);
+        }
+        if (params.has_supertonic_options) {
+            fprintf(stderr,
+                    "error: --voice / --steps / --speed / --noise-npy are Supertonic-only options,\n"
+                    "       but --model was not detected as a Supertonic GGUF.\n");
+            return 1;
+        }
+
         // Early preflight: if the user supplied --reference-audio, make sure
         // it's long enough for real voice cloning.  Bail out now with a clear
         // message instead of silently falling back on the built-in voice when
