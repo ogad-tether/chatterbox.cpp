@@ -1,6 +1,7 @@
 #include "supertonic_internal.h"
 
 #include "ggml-cpu.h"
+#include "ggml-quants.h"
 #include "gguf.h"
 
 #ifdef GGML_USE_CUDA
@@ -17,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <stdexcept>
 #include <thread>
@@ -64,6 +66,27 @@ std::vector<std::string> get_string_array(const gguf_context * ctx, const char *
 ggml_tensor * get_tensor_or_null(const supertonic_model & model, const std::string & name) {
     auto it = model.tensors.find(name);
     return it == model.tensors.end() ? nullptr : it->second;
+}
+
+bool should_expand_supertonic_tensor(enum ggml_type type) {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0;
+}
+
+std::vector<float> expand_supertonic_tensor_to_f32(const ggml_tensor * src) {
+    const int64_t n = ggml_nelements(src);
+    std::vector<float> out((size_t) n);
+    const void * data = ggml_get_data(src);
+    switch (src->type) {
+        case GGML_TYPE_F16:
+            ggml_fp16_to_fp32_row(static_cast<const ggml_fp16_t *>(data), out.data(), n);
+            break;
+        case GGML_TYPE_Q8_0:
+            dequantize_row_q8_0(static_cast<const block_q8_0 *>(data), out.data(), n);
+            break;
+        default:
+            throw std::runtime_error("unsupported Supertonic tensor expansion type");
+    }
+    return out;
 }
 
 ggml_backend_t init_supertonic_backend(int n_gpu_layers, bool verbose) {
@@ -140,6 +163,11 @@ void print_supertonic_setup_hint() {
             "  bash scripts/setup-supertonic2.sh --arch supertonic\n");
 }
 
+uint64_t next_supertonic_generation_id() {
+    static std::atomic<uint64_t> next_id{1};
+    return next_id.fetch_add(1, std::memory_order_relaxed);
+}
+
 } // namespace
 
 ggml_tensor * require_tensor(const supertonic_model & model, const std::string & name) {
@@ -206,6 +234,7 @@ bool load_supertonic_gguf(const std::string & path,
                           supertonic_model & model,
                           int n_gpu_layers,
                           bool verbose) {
+    model.generation_id = next_supertonic_generation_id();
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gp);
@@ -251,13 +280,19 @@ bool load_supertonic_gguf(const std::string & path,
         model.ctx_w = ggml_init(params);
         if (!model.ctx_w) throw std::runtime_error("ggml_init failed");
 
+        std::unordered_map<std::string, std::vector<float>> expanded_f32_tensors;
         for (int64_t i = 0; i < num_tensors; ++i) {
             const char * name = gguf_get_tensor_name(gguf_ctx, i);
             ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
             if (!src) throw std::runtime_error(std::string("missing tmp tensor: ") + name);
-            ggml_tensor * dst = ggml_dup_tensor(model.ctx_w, src);
+            ggml_tensor * dst = should_expand_supertonic_tensor(src->type)
+                ? ggml_new_tensor(model.ctx_w, GGML_TYPE_F32, ggml_n_dims(src), src->ne)
+                : ggml_dup_tensor(model.ctx_w, src);
             ggml_set_name(dst, name);
             model.tensors[name] = dst;
+            if (should_expand_supertonic_tensor(src->type)) {
+                expanded_f32_tensors[name] = expand_supertonic_tensor_to_f32(src);
+            }
         }
 
         model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
@@ -267,7 +302,13 @@ bool load_supertonic_gguf(const std::string & path,
              cur;
              cur = ggml_get_next_tensor(model.ctx_w, cur)) {
             ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
-            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+            auto expanded = expanded_f32_tensors.find(ggml_get_name(cur));
+            if (expanded != expanded_f32_tensors.end()) {
+                ggml_backend_tensor_set(cur, expanded->second.data(), 0,
+                                        expanded->second.size() * sizeof(float));
+            } else {
+                ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+            }
         }
 
         {
@@ -328,6 +369,7 @@ void free_supertonic_model(supertonic_model & model) {
     model.unicode_indexer.clear();
     model.languages.clear();
     model.tts_json.clear();
+    model.generation_id = 0;
 }
 
 } // namespace tts_cpp::supertonic::detail

@@ -7,8 +7,14 @@
 
 #include "chatterbox_t3_internal.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 
 namespace tts_cpp::chatterbox::detail {
+
+// Phase 15: drop a (buffer_stack, ctx_stack) pair from the process-wide
+// atexit registry. Called from main()'s free_t3() lambda on error-path
+// early-returns so we don't double-free at process exit.
+void t3_stack_unregister(ggml_backend_buffer_t buf, ggml_context * ctx);
 
 // Each builder returns a ggml_cgraph*; the caller uses ggml_gallocr_reserve +
 // alloc_graph and sets input tensors by name before compute.

@@ -71,6 +71,7 @@ struct supertonic_model {
     supertonic_hparams hparams;
     supertonic_vocoder_weights vocoder;
 
+    uint64_t generation_id = 0;
     int n_threads = 0;
     ggml_backend_t backend = nullptr;
     ggml_context * ctx_w = nullptr;

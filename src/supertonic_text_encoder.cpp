@@ -382,6 +382,7 @@ void relpos_attention(const supertonic_model & m, int idx, std::vector<float> & 
 
 struct text_relpos_graph_cache {
     const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
     int idx = -1;
     int L = 0;
     int C = 0;
@@ -406,6 +407,7 @@ void build_relpos_cache(text_relpos_graph_cache & cache,
                         int C) {
     free_relpos_cache(cache);
     cache.model = &m;
+    cache.generation_id = m.generation_id;
     cache.idx = idx;
     cache.L = L;
     cache.C = C;
@@ -507,7 +509,8 @@ void relpos_attention_ggml(const supertonic_model & m, int idx,
     if (idx < 0 || idx >= 4) throw std::runtime_error("invalid text relpos layer index");
     thread_local text_relpos_graph_cache caches[4];
     text_relpos_graph_cache & cache = caches[idx];
-    if (cache.model != &m || cache.idx != idx || cache.L != L || cache.C != C) {
+    if (cache.model != &m || cache.generation_id != m.generation_id ||
+        cache.idx != idx || cache.L != L || cache.C != C) {
         build_relpos_cache(cache, m, idx, L, C);
     }
     std::vector<float> x_raw = pack_time_channel_for_ggml(x_lc, L, C);
@@ -531,6 +534,7 @@ void ffn_block(const supertonic_model & m, int idx, std::vector<float> & x, int 
 
 struct text_ffn_graph_cache {
     const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
     int idx = -1;
     int L = 0;
     int C = 0;
@@ -554,6 +558,7 @@ void build_ffn_cache(text_ffn_graph_cache & cache,
                      int C) {
     free_ffn_cache(cache);
     cache.model = &m;
+    cache.generation_id = m.generation_id;
     cache.idx = idx;
     cache.L = L;
     cache.C = C;
@@ -587,7 +592,8 @@ void ffn_block_ggml(const supertonic_model & m, int idx, std::vector<float> & x,
     if (idx < 0 || idx >= 4) throw std::runtime_error("invalid text ffn layer index");
     thread_local text_ffn_graph_cache caches[4];
     text_ffn_graph_cache & cache = caches[idx];
-    if (cache.model != &m || cache.idx != idx || cache.L != L || cache.C != C) {
+    if (cache.model != &m || cache.generation_id != m.generation_id ||
+        cache.idx != idx || cache.L != L || cache.C != C) {
         build_ffn_cache(cache, m, idx, L, C);
     }
     std::vector<float> raw = pack_time_channel_for_ggml(x, L, C);
@@ -668,6 +674,7 @@ void speech_prompted_attention(const supertonic_model & m, int idx,
 
 struct speech_attention_cache {
     const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
     int idx = -1;
     int L = 0;
     int Lctx = 0;
@@ -697,6 +704,7 @@ void build_speech_attention_cache(speech_attention_cache & cache,
                                   const std::string & out_b_source) {
     free_speech_attention_cache(cache);
     cache.model = &m;
+    cache.generation_id = m.generation_id;
     cache.idx = idx;
     cache.L = L;
     cache.Lctx = Lctx;
@@ -763,9 +771,13 @@ void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
     ggml_set_name(v, "speech_attn_v"); ggml_set_output(v); ggml_build_forward_expand(gf, v);
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    if (!allocr) throw std::runtime_error("ggml_gallocr_new speech text attention failed");
+    if (!allocr) {
+        ggml_free(ctx);
+        throw std::runtime_error("ggml_gallocr_new speech text attention failed");
+    }
     if (!ggml_gallocr_reserve(allocr, gf)) {
         ggml_gallocr_free(allocr);
+        ggml_free(ctx);
         throw std::runtime_error("ggml_gallocr_reserve speech text attention failed");
     }
     ggml_gallocr_alloc_graph(allocr, gf);
@@ -796,7 +808,8 @@ void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
     }
     thread_local speech_attention_cache caches[2];
     speech_attention_cache & cache = caches[idx];
-    if (cache.model != &m || cache.idx != idx || cache.L != L || cache.Lctx != Lctx ||
+    if (cache.model != &m || cache.generation_id != m.generation_id ||
+        cache.idx != idx || cache.L != L || cache.Lctx != Lctx ||
         cache.out_w_source != o_w || cache.out_b_source != p + ".out_fc.linear.bias") {
         build_speech_attention_cache(cache, m, idx, L, Lctx, o_w, p + ".out_fc.linear.bias");
     }
@@ -807,6 +820,7 @@ void speech_prompted_attention_ggml(const supertonic_model & m, int idx,
     profile_text_compute(m, cache.gf, flash_island.c_str());
     out_lc = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "speech_attn_out"));
     ggml_gallocr_free(allocr);
+    ggml_free(ctx);
 }
 
 } // namespace
@@ -909,9 +923,13 @@ bool supertonic_text_encoder_forward_ggml(const supertonic_model & model,
         ggml_set_name(y, "text_encoder_convnext5"); ggml_set_output(y);
         ggml_build_forward_expand(gf, y);
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!allocr) throw std::runtime_error("ggml_gallocr_new text encoder failed");
+        if (!allocr) {
+            ggml_free(ctx);
+            throw std::runtime_error("ggml_gallocr_new text encoder failed");
+        }
         if (!ggml_gallocr_reserve(allocr, gf)) {
             ggml_gallocr_free(allocr);
+            ggml_free(ctx);
             throw std::runtime_error("ggml_gallocr_reserve text encoder failed");
         }
         ggml_gallocr_alloc_graph(allocr, gf);
@@ -920,6 +938,7 @@ bool supertonic_text_encoder_forward_ggml(const supertonic_model & model,
         profile_text_compute(model, gf, "convnext_front");
         x = tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_convnext5"));
         ggml_gallocr_free(allocr);
+        ggml_free(ctx);
         profile_text_checkpoint("convnext_readback");
 
         // The text encoder's relative-position and speech-prompted attention
@@ -1039,9 +1058,13 @@ bool supertonic_text_encoder_trace_ggml(const supertonic_model & model,
         v = ggml_add(ctx, v, repeat_like(ctx, require_source_tensor(model, "text_encoder:tts.ttl.text_encoder.attn_encoder.attn_layers.0.conv_v.bias"), v));
         ggml_set_name(v, "text_encoder_attn0_v"); ggml_set_output(v); ggml_build_forward_expand(gf, v);
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!allocr) throw std::runtime_error("ggml_gallocr_new text encoder failed");
+        if (!allocr) {
+            ggml_free(ctx);
+            throw std::runtime_error("ggml_gallocr_new text encoder failed");
+        }
         if (!ggml_gallocr_reserve(allocr, gf)) {
             ggml_gallocr_free(allocr);
+            ggml_free(ctx);
             throw std::runtime_error("ggml_gallocr_reserve text encoder failed");
         }
         ggml_gallocr_alloc_graph(allocr, gf);
@@ -1057,6 +1080,7 @@ bool supertonic_text_encoder_trace_ggml(const supertonic_model & model,
         ggml_trace.push_back({"text_encoder_attn0_k", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_attn0_k"))});
         ggml_trace.push_back({"text_encoder_attn0_v", {L, C}, tensor_to_time_channel(ggml_graph_get_tensor(gf, "text_encoder_attn0_v"))});
         ggml_gallocr_free(allocr);
+        ggml_free(ctx);
         auto vit = model.voices.find(model.hparams.default_voice);
         if (vit != model.voices.end()) {
             std::vector<float> style_ttl((size_t)ggml_nelements(vit->second.ttl));

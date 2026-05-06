@@ -338,6 +338,7 @@ ggml_tensor * convnext_block_ggml(ggml_context * ctx,
 
 struct vocoder_graph_cache {
     const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
     int latent_len = 0;
     std::vector<uint8_t> buf;
     ggml_context * ctx = nullptr;
@@ -360,6 +361,7 @@ void build_supertonic_vocoder_cache(vocoder_graph_cache & cache,
                                     int latent_len) {
     free_vocoder_cache(cache);
     cache.model = &model;
+    cache.generation_id = model.generation_id;
     cache.latent_len = latent_len;
     const int C_latent = model.hparams.latent_dim;
     const int T0 = latent_len * model.hparams.ttl_chunk_compress_factor;
@@ -717,7 +719,8 @@ bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
         profile_vocoder_checkpoint("bn_params", profile_last);
 
         thread_local vocoder_graph_cache cache;
-        if (cache.model != &model || cache.latent_len != latent_len) {
+        if (cache.model != &model || cache.generation_id != model.generation_id ||
+            cache.latent_len != latent_len) {
             build_supertonic_vocoder_cache(cache, model, latent_len);
         }
         profile_vocoder_checkpoint("graph_cache", profile_last);
@@ -925,9 +928,13 @@ bool supertonic_vocoder_trace_ggml(const supertonic_model & model,
         ggml_build_forward_expand(gf, cur);
 
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!allocr) throw std::runtime_error("ggml_gallocr_new failed");
+        if (!allocr) {
+            ggml_free(ctx);
+            throw std::runtime_error("ggml_gallocr_new failed");
+        }
         if (!ggml_gallocr_reserve(allocr, gf)) {
             ggml_gallocr_free(allocr);
+            ggml_free(ctx);
             throw std::runtime_error("ggml_gallocr_reserve failed");
         }
         ggml_gallocr_alloc_graph(allocr, gf);
@@ -965,6 +972,7 @@ bool supertonic_vocoder_trace_ggml(const supertonic_model & model,
         trace_out.push_back({"prelu", {T0, (int) model.vocoder.head1_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "prelu"))});
         trace_out.push_back({"wav", {T0, (int) model.vocoder.head2_w->ne[2]}, ggml_tensor_to_time_channel(ggml_graph_get_tensor(gf, "wav"))});
         ggml_gallocr_free(allocr);
+        ggml_free(ctx);
         if (error) error->clear();
         return true;
     } catch (const std::exception & e) {

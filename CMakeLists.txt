@@ -69,6 +69,7 @@ if (TTS_CPP_BUILD_LIBRARY)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src
     )
     target_compile_features(tts-cpp PUBLIC cxx_std_17)
     target_link_libraries(tts-cpp PUBLIC ggml)
@@ -207,96 +208,28 @@ if (TTS_CPP_BUILD_TESTS)
         target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
     endif()
 
-    add_executable(test-supertonic-preprocess
-        src/test_supertonic_preprocess.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_preprocess.cpp)
-    target_link_libraries(test-supertonic-preprocess PRIVATE ggml)
-    target_include_directories(test-supertonic-preprocess PRIVATE ggml/include src)
+    if (NOT TTS_CPP_BUILD_LIBRARY)
+        message(FATAL_ERROR "Supertonic tests require TTS_CPP_BUILD_LIBRARY=ON")
+    endif()
 
-    add_executable(test-supertonic-vocoder
-        src/test_supertonic_vocoder.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_vocoder.cpp)
-    target_link_libraries(test-supertonic-vocoder PRIVATE ggml)
-    target_include_directories(test-supertonic-vocoder PRIVATE ggml/include src)
+    function(add_supertonic_harness target source)
+        add_executable(${target} ${source})
+        target_link_libraries(${target} PRIVATE tts-cpp)
+        target_include_directories(${target} PRIVATE ggml/include src include)
+    endfunction()
 
-    add_executable(test-supertonic-vocoder-trace
-        src/test_supertonic_vocoder_trace.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_vocoder.cpp)
-    target_link_libraries(test-supertonic-vocoder-trace PRIVATE ggml)
-    target_include_directories(test-supertonic-vocoder-trace PRIVATE ggml/include src)
-
-    add_executable(test-supertonic-vocoder-pointwise
-        src/test_supertonic_vocoder_pointwise.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_vocoder.cpp)
-    target_link_libraries(test-supertonic-vocoder-pointwise PRIVATE ggml)
-    target_include_directories(test-supertonic-vocoder-pointwise PRIVATE ggml/include src)
-
-    add_executable(test-supertonic-duration
-        src/test_supertonic_duration.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_duration.cpp)
-    target_link_libraries(test-supertonic-duration PRIVATE ggml)
-    target_include_directories(test-supertonic-duration PRIVATE ggml/include src)
-
-    add_executable(test-supertonic-duration-trace
-        src/test_supertonic_duration_trace.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_duration.cpp)
-    target_link_libraries(test-supertonic-duration-trace PRIVATE ggml)
-    target_include_directories(test-supertonic-duration-trace PRIVATE ggml/include src)
-
-    add_executable(test-supertonic-text-encoder
-        src/test_supertonic_text_encoder.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_text_encoder.cpp)
-    target_link_libraries(test-supertonic-text-encoder PRIVATE ggml)
-    target_include_directories(test-supertonic-text-encoder PRIVATE ggml/include src)
-
-    add_executable(test-supertonic-text-encoder-trace
-        src/test_supertonic_text_encoder_trace.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_text_encoder.cpp)
-    target_link_libraries(test-supertonic-text-encoder-trace PRIVATE ggml)
-    target_include_directories(test-supertonic-text-encoder-trace PRIVATE ggml/include src)
-
-    add_executable(test-supertonic-vector
-        src/test_supertonic_vector.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_vector_estimator.cpp)
-    target_link_libraries(test-supertonic-vector PRIVATE ggml)
-    target_include_directories(test-supertonic-vector PRIVATE ggml/include src)
-
-    add_executable(test-supertonic-vector-trace
-        src/test_supertonic_vector_trace.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_vector_estimator.cpp)
-    target_link_libraries(test-supertonic-vector-trace PRIVATE ggml)
-    target_include_directories(test-supertonic-vector-trace PRIVATE ggml/include src)
-
-    add_executable(test-supertonic-pipeline
-        src/test_supertonic_pipeline.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_preprocess.cpp
-        src/supertonic_text_encoder.cpp
-        src/supertonic_vector_estimator.cpp
-        src/supertonic_vocoder.cpp)
-    target_link_libraries(test-supertonic-pipeline PRIVATE ggml)
-    target_include_directories(test-supertonic-pipeline PRIVATE ggml/include src)
-
-    add_executable(supertonic-bench
-        src/supertonic_bench.cpp
-        src/supertonic_gguf.cpp
-        src/supertonic_preprocess.cpp
-        src/supertonic_duration.cpp
-        src/supertonic_text_encoder.cpp
-        src/supertonic_vector_estimator.cpp
-        src/supertonic_vocoder.cpp)
-    target_link_libraries(supertonic-bench PRIVATE ggml)
-    target_include_directories(supertonic-bench PRIVATE ggml/include src)
+    add_supertonic_harness(test-supertonic-preprocess src/test_supertonic_preprocess.cpp)
+    add_supertonic_harness(test-supertonic-vocoder src/test_supertonic_vocoder.cpp)
+    add_supertonic_harness(test-supertonic-vocoder-trace src/test_supertonic_vocoder_trace.cpp)
+    add_supertonic_harness(test-supertonic-vocoder-pointwise src/test_supertonic_vocoder_pointwise.cpp)
+    add_supertonic_harness(test-supertonic-duration src/test_supertonic_duration.cpp)
+    add_supertonic_harness(test-supertonic-duration-trace src/test_supertonic_duration_trace.cpp)
+    add_supertonic_harness(test-supertonic-text-encoder src/test_supertonic_text_encoder.cpp)
+    add_supertonic_harness(test-supertonic-text-encoder-trace src/test_supertonic_text_encoder_trace.cpp)
+    add_supertonic_harness(test-supertonic-vector src/test_supertonic_vector.cpp)
+    add_supertonic_harness(test-supertonic-vector-trace src/test_supertonic_vector_trace.cpp)
+    add_supertonic_harness(test-supertonic-pipeline src/test_supertonic_pipeline.cpp)
+    add_supertonic_harness(supertonic-bench src/supertonic_bench.cpp)
 endif()
 
 set(TTS_CPP_POINTWISE_ACCEL_TARGETS

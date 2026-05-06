@@ -542,9 +542,13 @@ static bool duration_sentence_proj_ggml_impl(const supertonic_model & model,
         ggml_set_name(v, "duration_attn0_v"); ggml_set_output(v); ggml_build_forward_expand(gf, v);
 
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!allocr) throw std::runtime_error("ggml_gallocr_new duration failed");
+        if (!allocr) {
+            ggml_free(ctx);
+            throw std::runtime_error("ggml_gallocr_new duration failed");
+        }
         if (!ggml_gallocr_reserve(allocr, gf)) {
             ggml_gallocr_free(allocr);
+            ggml_free(ctx);
             throw std::runtime_error("ggml_gallocr_reserve duration failed");
         }
         ggml_gallocr_alloc_graph(allocr, gf);
@@ -672,6 +676,7 @@ static bool duration_sentence_proj_ggml_impl(const supertonic_model & model,
               192, 128, h_g);
         PUSH_DURATION_GGML({"duration_pred0_no_style", {1, 128}, h_g});
         ggml_gallocr_free(allocr);
+        ggml_free(ctx);
         if (error) error->clear();
 #undef PUSH_DURATION_GGML
         return true;

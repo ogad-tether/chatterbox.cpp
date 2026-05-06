@@ -731,13 +731,11 @@ std::vector<int32_t> mtl_tokenizer::encode(const std::string & text,
 }
 
 // Best-effort decoder for debugging.  Joins regular tokens with a space and
-// expands [SPACE] tokens.  Note: the `k > 0` guard avoids a leading space on
-// the first token, but if the first id(s) are special markers ([START],
-// [PAD], …) and skipped, the *first emitted* regular token still gets a
-// leading space because k has already advanced.  That diverges slightly from
-// the Python reference's `decode`, which trims leading whitespace.  Cosmetic
-// and only ever fires on the debug path; real synthesis only round-trips
-// through `encode()` which never returns special-token-prefixed sequences.
+// expands [SPACE] tokens.  The `!out.empty()` guard avoids a leading space
+// on the first emitted regular token even when the first id(s) are skipped
+// special markers ([START], [PAD], …) — matching the Python reference's
+// `decode`, which strips leading whitespace.  Real synthesis only
+// round-trips through `encode()`; this path is debug-only.
 std::string mtl_tokenizer::decode(const std::vector<int32_t> & ids) const {
     std::string out;
     out.reserve(ids.size() * 2);
@@ -750,7 +748,7 @@ std::string mtl_tokenizer::decode(const std::vector<int32_t> & ids) const {
             continue;
         }
         if (tok == "[START]" || tok == "[STOP]" || tok == "[UNK]" || tok == "[PAD]") continue;
-        if (k > 0) out.push_back(' ');
+        if (!out.empty()) out.push_back(' ');
         out += tok;
     }
     return out;

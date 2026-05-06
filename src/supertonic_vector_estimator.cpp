@@ -573,18 +573,22 @@ std::vector<float> pack_time_channel_for_ggml(const std::vector<float> & x, int 
 struct vector_static_layout_cache {
     const float * text_emb = nullptr;
     int text_len = 0;
+    uint64_t text_generation_id = 0;
     std::vector<float> text_lc_host;
 
     const float * style_ttl = nullptr;
     const supertonic_model * model = nullptr;
+    uint64_t style_generation_id = 0;
     std::vector<float> style_v_raw;
     std::vector<float> kctx_raw;
 };
 
-const std::vector<float> & cached_text_lc(const float * text_emb, int text_len) {
+const std::vector<float> & cached_text_lc(const supertonic_model & model, const float * text_emb, int text_len) {
     thread_local vector_static_layout_cache cache;
-    if (cache.text_emb != text_emb || cache.text_len != text_len) {
+    if (cache.text_emb != text_emb || cache.text_generation_id != model.generation_id ||
+        cache.text_len != text_len) {
         cache.text_emb = text_emb;
+        cache.text_generation_id = model.generation_id;
         cache.text_len = text_len;
         cache.text_lc_host.assign((size_t)text_len * 256, 0.0f);
         for (int c = 0; c < 256; ++c) {
@@ -601,9 +605,11 @@ void cached_style_layouts(const supertonic_model & model,
                           const std::vector<float> *& style_v_raw,
                           const std::vector<float> *& kctx_raw) {
     thread_local vector_static_layout_cache cache;
-    if (cache.style_ttl != style_ttl || cache.model != &model) {
+    if (cache.style_ttl != style_ttl || cache.model != &model ||
+        cache.style_generation_id != model.generation_id) {
         cache.style_ttl = style_ttl;
         cache.model = &model;
+        cache.style_generation_id = model.generation_id;
         cache.style_v_raw.assign((size_t)50 * 256, 0.0f);
         cache.kctx_raw.assign((size_t)50 * 256, 0.0f);
         auto kconst = read_f32(model, "vector_estimator:/Expand_output_0");
@@ -620,6 +626,7 @@ void cached_style_layouts(const supertonic_model & model,
 
 struct vector_text_attention_cache {
     const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
     int q_len = 0;
     int kv_len = 0;
     int n_heads = 0;
@@ -651,6 +658,7 @@ void build_text_attention_cache(vector_text_attention_cache & cache,
                                 const std::string & out_b_source) {
     free_text_attention_cache(cache);
     cache.model = &model;
+    cache.generation_id = model.generation_id;
     cache.q_len = q_len;
     cache.kv_len = kv_len;
     cache.n_heads = n_heads;
@@ -717,7 +725,8 @@ std::vector<float> run_text_attention_cache(vector_text_attention_cache & cache,
                                             int current_step,
                                             const char * island,
                                             std::vector<float> * ctx_trace) {
-    if (cache.model != &model || cache.q_len != q_len || cache.kv_len != kv_len ||
+    if (cache.model != &model || cache.generation_id != model.generation_id ||
+        cache.q_len != q_len || cache.kv_len != kv_len ||
         cache.n_heads != n_heads || cache.head_dim != head_dim ||
         cache.out_w_source != out_w_source || cache.out_b_source != out_b_source) {
         build_text_attention_cache(cache, model, q_len, kv_len, n_heads, head_dim, out_w_source, out_b_source);
@@ -745,6 +754,7 @@ struct vector_group_graph_result {
 
 struct vector_group_graph_cache {
     const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
     int L = 0;
     int C = 0;
     int text_len = 0;
@@ -798,6 +808,7 @@ void build_group_graph_cache(vector_group_graph_cache & cache,
                              bool trace_outputs) {
     free_group_graph_cache(cache);
     cache.model = &model;
+    cache.generation_id = model.generation_id;
     cache.L = L;
     cache.C = C;
     cache.text_len = text_len;
@@ -905,7 +916,8 @@ vector_group_graph_result run_group_graph_cache(vector_group_graph_cache & cache
                                                 const std::string & v_name,
                                                 const char * island,
                                                 std::vector<supertonic_trace_tensor> * trace) {
-    if (cache.model != &model || cache.L != L || cache.C != C || cache.text_len != text_len ||
+    if (cache.model != &model || cache.generation_id != model.generation_id ||
+        cache.L != L || cache.C != C || cache.text_len != text_len ||
         cache.group != group || cache.conv_block != conv_block ||
         cache.linear_block != linear_block || cache.post_block != post_block ||
         cache.trace_outputs != (trace != nullptr) ||
@@ -955,6 +967,7 @@ struct vector_res_style_qkv_result {
 
 struct vector_res_style_qkv_cache {
     const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
     int L = 0;
     int C = 0;
     int norm_block = 0;
@@ -1005,6 +1018,7 @@ void build_res_style_qkv_cache(vector_res_style_qkv_cache & cache,
                                bool trace_outputs) {
     free_res_style_qkv_cache(cache);
     cache.model = &model;
+    cache.generation_id = model.generation_id;
     cache.L = L;
     cache.C = C;
     cache.norm_block = norm_block;
@@ -1104,7 +1118,8 @@ vector_res_style_qkv_result run_res_style_qkv_cache(vector_res_style_qkv_cache &
                                                     const char * island,
                                                     std::vector<supertonic_trace_tensor> * trace) {
     const bool want_trace = trace != nullptr;
-    if (cache.model != &model || cache.L != L || cache.C != C ||
+    if (cache.model != &model || cache.generation_id != model.generation_id ||
+        cache.L != L || cache.C != C ||
         cache.norm_block != norm_block || cache.post_block != post_block ||
         cache.style_block != style_block || cache.trace_outputs != want_trace ||
         cache.q_matmul_source != q_matmul_source || cache.k_matmul_source != k_matmul_source ||
@@ -1141,6 +1156,7 @@ vector_res_style_qkv_result run_res_style_qkv_cache(vector_res_style_qkv_cache &
 
 struct vector_tail_graph_cache {
     const supertonic_model * model = nullptr;
+    uint64_t generation_id = 0;
     int L = 0;
     int C = 0;
     int Cin = 0;
@@ -1215,6 +1231,7 @@ void build_tail_graph_cache(vector_tail_graph_cache & cache,
                             bool trace_outputs) {
     free_tail_graph_cache(cache);
     cache.model = &model;
+    cache.generation_id = model.generation_id;
     cache.L = L;
     cache.C = C;
     cache.Cin = Cin;
@@ -1292,7 +1309,8 @@ std::vector<float> run_tail_graph_cache(vector_tail_graph_cache & cache,
                                         int current_step,
                                         int total_steps,
                                         std::vector<supertonic_trace_tensor> * trace) {
-    if (cache.model != &model || cache.L != L || cache.C != C ||
+    if (cache.model != &model || cache.generation_id != model.generation_id ||
+        cache.L != L || cache.C != C ||
         cache.Cin != Cin || cache.total_steps != total_steps ||
         cache.trace_outputs != (trace != nullptr)) {
         build_tail_graph_cache(cache, model, L, C, Cin, total_steps, trace != nullptr);
@@ -2108,9 +2126,13 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_build_forward_expand(gf, v_t);
 
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!allocr) throw std::runtime_error("ggml_gallocr_new failed");
+        if (!allocr) {
+            ggml_free(ctx);
+            throw std::runtime_error("ggml_gallocr_new failed");
+        }
         if (!ggml_gallocr_reserve(allocr, gf)) {
             ggml_gallocr_free(allocr);
+            ggml_free(ctx);
             throw std::runtime_error("ggml_gallocr_reserve failed");
         }
         ggml_gallocr_alloc_graph(allocr, gf);
@@ -2119,7 +2141,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_backend_tensor_set(mask, latent_mask, 0, (size_t) L * sizeof(float));
         std::vector<float> te_host = time_embedding(model, current_step, total_steps);
         ggml_backend_tensor_set(t_emb, te_host.data(), 0, te_host.size() * sizeof(float));
-        const std::vector<float> & text_lc_host = cached_text_lc(text_emb, text_len);
+        const std::vector<float> & text_lc_host = cached_text_lc(model, text_emb, text_len);
         ggml_backend_tensor_set(text_in, text_lc_host.data(), 0, text_lc_host.size() * sizeof(float));
         profile_vector_compute(model, gf, current_step, "front_proj_attn0_qkv");
 
@@ -2210,9 +2232,13 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_set_name(style_norm, "ve_style0_norm"); ggml_set_output(style_norm);
         ggml_build_forward_expand(srgf, style_norm);
         ggml_gallocr_t srallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!srallocr) throw std::runtime_error("ggml_gallocr_new style residual failed");
+        if (!srallocr) {
+            ggml_free(srctx);
+            throw std::runtime_error("ggml_gallocr_new style residual failed");
+        }
         if (!ggml_gallocr_reserve(srallocr, srgf)) {
             ggml_gallocr_free(srallocr);
+            ggml_free(srctx);
             throw std::runtime_error("ggml_gallocr_reserve style residual failed");
         }
         ggml_gallocr_alloc_graph(srallocr, srgf);
@@ -2225,6 +2251,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         std::vector<float> style_norm_ggml = tensor_to_time_channel(ggml_graph_get_tensor(srgf, "ve_style0_norm"));
         PUSH_GGML_TRACE({"ve_style0_norm", {L, C}, style_norm_ggml});
         ggml_gallocr_free(srallocr);
+        ggml_free(srctx);
 
         thread_local vector_group_graph_cache g1_group_cache;
         vector_group_graph_result g1_group = run_group_graph_cache(g1_group_cache, model, style_norm_ggml,
@@ -2309,9 +2336,13 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_set_name(g1_style_norm, "ve_g1_style_norm"); ggml_set_output(g1_style_norm);
         ggml_build_forward_expand(g1srgf, g1_style_norm);
         ggml_gallocr_t g1srallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g1srallocr) throw std::runtime_error("ggml_gallocr_new group1 style residual failed");
+        if (!g1srallocr) {
+            ggml_free(g1srctx);
+            throw std::runtime_error("ggml_gallocr_new group1 style residual failed");
+        }
         if (!ggml_gallocr_reserve(g1srallocr, g1srgf)) {
             ggml_gallocr_free(g1srallocr);
+            ggml_free(g1srctx);
             throw std::runtime_error("ggml_gallocr_reserve group1 style residual failed");
         }
         ggml_gallocr_alloc_graph(g1srallocr, g1srgf);
@@ -2324,6 +2355,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         std::vector<float> g1_style_norm_vec = tensor_to_time_channel(ggml_graph_get_tensor(g1srgf, "ve_g1_style_norm"));
         PUSH_GGML_TRACE({"ve_g1_style_norm", {L, C}, g1_style_norm_vec});
         ggml_gallocr_free(g1srallocr);
+        ggml_free(g1srctx);
 
         thread_local vector_group_graph_cache g2_group_cache;
         vector_group_graph_result g2_group = run_group_graph_cache(g2_group_cache, model, g1_style_norm_vec,
@@ -2408,9 +2440,13 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_set_name(g2_style_norm, "ve_g2_style_norm"); ggml_set_output(g2_style_norm);
         ggml_build_forward_expand(g2srgf, g2_style_norm);
         ggml_gallocr_t g2srallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g2srallocr) throw std::runtime_error("ggml_gallocr_new group2 style residual failed");
+        if (!g2srallocr) {
+            ggml_free(g2srctx);
+            throw std::runtime_error("ggml_gallocr_new group2 style residual failed");
+        }
         if (!ggml_gallocr_reserve(g2srallocr, g2srgf)) {
             ggml_gallocr_free(g2srallocr);
+            ggml_free(g2srctx);
             throw std::runtime_error("ggml_gallocr_reserve group2 style residual failed");
         }
         ggml_gallocr_alloc_graph(g2srallocr, g2srgf);
@@ -2423,6 +2459,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         std::vector<float> g2_style_norm_vec = tensor_to_time_channel(ggml_graph_get_tensor(g2srgf, "ve_g2_style_norm"));
         PUSH_GGML_TRACE({"ve_g2_style_norm", {L, C}, g2_style_norm_vec});
         ggml_gallocr_free(g2srallocr);
+        ggml_free(g2srctx);
 
         thread_local vector_group_graph_cache g3_group_cache;
         vector_group_graph_result g3_group = run_group_graph_cache(g3_group_cache, model, g2_style_norm_vec,
@@ -2507,9 +2544,13 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         ggml_set_name(g3_style_norm, "ve_g3_style_norm"); ggml_set_output(g3_style_norm);
         ggml_build_forward_expand(g3srgf, g3_style_norm);
         ggml_gallocr_t g3srallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-        if (!g3srallocr) throw std::runtime_error("ggml_gallocr_new group3 style residual failed");
+        if (!g3srallocr) {
+            ggml_free(g3srctx);
+            throw std::runtime_error("ggml_gallocr_new group3 style residual failed");
+        }
         if (!ggml_gallocr_reserve(g3srallocr, g3srgf)) {
             ggml_gallocr_free(g3srallocr);
+            ggml_free(g3srctx);
             throw std::runtime_error("ggml_gallocr_reserve group3 style residual failed");
         }
         ggml_gallocr_alloc_graph(g3srallocr, g3srgf);
@@ -2522,6 +2563,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         std::vector<float> g3_style_norm_vec = tensor_to_time_channel(ggml_graph_get_tensor(g3srgf, "ve_g3_style_norm"));
         PUSH_GGML_TRACE({"ve_g3_style_norm", {L, C}, g3_style_norm_vec});
         ggml_gallocr_free(g3srallocr);
+        ggml_free(g3srctx);
 
         thread_local vector_tail_graph_cache tail_cache;
         std::vector<float> next_latent_tc = run_tail_graph_cache(tail_cache, model, g3_style_norm_vec,
@@ -2530,6 +2572,7 @@ bool supertonic_vector_trace_proj_ggml(const supertonic_model & model,
         if (next_latent_tc_out) *next_latent_tc_out = next_latent_tc;
 
         ggml_gallocr_free(allocr);
+        ggml_free(ctx);
         profile_vector_step_end(current_step);
         if (error) error->clear();
 #undef PUSH_GGML_TRACE

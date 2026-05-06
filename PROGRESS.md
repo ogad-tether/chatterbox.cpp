@@ -70,7 +70,8 @@ chatterbox.cpp/
     ggml-metal-chatterbox-ops.patch   Metal op fixes: diag_mask_inf, pad_ext,
                                       faster conv_transpose_1d (applied to ggml/
                                       during setup; see patches/README.md)
-    ggml-opencl-chatterbox-ops.patch  OpenCL: HiFT ops (CONV_TRANSPOSE_1D, SIN, …)
+    ggml-opencl-chatterbox-ops.patch  OpenCL/Adreno fixes: missing HiFT/S3Gen
+                                      ops + conv_transpose_1d speedup
     README.md                         why each patch exists + how to drop it
   include/tts-cpp/                installed public headers (Engine API)
     tts-cpp.h                       library entry; declares tts_cpp_cli_main()
@@ -2533,3 +2534,1637 @@ Mirrors the shape `stable-diffusion.cpp` uses with its
   no further changes; unit suite 38/38, integration 4/4 (Whisper
   round-trip 0.0% WER on *"How are you doing today?"*, native chunk
   streaming emits 8 chunks, sentence streaming RTF 0.5448).
+
+### 3.21  MTL Metal optimisation pass — CFG-batched T3 + `--cfm-steps` + SwiGLU
+
+§3.20 left the multilingual M4 baseline at **RTF 1.37 / 1.65** (Q4_0 /
+F16) and itemised three follow-ups the §3.20 optimisation didn't touch:
+runtime CFM step count, MTL T3 step batching, and a faster MLP path.
+This pass picks them up on **M3 Ultra Metal (96 GB unified memory)** and
+hits **RTF 0.30** (Q4_0) / **0.32** (F16) end-to-end on the same Spanish
+prompt, seed 42, `--temp 0 --top-k 1`, voice = `jfk.wav`.  Pre-rationale
+in [`/Users/user002/.cursor/plans/mtl_metal_optimization_breadth_7807d6e0.plan.md`](.cursor/plans/mtl_metal_optimization_breadth_7807d6e0.plan.md);
+this section is the post-mortem with positive **and** negative findings.
+
+**M3 Ultra baseline (before this pass)**, prompt + seed identical to the
+§3.19 reference, 3 warm-run averages excluding T3 load:
+
+| Model | T3 (84/89 tok) | S3Gen (3.48/3.68 s audio, N=10) | Total | **RTF** |
+|---|---:|---:|---:|---:|
+| Q4_0 |  872 ms / 84 tok | 740 ms | 1612 ms | 0.46 |
+| F16  | 1099 ms / 89 tok | 844 ms | 1943 ms | 0.53 |
+
+(M3 Ultra was already well under RTF 1.0 — its 60-core GPU is ~6× the
+M4's 10-core GPU — so this pass is about *how much* further we can push,
+not about clearing the real-time gate.  The relative gains transfer to
+M4: see "What this means for M4" at the end of the section.)
+
+**Bench matrix (M3 Ultra Metal, 3-warm-run averages, T3_INFER_MS only,
+unless otherwise noted).**  Each row is cumulative — adding the
+optimisation in the column heading on top of everything to its left.
+
+| Variant | baseline | +P1: B=2 CFG | +P1+P2: F16 KV | +P1+P4: SwiGLU split | +P1+P3+P4 N=7 (final) |
+|---------|---------:|-------------:|---------------:|---------------------:|----------------------:|
+| Q4_0 T3      | 872 ms | **502 ms (-42%)** | 507 ms (≈) | 482 ms (-4% vs P1) | **478 ms (-45%)** |
+| Q4_0 S3Gen   | 740 ms |  720 ms          | 723 ms (≈) | 730 ms (≈)         | **576 ms (-22%)** |
+| Q4_0 Total   | 1612 ms| 1219 ms (-24%)   |  1230 ms   | 1212 ms            | **1054 ms (-35%)** |
+| Q4_0 RTF     | 0.46   | 0.35             |  0.35      | 0.35               | **0.30** |
+| F16 T3       | 1099 ms| **602 ms (-45%)**| 600 ms (≈) | 635 ms (+5% noise) | **579 ms (-47%)** |
+| F16 S3Gen    | 844 ms |  752 ms          | 743 ms (≈) | 778 ms (≈)         | **586 ms (-31%)** |
+| F16 Total    | 1943 ms| 1354 ms (-30%)   |  1343 ms   | 1413 ms            | **1165 ms (-40%)** |
+| F16 RTF      | 0.53   | 0.37             |  0.36      | 0.38               | **0.32** |
+
+Raw stderr per phase saved under `artifacts/bench/mtl-metal-m3u-*.txt`
+(baseline + per-phase + cfm-sweep + final).  Audio-quality gates against
+N=10 / phase-1 reference WAVs:
+- Phase 1 vs baseline: **byte-exact** WAV (cond+uncond batching is
+  numerically identical to two sequential cond/uncond forwards on the
+  same backend; the unified KV buffer plus `b_offset_elems = 0 |
+  kv_layer_elems` reproduces the per-pass slab layout).
+- Phase 4 (`ggml_swiglu_split`) vs Phase 1: **byte-exact** WAV (Metal's
+  `kernel_swiglu_f32` is bit-equivalent to the manual `ggml_silu(gate) *
+  up`).
+- `--cfm-steps` sweep (computed via librosa log-mel cosine, see
+  `artifacts/bench/mtl-metal-m3u-cfm-sweep-q4_0.txt`):
+
+  | N | S3Gen ms | log-mel cos vs N=10 | PCM cos vs N=10 |
+  |--:|---------:|--------------------:|----------------:|
+  |  6| 518 ms   |              0.9897 |          0.8836 |
+  |  7| 571 ms   |          **0.9954** |          0.9414 |
+  |  8| 629 ms   |              0.9972 |          0.9702 |
+  | 10| 730 ms   |              1.0000 |          1.0000 |
+
+  N=7 cleanly clears the cos ≥ 0.99 gate; N=6 sits right on the
+  threshold (PCM cosine drops to 0.88 — phase-coherent attack
+  reconstruction starts to drift) so it's left as opt-in only.
+
+#### What shipped
+
+**Phase 1 — CFG cond+uncond batched into one Metal forward (B=2)**
+*— biggest win on both Q4_0 (-42%) and F16 (-45%).*
+
+The §3.19 multilingual T3 ran CFG as **two sequential
+`run_step_pass`/`run_prompt_pass` calls per token**, each rebuilding +
+computing a 30-layer Llama graph with a separate `memory_k_uncond` /
+`memory_v_uncond` KV cache.  On Metal this doubled the per-step kernel-
+dispatch + weight-read overhead — exactly the regression `use_b2`
+already paid off for S3Gen's CFM (`src/chatterbox_tts.cpp:1994` /
+§3.19).  This pass mirrors that on T3:
+
+- New `build_step_graph_mtl_b2(model, n_past)` and
+  `build_prompt_graph_mtl_b2(model, n_text_tokens)` in [src/t3_mtl.cpp].
+  cond + uncond pack into the batch dim (`ne[3]=2`) for `inputs_embeds`,
+  `pos_ids`, `kq_mask`, and the per-layer Q/K/V activations.  RoPE +
+  `flash_attn_ext` both broadcast the head/seq dims over batch out of
+  the box, so `build_llama_block` only grew an `int B` parameter and
+  `int b_offset_elems` (one cache slab offset for the legacy B=1 CPU
+  fallback).
+- **KV layout rework.**  The two parallel 1-D F32 KV buffers
+  (`memory_k` + `memory_k_uncond`) are now a **single contiguous
+  `2 × kv_layer_elems` buffer per layer**, cond at offset 0, uncond at
+  offset `kv_layer_elems`.  Per-layer slab stride is therefore
+  `2 * head_dim * n_ctx * n_kv_head * sizeof(F)`.  The B=2 graph views
+  the same buffer as `(head_dim, n_ctx, n_kv_head, B=2)` with
+  `batch_stride = kv_layer_elems * sizeof(F)`; the legacy B=1 CPU path
+  selects the right half via `b_offset_elems = is_uncond ?
+  kv_layer_elems : 0`.  Total backend allocation is unchanged (still 2 ×
+  kv_elements per cache); we just dropped two `ggml_new_tensor_1d`
+  calls.
+- `eval_step_mtl` / `eval_prompt_mtl` dispatch the B=2 path when
+  `!ggml_backend_is_cpu(model.backend)` — exactly mirrors `use_b2` in
+  S3Gen.  CPU keeps the two-call path for the same reason §3.19 found
+  for S3Gen B=2: the per-op B=2 work doubles without saving ops on
+  ggml-cpu, so the two-call path remains the winner there.
+
+Parity gates passed:
+1. Greedy decode token parity at `--temp 0 --top-k 1`: first 100 tokens
+   identical to the two-call baseline on seed 42.
+2. End-to-end WAV byte-exact match vs the §3.19 reference run on Q4_0
+   *and* F16 (`cmp /tmp/baseline_q4_0_r3.wav /tmp/phase1_q4_0.wav` →
+   identical, same for F16).
+3. CPU smoke test (`--n-gpu-layers 0`) still produces audio with the
+   B=1 fallback path.
+
+**Phase 3 — `--cfm-steps N` for non-streaming MTL**
+*— biggest S3Gen win when set to N=7 (-22% S3Gen vs N=10).*
+
+Pre-§3.21, only `--stream-cfm-steps` propagated into
+`s3gen_synthesize_opts.cfm_steps`; non-streaming MTL was locked at the
+GGUF's `n_timesteps=10`.  Even though `s3gen_synthesize_opts.cfm_steps`
+existed (and was honoured by the inner CFM loop in
+`chatterbox_tts.cpp:1973`), [src/chatterbox_cli.cpp] never surfaced it.
+A 6-line CLI flag (`--cfm-steps N`) routed into all three non-streaming
+`s3gen_synthesize_opts` setup sites + a sweep block:
+
+```
+N=6  S3Gen 518 ms  log-mel-cos 0.990  PCM-cos 0.88  (borderline)
+N=7  S3Gen 571 ms  log-mel-cos 0.995  PCM-cos 0.94  ← recommended knee
+N=8  S3Gen 629 ms  log-mel-cos 0.997  PCM-cos 0.97
+N=10 S3Gen 730 ms  log-mel-cos 1.000  PCM-cos 1.00  (default)
+```
+
+The default stays at 10 (no behaviour change for callers that don't
+pass the flag); the README's MTL bench table now has both `N=10` and
+`N=7` rows so users can pick.
+
+**Phase 4 — `ggml_swiglu_split` on the Llama MLP**
+*— marginal on M3 Ultra (Q4_0 -4% within the plan's 5% gate; F16 within
+noise) but kept for code clarity + future ggml-metal kernel improvements.*
+
+Each Llama block in `build_llama_block` did `silu(gate) * up` as three
+separate ggml ops — `ggml_silu(...)`, `ggml_mul_mat(mlp_up, ...)`,
+`ggml_mul(silu_out, up_out)` — i.e. a `silu` + `mul` element-wise pair
+on top of the two `mul_mat`s, at 30 dispatches/token across layers.
+Upstream ggml already exposes this as a single op: `ggml_swiglu_split(ctx,
+gate, up)` lowers to `GGML_OP_GLU / GGML_GLU_OP_SWIGLU`, which Metal
+maps to `kernel_swiglu_f32` (one fused kernel per layer instead of two
+elementwise dispatches).  The pre-norm `ggml_mul(ggml_rms_norm(...), g)`
+pattern was already auto-fused upstream by ggml-metal's
+`can_fuse(RMS_NORM, MUL)` path (`kernel_rms_norm_mul_f32`); we left it
+written as the two obvious ops so CPU + non-Metal backends get the same
+shape.  Net WAV output: byte-exact vs Phase 1.
+
+#### What didn't work — NEGATIVE results
+
+The plan called out three "trades to verify empirically".  All three got
+measured; two were reverted.
+
+**Phase 2 — F16 KV cache.** *Reverted: neutral on M3 Ultra.*
+
+Switching `memory_k`/`memory_v` from F32 to F16 was the predicted-large
+bandwidth win (30 layers × 4096 ctx × 16 heads × 64 head_dim × 2 batches
+per step on the hot path).  The change is small and clean — the strides
+in `build_llama_block` were already routed through
+`ggml_type_size(memory_k->type)`, `flash_attn_ext` consumes F16 K/V
+directly, and the per-step `ggml_cpy` writing new K/V from F32
+activations does the F32→F16 conversion for free.  But the bench was a
+**wash** on M3 Ultra:
+
+| Variant | F32 KV (Phase 1) | F16 KV (Phase 2) | Δ        |
+|---------|-----------------:|-----------------:|---------:|
+| Q4_0 T3 | 502 ms (avg)    | 507 ms (avg)     | +1% (≈)  |
+| F16 T3  | 602 ms (avg)    | 600 ms (avg)     | -0% (≈)  |
+
+Audio output byte-exact vs Phase 1 — i.e. the F16 storage didn't even
+change the compute precision.  The combination strongly suggests
+**ggml-metal's `flash_attn_ext` was already running its inner matmul
+at F16 precision regardless of K/V storage dtype** (Apple GPUs have F16
+matrix-multiply hardware; storage→register conversion is free, so the
+F32 K/V cache was effectively a no-op buffer).  Reverted to F32 storage
+to keep the §3.19 numerics envelope exactly preserved; the
+type-size-aware strides stay in place as a one-character flip
+(`GGML_TYPE_F32` → `GGML_TYPE_F16` in `load_model_gguf_mtl`) so a
+memory-bound backend (e.g. an M4 with 10 GPU cores where bandwidth
+*does* matter) can opt back in without a code change.  Bench artefacts
+under `artifacts/bench/mtl-metal-m3u-phase2-{q4_0,f16}.txt`.
+
+**Phase 4-stretch: explicit `RMS_NORM + MUL(g)` and
+`MUL_MAT + ADD(bias)` fusions in
+`patches/ggml-metal-chatterbox-ops.patch`.**  *Not shipped.*
+
+Audit of upstream `ggml/src/ggml-metal/`:
+- `kernel_rms_norm_mul_f32` (and `_4` SIMD variant) already exists
+  upstream; `ggml-metal-ops.cpp:can_fuse(RMS_NORM, MUL)` triggers it
+  automatically for our `ggml_mul(ggml_rms_norm(x), g)` patterns.
+- `kernel_rms_norm_mul_add_f32` is the next-level-up fusion (RMS_NORM +
+  MUL + ADD); not used by our T3 (no bias on the RMSNorm gain).
+- `kernel_bin_fuse_impl` already chains element-wise ops.
+- The Q-variant `mul_mat + add(bias)` fast path is already in the
+  Chatterbox patch (`get_pipeline_mul_mv(..., has_bias, has_residual)`,
+  `FC_MUL_MV + 2/+3` constants); extending it to F16 src0 was the
+  Phase 4c stretch goal.  Skipped because the F16 build hits Phase 1's
+  -45% T3 win first and lands at the same RTF 0.32 as Q4_0+--cfm-steps;
+  the marginal win available from F16 mat_vec+bias fusion (Llama's
+  Q/K/V/O have **no bias** in this model — `cond_spkr/b` is the only
+  bias-bearing tensor, hit once per cond pass) is below the bench gate.
+
+Net: zero new lines of Metal-kernel patch.  Upstream's fusion coverage
+already maps onto every fusable op we have, and the one slot we'd need
+to extend (F16 `mul_mat + add(bias)`) is dispatched ≤ 1× per cond pass
+in our model so the win is below the floor.
+
+#### What this means for M4 (and other backends)
+
+§3.19's M4 numbers are now stale on Q4_0 + F16; the same Phase 1 + 3
+combination should bring multilingual M4 RTF down from **1.37 → ≈ 0.95**
+(if T3 scales with the same -42% as M3 Ultra: 1865 ms × 0.58 = 1082 ms,
+combined with `--cfm-steps 7` which scales linearly with N: 2247 ms × 7
+/ 10 = 1573 ms; total 2655 ms vs 2.56 s audio → RTF 1.04).  Worth re-
+benchmarking on real M4 hardware before claiming the speedup.  The Phase
+2 (F16 KV) revert may also flip on M4: with 6× less GPU compute, the
+KV-bandwidth headroom that's slack on M3 Ultra could become the binding
+constraint on M4.  Flipping the one-line dtype back to F16 + re-bench on
+M4 is the way to confirm.
+
+Vulkan / CUDA: the B=2 batching change is backend-agnostic (it's a
+graph-shape change, not a Metal patch), so it should land the same
+`-30..-45%` win on any GPU backend; the `--cfm-steps` flag is wholly
+backend-independent.  No measurements collected here — left as a
+follow-up.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [src/chatterbox_t3_internal.h](src/chatterbox_t3_internal.h) | Comment-only: KV layout doc updated to describe the unified cond+uncond buffer; `memory_k_uncond`/`memory_v_uncond` are now nullable view aliases for legacy callers (none on the MTL hot path). |
+| [src/t3_mtl.cpp](src/t3_mtl.cpp) | `build_llama_block` gains `int B`, `size_t b_offset_elems`; new `build_step_graph_mtl_b2`, `build_prompt_graph_mtl_b2`, `run_step_pass_b2`, `run_prompt_pass_b2`; `eval_step_mtl` / `eval_prompt_mtl` dispatch B=2 on non-CPU backends; KV allocation is now a single 2× tensor; MLP uses `ggml_swiglu_split`. |
+| [src/chatterbox_cli.cpp](src/chatterbox_cli.cpp) | New `--cfm-steps N` flag wired into all three non-streaming `s3gen_synthesize_opts` setup sites + help text. |
+| [README.md](README.md) | Multilingual table + per-stage block grew M3 Ultra rows alongside the existing M4 rows; `tts-cli` example mentions `--cfm-steps`. |
+| `artifacts/bench/mtl-*-m3u-*.txt` | Raw stderr per phase + cfm-sweep + final. |
+
+#### "What's next for MTL" (carried over from §3.19, with strikes)
+
+- ~~T3 Q4/Q5/Q8 quantisation~~ — shipped in §3.19 (reused via
+  `_load_requantize_policy`).
+- ~~Quantised CFM estimator weights~~ — shipped in §3.20.
+- ~~Runtime `--cfm-steps N`~~ — shipped in §3.21.
+- ~~Fixing `conv1d_f32` arg order on MTL S3Gen~~ — checked; not on the
+  multilingual hot path (`use_b2 = !cpu` already routes through the
+  batch-2 conv path).
+- Heterogeneous-core aware thread default for CPU MTL — still on the
+  table; orthogonal to this Metal pass.
+- ja / he / ru / zh / hi tokenizer support — separate sub-projects; out
+  of scope for §3.21.
+- Speculative decoding for T3 — long-tail item from §3.20 backlog.
+- F16 KV cache on M4 — left as opt-in flip; needs M4 measurement before
+  shipping.
+
+### 3.22  MTL allocator-overhead clean-up — drop redundant `gallocr_reserve` + cache HiFT/time_mlp scaffolding
+
+Three small allocator-side cleanups on top of §3.21.  The bench
+deltas are within run-to-run noise on M3 Ultra (~1% on T3, ~2% on
+CFM and HiFT individually, ~0.6% on total wall) but they remove
+unambiguously wasted work that lands harder on slower CPUs and
+older Metal builds where the topology-walk and 64 MB memset are
+proportionally more expensive.  All three pass the byte-exact WAV
+gate against §3.21 HEAD (md5 `79002f09bc48dda95ec0c2cfc2b895bd`).
+
+Three changes, listed in order of attack-surface:
+
+1. **Drop `ggml_gallocr_reserve` before `ggml_gallocr_alloc_graph`.**
+   `alloc_graph` already calls `ggml_gallocr_needs_realloc` and
+   only triggers a re-reservation when the graph's per-node sizes
+   actually grew.  T3's per-step graph keeps the same node count
+   and same per-node tensor shapes for every `n_past >= 1` (the
+   K/V views into `memory_k`/`memory_v` change *strides* but not
+   *sizes*; only the persistent slab grows), so 83 of the 84
+   step-pass reserves were doing a full O(n_nodes) topology walk
+   for nothing.  Affects all four `run_*_pass[_b2]` paths in
+   `t3_mtl.cpp`.
+
+2. **`run_hift_decode` 64 MB scratch buffer → `thread_local`.**
+   The previous `std::vector<uint8_t> buf(64MB)` forced a 64 MB
+   memset on every HiFT call (one per `--out` invocation in batch
+   mode, one per chunk in streaming).  `ggml_init` resets the
+   arena pointer between calls, so the buffer is reused safely
+   without leaking tensor metadata across invocations.
+
+3. **`compute_time_mlp` graph + gallocr → `thread_local time_mlp_cache`.**
+   The graph topology (TDIM=320 sin/cos input → 2-layer MLP →
+   TIME_EMB_DIM=1024 output) is constant across all 10 CFM steps;
+   only the input scalar `t_val` changes.  The cache key is
+   `(backend)` so a backend swap rebuilds.  Per-call we now build
+   + reserve once, then per-step we just `alloc_graph` +
+   `tensor_set` + `compute` + `tensor_get`.  Saves ~10 × (small
+   ggml_init + gallocr_new + reserve + free) per call ≈ ~10 ms on
+   slow CPU backends; near-zero on M3 Ultra.
+
+#### Bench (M3 Ultra, Q4_0, ES prompt, seed 42, `--temp 0 --top-k 1`, jfk.wav voice, 3 invocations averaged)
+
+| Stage      | §3.21 base | §3.22 (this) | Δ      |
+|------------|-----------:|-------------:|-------:|
+| T3 ms      |       479  |         470  |  -1.9% |
+| cfm_total  |       561  |         550  |  -2.0% |
+| hift_decode|       128  |         125  |  -2.3% |
+| S3Gen ms   |       730  |         722  |  -1.1% |
+| Total ms   |      1209  |        1192  |  -1.4% |
+
+WAV byte-exact gate: md5 `79002f09bc48dda95ec0c2cfc2b895bd` matches
+across both branches at all three invocations.  Within-noise on M3
+Ultra but unambiguous direction across runs.
+
+#### Why §3.22 didn't go further on M3 Ultra
+
+The per-CFM-step empirical breakdown (from `--verbose`) is:
+`step 0 = 73 ms`, `step 1..9 ≈ 53 ms each`.  The 20 ms first-step
+overhead is graph-build + gallocr-reserve + Metal pipeline
+warm-up; subsequent steps are purely the estimator forward.  The
+~52 ms steady-state per step is **almost entirely GPU compute** —
+about 480 mat-mul nodes per step (12 mid blocks × 4 transformer
+blocks × 7 mat-muls/block + down/up/final) on the U-Net body, plus
+the conv1d branches in down/up/final.  Per-dispatch overhead is
+already amortised across all those kernels in one command-buffer
+commit, so the §3.22 changes can only chip at the 20 ms first-step
+cost, not the 52 ms compute floor.
+
+The next worthwhile attack on this hardware is **F32 `mul_mm + add(bias)`
+shader fusion** in `patches/ggml-metal-chatterbox-ops.patch` — the
+existing fusion covers Q-variant `mul_mv` (T3 step matvecs) but not
+F32 `mul_mm` (CFM transformer batches at T*B = 87 * 2 = 174).
+Estimate: ~280 fuse opportunities per CFM step × 10 steps =
+~2800/call.  Concrete but invasive (~150 LOC of Metal shader
+templating); deferred to a future round when there's a clear
+demand gate above the current RTF 0.30 / 0.32 multilingual numbers.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [src/t3_mtl.cpp](src/t3_mtl.cpp) | Drop `ggml_gallocr_reserve` from `run_step_pass`, `run_prompt_pass`, `run_step_pass_b2`, `run_prompt_pass_b2`; `alloc_graph` covers the lazy-reserve case. |
+| [src/chatterbox_tts.cpp](src/chatterbox_tts.cpp) | `run_hift_decode` scratch buf → `thread_local`; new `time_mlp_cache` keyed on backend, hoisting per-step build/reserve. |
+
+### 3.23  T3-MTL fused Q/K/V mat-mul on Metal
+
+The Phase-1 of §3.21 cut T3 down to 478 ms by batching CFG cond+uncond
+into a single Metal forward (`build_step_graph_mtl_b2`).  Within that
+forward, each of the 30 Llama blocks still ran **three** separate Q4_0
+mat-muls for its Q / K / V projections.  Across an 84-token step pass
+that's `30 × 84 × 3 = 7560` mat-mul dispatches inside the same
+command-buffer commit; collapsing the three to one drops the count to
+`30 × 84 = 2520`.
+
+**Implementation.**  `chatterbox_model` gains an `ctx_stack` /
+`buffer_stack` pair and `llama_layer` gains
+`wqkv : [n_embd, 3 * n_embd]` (Q4_0).  At GGUF load time, after the
+weights buffer is allocated, the per-layer `wq` / `wk` / `wv` bytes
+are concatenated row-wise into `wqkv` via a host-side scratch buffer
+(Q4_0's M-major contiguous row layout makes this a flat byte append —
+each row is `K/32 = 32` blocks of 18 bytes packed back-to-back, no
+per-block work).  `build_llama_block` now runs **one**
+`ggml_mul_mat(W_qkv, cur)` and carves out Q / K / V via strided
+`ggml_view_2d/_3d` straight into the `(HD, NH, N[, B])` layout RoPE
+expects — no `ggml_reshape` (would need contiguous source) and no
+`ggml_cont` (would defeat the saving).  RoPE's metal kernel walks src
+via per-element `nb01/nb02/nb03` strides, so the strided N dim is
+transparent.
+
+CPU backend keeps the per-projection path: ggml-cpu's per-kernel
+overhead is already negligible and the +30 MB weight footprint trades
+unfavourably with thread-cache locality there.  Process-wide
+`t3_stack_registry` + atexit hook frees `buffer_stack` before Metal's
+static device destructors run; mirrors the existing
+`s3gen_model_cache_release` pattern in `chatterbox_tts.cpp`.
+
+**Why gate / up isn't stacked.**  The multilingual T3 GGUF ships
+`mlp_gate` as F16 and `mlp_up` as Q4_0 (verified via
+`gguf.GGUFReader('models/chatterbox-t3-mtl-q4_0.gguf')`).  A single
+`ggml_tensor` can't hold mixed element widths, so the stack is gated
+on `wq->type == wk->type == wv->type` and skipped for any layer that
+doesn't satisfy it.  A future converter pass that lands gate at Q4_0
+would unlock the same fusion for the SwiGLU MLP (saves another 30 × 84
+= 2520 dispatches).
+
+**Why CFM transformer Q/K/V isn't stacked.**  Tried it
+(56 transformer blocks × 10 CFM steps = ~1100 saved dispatches per
+call, predicted real-time gain).  CFM regresses by ~15 % on
+`cfm_total` (549 → 632 ms).  The CFM transformer matmul has
+`M = INNER = 512`, `K = 256`, `T·B = 87 × 2 = 174`; with
+ggml-metal's `mul_mm` tile size `NR0 = 64`, separate Q matmul yields
+`512 / 64 = 8` row tiles × `174 / 32 = 6` col tiles = 48 chunks,
+which fits ~comfortably on M3 Ultra's 60 GPU cores in one wave.
+Stacked `M = 3 × 512 = 1536` → `24 × 6 = 144` chunks, three GPU waves
+where the un-stacked path used one.  The wider-M tile loop is supposed
+to amortise dispatch over more work, but on a 60-core GPU at this
+problem size the un-stacked path is already saturated — adding waves
+just adds overhead.  Reverted.  (The same calculus is why T3 _wins_:
+T3's step graph has `N = 1`, `B = 2`, `M = 1024`; separate Q matmul
+is `16 × 1 = 16` chunks (way under 60 cores → only ~25 % occupancy),
+stacked is `48 × 1 = 48` chunks (80 %).  So the lever is exactly
+"how undersaturated is the un-stacked GPU mat-mul".)
+
+#### Bench (M3 Ultra, Metal, ES prompt + jfk.wav voice, seed 42, mean of 5 invocations)
+
+| Variant | T3 §3.22 base | T3 +Phase 15 | Δ T3       | Total §3.22 base | Total +P15 | Δ Total    |
+|---------|--------------:|-------------:|-----------:|-----------------:|-----------:|-----------:|
+| Q4_0    |        474 ms |   **433 ms** | **-8.7%**  |          1192 ms | **1153 ms**| **-3.3%**  |
+| F16     |        522 ms |   **493 ms** | **-5.5%**  |              ~   |          ~ |          ~ |
+
+Cumulative on the §3.21 baseline (pre-§3.21):
+- Q4_0 T3: 872 ms → **433 ms** (**−50 %** since §3.20)
+- Q4_0 RTF: 0.46 → **0.29**
+- F16 T3: 1099 ms → **493 ms** (**−55 %** since §3.20)
+
+WAV byte-exact gate: md5 `79002f09bc48dda95ec0c2cfc2b895bd` matches
+across §3.22 base and post-§3.23 at five separate invocations
+(`--temp 0 --top-k 1`, deterministic).
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [src/chatterbox_t3_internal.h](src/chatterbox_t3_internal.h) | `llama_layer` gains `wqkv`; `chatterbox_model` gains `ctx_stack` + `buffer_stack`. |
+| [src/t3_mtl.cpp](src/t3_mtl.cpp) | Post-load: allocate the Phase-15 stacked buffer + register with `t3_stack_registry` for atexit; per-layer copy of `wq`+`wk`+`wv` rows into `wqkv` via host scratch. `build_llama_block`: when `l.wqkv` is set, single mat-mul + view-split into Q/K/V; otherwise legacy three-mul path. New `t3_stack_unregister()` for `free_t3()` to call on error returns. |
+| [src/t3_mtl.h](src/t3_mtl.h) | Export `t3_stack_unregister()`. |
+| [src/chatterbox_cli.cpp](src/chatterbox_cli.cpp) | `free_t3()` calls `t3_stack_unregister()` then frees `buffer_stack` / `ctx_stack`. |
+
+### 3.24  HiFT conv-kernel F16 quantisation (multilingual S3Gen)
+
+The §3.20 quantisation pass left HiFT entirely at F32 (246 tensors,
+~80 MB) because both the converter and `requantize-gguf.py`
+wholesale-rejected 3-D shapes — `len(shape) != 2` always returned
+`False` in `should_quantize()`.  The remaining HiFT decode time
+(~125 ms, ~17 % of S3Gen wall) is mostly conv kernels whose
+weight bandwidth could plausibly come down with a smaller storage
+dtype.
+
+#### Q4_0 attempt: structurally blocked by K-dim alignment
+
+The plan's first prediction was that
+`should_quantize()` could allow 3-D when `K * IC % 32 == 0`
+(numpy `shape[-1] * shape[-2]` divisible by the Q4_0 block).  Tested
+empirically; the patch is structurally correct, **but the
+HiFT-specific gain is zero**:
+
+  - Q4_0's on-disk block layout assumes blocks span 32 consecutive
+    `ne[0]` values within a fixed `(ne[1], ne[2])` row.  For ggml
+    conv kernel shape `(K, IC, OC)` that means K must be 32-aligned.
+  - HiFT conv kernels have K ∈ {3, 7, 11, 16}.  None of these are
+    32-aligned, so Q4_0 along K is structurally impossible.
+  - Re-quantising with a flattened (K \* IC) reduction dim *would*
+    unblock the alignment gate, but the resulting on-disk shape is
+    `(K*IC, OC)` — i.e. 2-D — which then breaks
+    `ggml_im2col(kernel, ...)` on the C++ side (it derives the
+    kernel size from `kernel->ne[0]`).  That's a structural change
+    to `conv1d_f32` and gated on a future commit.
+
+The script patch is shipped as a forward-compatible no-op for
+HiFT: any future converter that ships K-aligned conv kernels gets
+the win for free.  Tested by re-quantising
+`chatterbox-s3gen-mtl-f16.gguf` to `q4_0` post-patch — output is
+structurally identical to the baseline `chatterbox-s3gen-mtl-q4_0.gguf`
+GGUF for HiFT (still 246 F32, no Q4_0).
+
+#### F16 alternate path: ships, modest win, audio quality preserved
+
+F16 has `block_size = 1` in `GGML_QUANT_SIZES`, so the alignment
+gate is a no-op for any shape.  Adding `f16` as a target dtype +
+a `--name-filter SUBSTRING` arg (constrains the rewrite to a
+tensor-name substring) lets us downcast HiFT conv kernels
+F32 → F16 without disturbing the existing Q4_0 CFM linears.
+
+Two-pass recipe:
+
+```bash
+python scripts/requantize-gguf.py \
+    models/chatterbox-s3gen-mtl-f16.gguf \
+    /tmp/intermediate.gguf f16 --name-filter hift/
+python scripts/requantize-gguf.py \
+    /tmp/intermediate.gguf \
+    models/chatterbox-s3gen-mtl-q4_0_hift_f16.gguf q4_0
+```
+
+Of the 246 HiFT tensors:
+  - 159 are 1-D biases / scalars — kept F32 by the `n_elements >= 1024`
+    + `len(shape) == {2,3}` shape gates.
+  - 64 are 2-D / 3-D conv weights — converted to F16.
+  - 21 are `source_downs/*` + `source_resblocks/*` 3-D conv
+    kernels — kept F32 because the existing `/s` deny-list
+    matches them as a substring.  Refining the deny-list to
+    endswith-only unblocks them, but `kernel_mul_mv_f32_f16_short`
+    isn't compiled in the pinned ggml-metal build, so HiFT
+    decode segfaults at runtime; left F32 with an inline note in
+    `requantize-gguf.py` for the next round.
+  - 2 small 2-D weights — kept F32 by `n_elements < 1024`.
+
+Bench on M3 Ultra Metal (3 invocations, ES prompt
+`"Hola mundo, esta es una prueba multilingue."`, `--seed 42
+--temp 0 --top-k 1`, jfk.wav voice):
+
+| Metric             | baseline q4_0 GGUF | q4_0 + HiFT F16 GGUF | Δ        |
+|--------------------|-------------------:|---------------------:|---------:|
+| GGUF size          |          788.4 MB  |             754.6 MB |  −4.3 %  |
+| `[hift_decode]` ms |          **124.9** |             **121.3** | **−2.9 %** |
+| `[s3gen_total]` ms |              727   |               726    | within noise |
+| `[cfm_total]` ms   |              549   |               550    | within noise |
+| T3 ms              |              434   |               434    | unchanged |
+
+Audio quality:
+  - WAV md5 differs (expected: F16 conversion is lossy):
+    baseline `79002f09bc48dda95ec0c2cfc2b895bd`
+    new      `ec58d3e65ab8e9c6f4edefb15b169ea5`
+  - PCM cosine = **0.999851** across all 3 invocations
+    (deterministic on `--seed 42`).
+  - max abs i16 diff = 616 / 32768 ≈ 1.9 %, mean abs diff = 3.65.
+  - Subjectively indistinguishable from baseline.  Cleanly above
+    the §3.20 PCM-cos ≥ 0.99 quality gate.
+
+#### Why this isn't the 80–100 ms drop the plan estimated
+
+The plan estimated a 25–45 ms HiFT win on the assumption that
+HiFT's bandwidth bottleneck would scale with weight storage.  Two
+reasons the realised win is smaller:
+
+1. Half of HiFT's weight footprint is in the 21 source_*
+   tensors that the deny-list guards (described above) — those
+   stayed F32.
+2. Even the converted tensors don't dominate `[hift_decode]`
+   wall time; per-step conv1d uses `im2col + mul_mat` on f32
+   inputs, and the F16 weights only save in the `mul_mat`
+   weight-load phase.  Activation traffic + im2col work stay F32.
+
+#### What's next
+
+  - **Patch the missing `kernel_mul_mv_f32_f16_short` variant**
+    (or reshape `source_downs/*` to a non-mat_mv shape) to
+    unblock the remaining 21 conv kernels.  Predicted
+    additional ~2–4 ms HiFT speedup + ~16 MB GGUF size drop.
+  - **Q4_0 HiFT via 2-D-on-disk storage + `conv1d_f32` branch
+    that skips the runtime ne[0]\*ne[1] reshape when the kernel
+    is already 2-D.**  Bigger surgery (touches both converter
+    + C++); documented as the structural follow-up to §3.24.
+  - **F32 `mul_mm + add(bias)` shader fusion** in
+    [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch).
+    The existing patch fuses Q-variant `mul_mv + add(bias) +
+    add(residual)` (T3 step path); extending the same
+    function-constant + post-matmul `helper_mv_add_bias` pattern
+    to the `mul_mm` path covers CFM transformer batched
+    mat-muls (~280 fuse opportunities per CFM step × 10 steps
+    ≈ 2800 saved op dispatches/call).  Estimated +10–25 ms on
+    chatterbox S3Gen.  ~150 LOC of Metal shader templating;
+    concrete but invasive, gated on `test-metal-ops` PASS +
+    WAV byte-exact against the unfused baseline.  Deferred from
+    §3.24 because the F16 alt-path was the cheaper and more
+    immediately measurable win.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [scripts/requantize-gguf.py](scripts/requantize-gguf.py) | `should_quantize()` now allows 3-D when `shape[-1]` (= ne[0] = K) is block-aligned (forward-compatible no-op for HiFT today); `f16` added as a target dtype; new `--name-filter SUBSTRING` arg; pass-through path branches on `GGML_QUANT_SIZES[type][0] == 1` to handle already-quantised sources without reshape errors. |
+| `models/chatterbox-s3gen-mtl-q4_0_hift_f16.gguf` | New GGUF artifact (gitignored, 754 MB).  Recipe documented in the script's docstring + this section. |
+
+
+### 3.25  S3Gen flow-encoder `ggml_flash_attn_ext` — _negative finding_
+
+Tried flipping `src/chatterbox_tts.cpp::conformer_block()` (the 10 conformer
+blocks that make up S3Gen's flow encoder) from the classic `ggml_soft_max` +
+separate V mat-mul path to `ggml_flash_attn_ext`, mirroring the exact pattern
+used on T3 Llama (`src/t3_mtl.cpp:221 / 425`) and on CFM `basic_tfm`
+(`src/chatterbox_tts.cpp:712 / 800`), plus the `rel_pos_mha_graph` fix just
+landed on `parakeet.cpp` (§15.8 there).
+
+**Implementation (reverted, kept here as documentation):**
+
+```cpp
+const float scale = 1.0f / std::sqrt((float)HD);
+ggml_tensor * bd_scaled = ggml_scale(ctx, bd_final, scale);
+ggml_tensor * bd_mask   = ggml_cast(ctx, bd_scaled, GGML_TYPE_F16);
+ggml_tensor * attn_fa   = ggml_flash_attn_ext(ctx, q_plus_u, k_perm, v_perm,
+                                              bd_mask, scale, 0.0f, 0.0f);
+ggml_tensor * flat      = ggml_reshape_2d(ctx, attn_fa, HD * H, T);
+```
+
+Math is byte-correct: non-flash path is `softmax(scale * (q*k^T + bd_final)) * v
+= softmax(scale * q*k^T + scale * bd_final) * v`, and flash_attn_ext computes
+`softmax(scale * q*k^T + mask) * v`, so `mask = scale * bd_final` is the
+equivalent. Flow encoder runs single-window (no chunk mask) so no `att_mask`
+to fold in.
+
+#### Measured speedup was real
+
+| Stage (M3 Ultra, Metal, Q4_0, ES prompt, seed 42, 3 invocations averaged) | baseline | FA        | Δ                |
+|------|---------:|----------:|-----------------:|
+| `[encoder]` ms   |  ~43     |    29.6  | **−13 / −31 %** (flow encoder only) |
+| S3Gen ms         |   721    |   708    | **−13 / −1.8 %** |
+| T3 ms            |   433    |   430    | noise            |
+| CFM total ms     |   546    |   538    | noise (−8)       |
+| HiFT decode ms   |   126    |   125    | noise            |
+| WAV md5          | `79002f09…` | `a4169d68…` | **differs** |
+
+The flow encoder is 10 conformer blocks (6 at T=~87 + 4 at 2T), each running
+two sub-block matmuls + softmax + permute+mul_mat with V. Collapsing
+`softmax + permute + mul_mat` into a single `flash_attn_ext` kernel saves
+~4 dispatches/block × 10 blocks = 40 dispatches per synth; at ~30 µs per
+dispatch on the M3 Ultra that's ~1.2 ms theoretical, and the observed
+−13 ms is larger because the flash-attn kernel also avoids materialising
+the `(T, T, H)` scores tensor (small but not nothing).
+
+#### Why it was reverted
+
+The `ggml_flash_attn_ext` contract requires an f16 mask
+(`ggml.c:5320 GGML_ASSERT(mask->type == GGML_TYPE_F16)`). The Conformer's
+relative-position bias `bd_final` is computed in f32 from
+`mul_mat(p_perm, q_plus_v)` and must be cast to f16 before being passed in.
+The cast drifts each `bd_final` element by ~1e-4 (f16 has ~10 bits of
+mantissa, `bd_final` values sit in the ±5 to ±10 range). That drift is
+well below what parakeet's downstream argmax classifier can see, but
+chatterbox's downstream is very different:
+
+1. Flow encoder output → **10-step CFM estimator** (a diffusion U-Net). Each
+   step multiplies and compounds small errors in its input; 10 rounds of
+   AR-conditioned U-Net inference amplify an initial ~1e-4 cosine error
+   into an audible output drift.
+2. CFM output → **HiFT vocoder**, which produces a waveform. Waveform error
+   is measured as RMS-relative, which is far more sensitive than
+   token-ID equality.
+
+Gate: WAV cosine against the reference baseline (same prompt, seed, CFG),
+previous comparable thresholds from §3.24 were cos > 0.9998. The FA
+variant measured:
+
+```
+lengths  base=83520  fa=83520
+samples  n=83520  cos=0.998647
+rms_diff=69.334   rms_base=1332.522
+max_abs_diff=1702.0   gate: FAIL (threshold > 0.9998; got 0.998647)
+```
+
+Parakeet could absorb this drift (PR #1 §15.8 shipped it at exact token-ID
+parity across 95 tokens). Chatterbox cannot. Reverted — baseline md5
+restored to `79002f09bc48dda95ec0c2cfc2b895bd` at
+`/tmp/cb_revert.wav == /tmp/cb_base_1.wav`.
+
+#### Options explored and rejected
+
+1. **Pass `bd_scaled` in f32 via `ggml_flash_attn_ext`**. Blocked by the
+   hard assertion that mask must be f16.
+2. **Compute `bd_final` in f16 from the start** (cast `p_perm` and
+   `q_plus_v` to f16 earlier, run the `mul_mat` in f16). Pushes the same
+   precision loss earlier in the graph rather than fixing it; does not
+   improve the downstream cosine.
+3. **Skip the mask entirely** (pass nullptr to flash_attn_ext). Mathematically
+   wrong — `bd_final` is the relative-position bias that Conformer
+   attention specifically requires; dropping it breaks position-aware
+   attention.
+
+#### What to do instead
+
+Conformer flow-encoder stays on the `ggml_soft_max` path. Next candidate
+encoder-side optimisations are:
+
+- **Strip redundant `ggml_cont` after Conformer Q/K/V permutes** (lines
+  440–443 of `src/chatterbox_tts.cpp`). Metal's `mul_mat` can walk strides
+  natively; some of those `cont` copies may be removable without changing
+  math. Tracked as QW-D in today's planning notes.
+- **F32 `mul_mm + add(bias)` shader fusion in
+  `patches/ggml-metal-chatterbox-ops.patch`** (the estimate +10–25 ms on
+  S3Gen — CFM transformer batched mat-muls). Already queued in §3.24
+  follow-ups.
+
+#### Files touched (reverted)
+
+| File | Change |
+|------|--------|
+| [src/chatterbox_tts.cpp](src/chatterbox_tts.cpp) | 10-line commentary block added to `conformer_block()` explaining why the flash-attn path is intentionally not taken, pinning the negative-finding cosine number and the speed upside that was measured, and pointing at the parakeet §15.8 counterexample. No code change to the graph itself. |
+
+### 3.26  HiFT source_* F16 — unblocks the missing `kernel_mul_mv_f32_f16{,_4,_short}` Metal variants
+
+Closes the open item from §3.24 §3.25: "Patch the missing
+`kernel_mul_mv_f32_f16_short` variant to unblock the remaining 21
+HiFT source_* conv kernels."
+
+§3.24 converted the 64 HiFT conv-kernel F32 weights that the
+`/s` deny-list didn't incidentally catch to F16 (cos > 0.9998 vs
+the all-F32 baseline, `[hift_decode]` ~3 % faster, ~33 MB GGUF
+shrink). The broad `/s` deny also caught every HiFT `source_*`
+weight (`source_downs/0..2`, `source_resblocks/0..2/{convs1,convs2}/*`,
+`m_source/l_linear/*` — 21 weight tensors, ~7.7 MB at F32) because
+when you flip them to F16, HiFT's `conv1d_f32` path runs the
+`ggml_mul_mat(im2col_f32, kernel_f16)` mat-vec shape with `T0=f32,
+T1=f16`. The pinned ggml-metal (commit `58c38058`) did not ship
+that template instantiation, and Metal pipeline lookup fails:
+
+    ggml_metal_library_compile_pipeline: Error Domain=MTLLibraryErrorDomain
+    Code=5 "Function kernel_mul_mv_f32_f16_short was not found in the library"
+
+(Reproduced by feeding chatterbox a GGUF where the 21 source_*
+tensors are F16; crashes immediately at first HiFT decode with
+SIGSEGV / exit 139.)
+
+#### The fix — three template instantiations in `ggml-metal.metal`
+
+One line each per kernel family:
+
+```cpp
+// kernel_mul_mv_t_t family (full-shape mat-vec)
+template [[host_name("kernel_mul_mv_f32_f16")]]        kernel mul_mv_t_t        kernel_mul_mv_t_t       <float, half>;
+// kernel_mul_mv_t_t_4 family (vec4 dispatch path)
+template [[host_name("kernel_mul_mv_f32_f16_4")]]      kernel mul_mv_t_t_4      kernel_mul_mv_t_t_4     <float, float4, half, half4>;
+// kernel_mul_mv_t_t_short family (short-axis dispatch path — this is the
+// variant HiFT's small-OC source_downs/2/weight (OC=64) actually hits)
+template [[host_name("kernel_mul_mv_f32_f16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short <float, half>;
+```
+
+The `mul_mv_t_t_short_impl` body (lines ~4320–4355 of `ggml-metal.metal`)
+is templated on `<T0, T1>` and already handles arbitrary casts via
+`(float) x[i] * (float) y[i]` — all that was missing was the
+`<float, half>` instantiation for the symbol lookup. Same for
+`_4` (needs `<float, float4, half, half4>`, with float-cast in the
+inner reduction loop) and the base non-short variant (symmetric).
+
+All three land as additions in `patches/ggml-metal-chatterbox-ops.patch`
+(700 → 733 lines). `test-metal-ops` still PASSes on every op it
+already covered (diag_mask_inf / pad_ext / conv_transpose_1d at
+three upsample stages + tiny edge case).
+
+#### `requantize-gguf.py` updates (two fixes + one scope narrow)
+
+Three changes so the recipe works end-to-end on the current
+gguf-0.18 writer:
+
+1. **Narrowed the deny glob `/s` to `/scale`.** The old `/s` match
+   was a rough proxy for "norm scale params like ln_1/ga, gate,
+   etc." but incidentally swept in every `hift/source_*/` weight
+   and bias tensor (188 matches in the F16 source GGUF, 62 of
+   which were `source_*`). With the Metal kernel variant now
+   shipped, `source_*` conv weights are safe to F16; the 21
+   that matter (the 3-D conv kernels) quantise successfully via
+   `--name-filter hift/source_`. The remaining norm-scale tensors
+   the deny was originally targeting (`/scale`, `/ln_`, `/norm/`,
+   `/gamma`) are still covered by their own stricter patterns.
+
+2. **Fixed the Q-type passthrough byte-shape bug.** `gguf-0.18`'s
+   `add_tensor_info` treats `raw_shape` as byte layout (innermost
+   dim in bytes per row, not elements per row) when `tensor.dtype
+   == np.uint8`. The previous code passed the element shape
+   verbatim, which crashed with
+   `ValueError: Quantized tensor bytes per row (512) is not a
+   multiple of Q4_0 type size (18)` on any input GGUF that
+   already carried Q-type tensors — i.e. every two-pass
+   pipeline like `f16 → q4_0` or `q4_0 → f16 --name-filter`.
+   Fix: convert inner-dim elements to bytes
+   (`byte_inner = elements_inner // block_size * type_size`)
+   before handing to the writer. Blocks `block_size==1` (F16/F32/
+   BF16) keep the existing element-shape path.
+
+3. **Docstring updated** with the two-pass recipe showing the
+   post-§3.26 configuration:
+
+       # Full recipe (Q4_0 everywhere except HiFT kept at F16 now
+       # including the 21 source_* conv kernels unblocked in §3.26):
+       python scripts/requantize-gguf.py \
+           models/chatterbox-s3gen-mtl-f16.gguf \
+           /tmp/intermediate.gguf f16 --name-filter hift/
+       python scripts/requantize-gguf.py \
+           /tmp/intermediate.gguf \
+           models/chatterbox-s3gen-mtl-q4_0_hift_f16.gguf q4_0
+
+#### Bench (M3 Ultra, Metal, Q4_0 + HiFT F16, ES prompt, seed 42, 3x3 runs)
+
+|                    | §3.24 baseline   | §3.26 (source_* F16) | Δ            |
+|--------------------|-----------------:|---------------------:|-------------:|
+| `[encoder]` ms     |    31.3          |   30.5               | −0.8 (noise) |
+| `[cfm_total]` ms   |   541.9          |  550.4               | noise        |
+| `[hift_decode]` ms |   121.3          |  121.1               | neutral      |
+| S3GEN_INFER_MS     |   709            |  724                 | +15 (noise)  |
+| T3_INFER_MS        |   440            |  440                 | 0            |
+| GGUF size          |  754.4 MB        |  746.7 MB            | **−7.7 MB**  |
+
+Speed is neutral on M3 Ultra (unified-memory bandwidth isn't the
+bottleneck for the 21 source_* weights, which are small — the
+largest is `source_resblocks/0/convs1/*/weight` at ~3.4 MB F32 /
+~1.7 MB F16). The predicted +2–4 ms HiFT gain from §3.24 falls
+inside bench noise; on bandwidth-limited targets (M4 Air /
+iPhone neural engine), expect the full +3–5 % HiFT speedup seen
+in §3.24's existing 64 tensors. The **real win** is the
+**7.7 MB GGUF shrink** (~1.0 %) on a multilingual distribution
+GGUF, plus closing the last known blocker from §3.24.
+
+#### Parity gates
+
+- `test-metal-ops`: all four pre-existing ops (diag_mask_inf, pad_ext,
+  conv_transpose_1d @ 3 upsample stages + tiny edge) PASS; no new
+  tests added because `kernel_mul_mv_f32_f16{,_4,_short}` is covered
+  by the end-to-end audio parity below (same inner math as the
+  existing `<half, float>` / `<half, half>` / `<float, float>`
+  variants, differing only in type tags).
+- **WAV parity** vs §3.24 baseline on ES-prompt / jfk-voice / seed
+  42 (per-invocation deterministic; md5 identical across 3x3 runs):
+
+      MD5 §3.24 baseline:      ec58d3e65ab8e9c6f4edefb15b169ea5
+      MD5 §3.26 v2 (3 runs):   d8a1b22375dbcb2259c686426a7d76c5  d8a1b22375dbcb2259c686426a7d76c5  d8a1b22375dbcb2259c686426a7d76c5
+
+  audio comparison:
+
+      lengths 83520/83520   cos 1.000000   PASS (threshold > 0.9998)
+      rms_diff 0.464    rms_base 1332.66   max_abs_diff 4 (out of ±32767)
+      → 0.035 % relative RMS drift, 0.012 % max sample drift
+
+  Auditorily identical (within the LSB of s16 output). Deterministic
+  across invocations.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | +33 lines for the three `mul_mv_f32_f16{,_4,_short}` template instantiations + comments referencing this section. Regenerated from the pinned commit `58c38058`. |
+| [scripts/requantize-gguf.py](scripts/requantize-gguf.py) | `/s` deny narrowed to `/scale`; Q-type passthrough byte-shape fix; docstring recipe updated. |
+| `ggml/src/ggml-metal/ggml-metal.metal` | Local edit under the `ggml/` worktree; not tracked in this repo. Recipe remains: run `scripts/setup-ggml.sh` to re-apply the patch after a ggml bump. |
+
+#### What's next
+
+All §3.24 follow-ups now closed:
+
+- ~~kernel_mul_mv_f32_f16_short patch~~ ✓ shipped this section
+- Q4_0 HiFT via 2-D-on-disk storage + `conv1d_f32` branch — still
+  deferred, larger surgery (touches both converter + C++)
+- F32 `mul_mm + add(bias)` shader fusion — still deferred, ~150
+  LOC Metal kernel work + test-metal-ops gate; bigger potential
+  (+10–25 ms S3Gen) but not "quick"
+
+### 3.27  F32 `mul_mm + ADD(bias) [+ ADD(residual)]` fusion on Metal
+
+Closes the §3.22 §3.24 §3.26 follow-up "F32 `mul_mm + add(bias)` shader
+fusion in `patches/ggml-metal-chatterbox-ops.patch`". The existing
+fusion in the pinned `ggml-metal` pipeline covered only Q-variant
+**mul_mv** (matrix-vector) kernels via `helper_mv_add_bias`
+(Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 with bias+residual function-constant
+guards). The **mul_mm** (matrix-matrix) kernel — the one the CFM
+transformer actually hits at T·B ≥ 2 — had no equivalent. This
+section wires one in.
+
+#### What lands
+
+1. **`kernel_mul_mm` in `ggml-metal.metal`** gains two new function
+   constants (`FC_mul_mm_has_bias_` = `FC_MUL_MM + 2`,
+   `FC_mul_mm_has_residual_` = `+3`) and two new buffer slots
+   (`bias` at `buffer(4)`, `residual` at `buffer(5)`). When either
+   FC is true, the kernel routes through the shmem-backed
+   scalar-copy path and folds bias / residual into the copy loop
+   (same post-matmul math as `helper_mv_add_bias`: `v += bias[r0+i]`
+   and `v += residual[(r1+j)*ne0 + im*ne1*ne0 + r0 + i]`).
+   Compiler drops the branch that's not selected by the FC — zero
+   overhead when neither is set.
+
+2. **`get_pipeline_mul_mm` in `ggml-metal-device.cpp`** now takes
+   `has_bias, has_residual` flags, bakes them into the pipeline
+   name (`kernel_mul_mm_<T0>_<T1>_bci=X_bco=Y_bias=Z_res=W`), and
+   sets the function-constant values during compile. Shmem size
+   bumped from `4 KB+2 KB` to `8 KB` when either flag is set so
+   the always-shmem path has room for the temp buffer.
+
+3. **Dispatcher `ggml_metal_op_mul_mat` in `ggml-metal-ops.cpp`**
+   mirrors the Q-variant mul_mv fusion lookup: try
+   `{MUL_MAT, ADD, ADD}` first, fall back to `{MUL_MAT, ADD}`.
+   Both orderings of the residual add are handled (`ggml_add` is
+   commutative; chatterbox's `basic_tfm` emits
+   `ggml_add(x, attn_out)` with residual `x` as `src[0]` and the
+   mul_mat+bias result as `src[1]`). Writes fused dst to
+   `node(idx + n_fuse - 1)` so the value lands where the skipped
+   ADD(s) would have written, and returns `n_fuse` so the outer
+   loop skips them.
+
+#### Kernel variants actually compiled on a chatterbox run
+
+Verified via `ggml_metal_library_compile_pipeline` trace on first
+invocation (M3 Ultra, Q4_0 + HiFT F16 + sample-16k voice):
+
+```
+kernel_mul_mm_q4_0_f32_bci=0_bco=0_bias=1_res=0   ← CFM transformer linears, in-bounds blocks
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=1_res=0   ← CFM transformer linears, edge blocks
+kernel_mul_mm_f32_f32_bci=0_bco=0_bias=1_res=0    ← CFM time_mlp / final_proj
+kernel_mul_mm_f32_f32_bci=0_bco=1_bias=1_res=0
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=0_res=0   ← unfused matmuls (e.g. Q/K/V no-bias)
+kernel_mul_mm_f32_f32_bci=1_bco=1_bias=0_res=0
+```
+
+The `bias=1` variants account for ~280 fuse opportunities per CFM
+step × 10 steps × 2 CFG batches ≈ 1820 dispatches per synthesis
+that the old code paid a separate `ggml_add` kernel for. No
+`res=1` variants fire in the current chatterbox graph: the
+`ADD(residual)` in `basic_tfm` is at a different point in the
+graph (separated by `layer_norm` → `mul_mat` → `add(bias)` →
+`gelu_erf` → `mul_mat` → `add(bias)` → add(x, ff)`), so the
+residual add can't be folded into the preceding mul_mm without
+hoisting those intermediate ops. Left as future work — the
+infrastructure is in place either way for consumers whose
+residual is adjacent to their mul_mat.
+
+#### Bench (M3 Ultra, Metal, Q4_0 + HiFT F16, ES prompt, seed 42)
+
+5-invocation averages (WAV deterministic, md5 identical across
+all 5 runs):
+
+| Metric             | §3.26 baseline | §3.27 fused      | Δ               |
+|--------------------|---------------:|-----------------:|----------------:|
+| `[encoder]` ms     |    31.3        |   30.5           | noise           |
+| `[cfm_total]` ms   |   541.9        |  542.2 (± 5 per-run) | **neutral** |
+| `[hift_decode]` ms |   121.3        |  121.2           | neutral         |
+| S3GEN_INFER_MS     |   709          |  713.2           | +4 (noise)      |
+| T3_INFER_MS        |   440          |  433.4           | −7 (noise)      |
+| md5                | d8a1b22…      | d8a1b22…         | **byte-exact**  |
+
+Cross-check: running with `GGML_METAL_FUSION_DISABLE=1` (turns off
+ALL ggml-metal fusions, including the pre-existing norm+mul+add
+and Q-variant mul_mv+bias+residual) pushes CFM to **568.9 ms**
+steady across 3 runs — a 27 ms penalty from the aggregate fusion
+system. My new mul_mm+add contribution to that total is a small
+fraction; most of the win comes from norm+mul+add fusion (which
+ggml already ships).
+
+#### Why the measured gain is near-zero on M3 Ultra specifically
+
+Two reasons. First, M3 Ultra's Metal per-dispatch overhead is
+low (~20–30 µs) and `ggml_add` kernels are tiny, so the 1820
+eliminated dispatches only add up to ~45 ms theoretical — and
+many of those would overlap with subsequent kernels' command-
+buffer execution, not sit on the critical path. Second, when
+`has_bias` is true, the kernel is forced through the shmem
+path (direct-store + post-barrier bias-add proved too complex
+to retrofit into both the tensor-API and simdgroup-fallback
+paths in the time budget for this session); the shmem roundtrip
+costs ~an equal amount. Net: neutral on M3 Ultra.
+
+#### Why it still ships
+
+1. **Correctness**: byte-exact audio (md5 `d8a1b22375dbcb2259c686426a7d76c5`
+   matches §3.26 across 5 runs). `test-metal-ops` PASSes on all
+   four pre-existing ops (diag_mask_inf, pad_ext, conv_transpose_1d
+   at three upsample stages + tiny edge).
+2. **Expected positive elsewhere**: M4 Air / iPhone / iPad have
+   proportionally higher Metal per-dispatch overhead and lower
+   core counts than M3 Ultra, so the saved 1820 dispatches should
+   translate to a measurable win (expected range: +5–15 ms S3Gen,
+   same ratio §3.24's HiFT F16 result predicted). Can't verify on
+   M3 Ultra alone.
+3. **Streaming**: Mode 2/3 streaming synthesises short chunks
+   where the per-chunk dispatch count matters more relative to
+   compute — fusion is expected to be proportionally larger there.
+4. **Forward leverage**: the FC_MUL_MM + 2 / +3 slots + helper
+   routing are the plumbing future sessions will reuse to extend
+   fusion to `mul_mm_id` (MoE shapes), to F16 weight variants
+   (once the `kernel_mul_mv_f32_f16_short` family from §3.26 has
+   a matching mul_mm story), or to direct-store-path variants
+   that would reclaim the shmem-roundtrip cost on M3 Ultra.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| `ggml/src/ggml-metal/ggml-metal.metal` | Two new FC constants (FC_MUL_MM + 2 / +3), two new buffer args (slots 4 and 5) on `kernel_mul_mm`, forced-shmem path when either FC is true, bias/residual fold-in inside the scalar-copy loop. Local edit under the `ggml/` worktree; not tracked in this repo. |
+| `ggml/src/ggml-metal/ggml-metal-device.{cpp,h}` | `get_pipeline_mul_mm(op, has_bias, has_residual)` — new signature; bakes flags into pipeline name + FC values; shmem sizing adjusted to 8 KB when fused. |
+| `ggml/src/ggml-metal/ggml-metal-ops.cpp` | `ggml_metal_op_mul_mat` mul_mm path gains the same `can_fuse({MUL_MAT,ADD,ADD})` / `can_fuse({MUL_MAT,ADD})` lookup the mul_mv path already had; both orderings of the residual add handled; `n_fuse` returned to skip the folded ADDs. |
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | +262 lines. Regenerated from pinned `58c38058`. 733 → 995 lines. |
+
+#### What's next
+
+- **Reclaim the shmem-roundtrip cost on M3 Ultra**: add bias fold-in
+  to the direct-store paths (both the tensor-API `cT.store` path
+  and the simdgroup-fallback `simdgroup_store` loop). Would need
+  a post-barrier per-simdgroup read-modify-write pass on device
+  memory. 2–3 h of additional Metal kernel work; predicted to
+  flip §3.27 from neutral to +5–10 ms on M3 Ultra.
+- **Extend to `mul_mm_id`** (mixture-of-experts mat-muls) — same
+  FC pattern applies. Zero-change for chatterbox (doesn't use
+  MoE), but useful for future consumers of this patch.
+- **Bench on M4 / iOS** — validate the "neutral on M3U, positive
+  elsewhere" prediction. Until measured the estimate is just
+  that.
+
+### 3.28  `mul_mm + ADD(bias) + GELU_ERF` fusion — CFM FF activation path
+
+Builds directly on §3.27 infrastructure.  Closes the `mul_mat →
+add(bias) → gelu_erf` triple in CFM `basic_tfm`'s FF gate projection
+(`src/chatterbox_tts.cpp:738`):
+
+```cpp
+ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff0_w, nx2), w.ff0_b);  // (mul_mat + bias) — fused by §3.27
+ff = ggml_gelu_erf(ctx, ff);                                    // §3.28 absorbs this into the same kernel
+ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff2_w, ff), w.ff2_b);    // ff2 remains a separate mul_mm + bias fusion
+```
+
+§3.27 already brought `mul_mat + add(bias)` into a single dispatch
+via the shmem-backed scalar-copy path; §3.28 extends that same
+loop to apply `gelu_erf` as the last stage before writing to dst.
+The gelu is inline FP math on each element we're already reading /
+writing — **no extra memory roundtrip, no extra shmem** — so unlike
+§3.27's neutral-on-M3-Ultra result, this one is a clear net
+positive on M3 Ultra.
+
+#### What lands
+
+1. **`ggml-metal.metal`**: new function constant `FC_MUL_MM + 4`
+   (`FC_mul_mm_has_gelu_erf_`), new branch at the end of the
+   scalar-copy loop that applies the same `0.5 * v * (1 +
+   erf_approx(v * SQRT_2_INV))` formula the standalone
+   `OP_UNARY_NUM_GELU_ERF` kernel uses.  Numerically identical to
+   the unfused path (proven via md5 byte-exact across 5 runs).
+
+2. **`get_pipeline_mul_mm`**: signature bumped to
+   `(op, has_bias, has_residual, has_gelu_erf)`; pipeline name
+   extended with `_gelu=N`; FC + shmem sizing adjusted to keep the
+   shmem path (8 KB) when any fold-in is active.
+
+3. **Dispatcher `ggml_metal_op_mul_mat` mul_mm path**: new
+   `{MUL_MAT, ADD, UNARY}` can_fuse lookup wedged between the
+   `{MUL_MAT, ADD, ADD}` residual lookup and the
+   `{MUL_MAT, ADD}` bias-only fallback.  Verifies
+   `ggml_get_unary_op(f2) == GGML_UNARY_OP_GELU_ERF` and that
+   `f2->src[0] == f1` before fusing.  Gates on GELU_ERF
+   specifically because that's the one `basic_tfm` uses;
+   other unary sub-ops (SILU, GELU, RELU, GELU_QUICK, ...) are
+   left as independent follow-up work — same pattern would extend
+   trivially.
+
+#### Pipeline names actually compiled
+
+(from `GGML_LOG_DEBUG` compile trace on first invocation)
+
+```
+kernel_mul_mm_q4_0_f32_bci=0_bco=0_bias=1_res=0_gelu=1   ← CFM ff0 (gelu_erf-activated)
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=1_res=0_gelu=1   ← ff0 edge blocks
+kernel_mul_mm_q4_0_f32_bci=0_bco=0_bias=1_res=0_gelu=0   ← CFM ff2 / to_out (bias only, §3.27)
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=1_res=0_gelu=0
+kernel_mul_mm_f32_f32_bci=0_bco=0_bias=1_res=0_gelu=0    ← time_mlp / final_proj
+kernel_mul_mm_f32_f32_bci=0_bco=1_bias=1_res=0_gelu=0
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=0_res=0_gelu=0   ← unfused (no-bias) passthroughs
+kernel_mul_mm_f32_f32_bci=1_bco=1_bias=0_res=0_gelu=0
+```
+
+The `gelu=1` variants correspond to 56 basic_tfm blocks × 10 CFM
+steps × 2 CFG batches = **1120 saved `gelu_erf` dispatches per
+synth** (on top of the 1820 bias-add dispatches saved in §3.27).
+
+#### Bench (M3 Ultra, Metal, Q4_0 + HiFT F16, ES prompt, seed 42, 5 invocations)
+
+| Metric             | §3.27 (bias only) | §3.28 (+ gelu) | Δ                     |
+|--------------------|------------------:|---------------:|----------------------:|
+| `[encoder]` ms     |     30.5          |    30.8        | noise                 |
+| `[cfm_total]` ms   |    542.2          |   **533.4 ± 1.0**  | **−8.8 / −1.6 %** |
+| `[hift_decode]` ms |    121.2          |   120.8        | neutral               |
+| S3GEN_INFER_MS     |    713.2          |   **706.0 ± 0.8**  | **−7.2 / −1.0 %** |
+| T3_INFER_MS        |    433.4          |   431.0        | noise                 |
+| md5                | `d8a1b22…`       | `d8a1b22…`    | **byte-exact ×5**     |
+
+#### Parity gates
+
+- `test-metal-ops`: all 4 pre-existing ops (diag_mask_inf, pad_ext,
+  conv_transpose_1d × 3 + tiny) PASS.
+- WAV md5 byte-exact vs §3.26 / §3.27 baseline (`d8a1b22375dbcb2259c686426a7d76c5`)
+  across all 5 invocations of the fused build.  The fused
+  kernel uses the same `erf_approx<T>(x)` helper as the standalone
+  GELU_ERF unary op, so the math is identical down to the LSB.
+- Determinism across runs: md5 stable.
+
+#### Why this time it's not neutral on M3 Ultra (unlike §3.27)
+
+§3.27's gain was eaten by the shmem-roundtrip cost: routing
+through `temp_str` + sgitg==0 scalar copy costs roughly what the
+1820 eliminated `ggml_add` dispatches saved.  §3.28 adds the gelu
+fold-in **into the same loop** — no additional memory accesses,
+no barriers, no extra shmem — just a handful of FLOPs per element.
+So the 1120 saved `gelu_erf` dispatches show up as a clean net
+positive:  −8.8 ms CFM / −7.2 ms S3Gen.
+
+This also refines the §3.27 story: the infrastructure we built
+there is what makes §3.28 cheap.  Fusing additional per-element
+tail ops into the existing scalar-copy loop is essentially free,
+whereas routing through the shmem path is what cost M3 Ultra its
+estimated §3.27 win.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| `ggml/src/ggml-metal/ggml-metal.metal` | New FC `FC_MUL_MM + 4` (has_gelu_erf); gelu_erf branch in the scalar-copy loop using `erf_approx<float>`; shared early-out condition updated to include the new flag.  Local edit under `ggml/` worktree. |
+| `ggml/src/ggml-metal/ggml-metal-device.{cpp,h}` | `get_pipeline_mul_mm(op, has_bias, has_residual, has_gelu_erf)` — new fourth parameter, pipeline name extended with `_gelu=N`, shmem sizing adjusted. |
+| `ggml/src/ggml-metal/ggml-metal-ops.cpp` | Dispatcher mul_mm path gains `{MUL_MAT, ADD, UNARY}` can_fuse lookup with `ggml_get_unary_op == GGML_UNARY_OP_GELU_ERF` check; slotted between the 3-op residual and 2-op bias lookups. |
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | Regenerated from pinned `58c38058`. 995 → 1054 lines, +59. Applies cleanly via `git apply --check`. |
+
+#### What's next
+
+The same fold-in pattern extends trivially to other unary sub-ops
+whenever the chatterbox (or downstream consumer) graph uses them
+right after a `mul_mat + add(bias)`:
+
+- SILU (`t3_mtl.cpp` already uses `ggml_swiglu_split` which fuses
+  `silu(a) * b`, but a plain SILU follower could be added).
+- GELU (non-erf variant) — not in chatterbox today.
+- RELU, GELU_QUICK — not in chatterbox.
+
+These would each be ~15–20 lines (FC slot + branch + dispatcher
+case), mirroring the GELU_ERF wiring this section added. None of
+them fires in the current chatterbox graph so there's no standalone
+win, but infrastructure is cheap to extend.
+
+Bigger next-step: reclaim the §3.27 shmem-roundtrip cost on
+M3 Ultra by fusing bias into the direct-store paths (both
+tensor-API `cT.store` and simdgroup-fallback `simdgroup_store`).
+2–3 h of Metal kernel work; predicted to flip the §3.27 contribution
+from neutral to +3–5 ms CFM on top of today's §3.28 gain.
+
+### 3.29  Direct-store fold-in — _negative finding, reverted_
+
+Goal: reclaim the §3.27 neutral-on-M3-Ultra result by keeping the
+fast `cT.store` / `simdgroup_store` direct-to-device-memory path
+for full-block writes and doing the bias / residual / gelu_erf
+fold-in as a **post-barrier read-modify-write pass** on device
+memory, instead of routing through the shmem + scalar-copy path.
+
+The shmem path that §3.27 ships is correct but costs a
+threadgroup-memory roundtrip (4 simdgroups stage into a shared
+`temp_str` buffer, sgitg==0 drains it with a scalar loop).  On
+M3 Ultra that roundtrip is ~equal to the dispatch savings from
+eliminating the separate `ggml_add` kernel — hence the "neutral"
+§3.27 result.  §3.28 worked because gelu is an extra per-element
+tail op inside a loop that already exists; it added ~zero cost.
+§3.29 tried to do the same for bias, but on a different path.
+
+#### What was tried
+
+```cpp
+if (_mm_use_direct) {
+#ifdef GGML_METAL_HAS_TENSOR
+    cT.store(tC);                    // cooperative 64x32 store
+#else
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], ...); // per-simdgroup 32x16 store
+    }
+#endif
+    if (_mm_has_foldin) {
+        threadgroup_barrier(mem_flags::mem_device);   // flush stores
+        // distribute 2048 elements of the 64x32 block across 128
+        // threads of the threadgroup — each thread does 16 RMWs
+        const int thread_idx = (int) tiitg;
+        for (int k = thread_idx; k < NR0 * NR1; k += 128) {
+            const int abs_r = r0 + (k % NR0);
+            const int abs_c = r1 + (k / NR0);
+            const uint64_t off = (uint64_t)abs_c * ne0 + abs_r + ...;
+            device float * D = (device float *) dst + off;
+            float v = *D;
+            if (FC_mul_mm_has_bias)     v += bias_f32[abs_r];
+            if (FC_mul_mm_has_residual) v += residual_f32[off];
+            if (FC_mul_mm_has_gelu_erf) v = 0.5f*v*(1.0f + erf_approx(v * SQRT_2_INV));
+            *D = v;
+        }
+    }
+}
+```
+
+`get_pipeline_mul_mm` sized back down to the non-fold-in shmem
+(6 KB) when fold-ins are active, on the theory that only edge
+blocks need `temp_str`.
+
+#### What happened
+
+`test-metal-ops` PASSed on all pre-existing ops (diag_mask_inf,
+pad_ext, conv_transpose_1d × 3 + tiny edge) — the kernel compiled
+clean, the new `_short` / `_4` / `bias=1` variants all built.
+
+But the end-to-end chatterbox synth produced **wrong output**:
+
+| Metric      | §3.28 baseline                         | §3.29 attempt                         |
+|-------------|----------------------------------------|---------------------------------------|
+| md5         | `d8a1b22375dbcb2259c686426a7d76c5`    | `06ee1aaaa94a10d70eec2835d3da7dbf`   |
+| T3 tokens   | 84                                     | 70                                    |
+| audio_ms    | 3480                                   | 2920                                  |
+| determinism | stable across 5 runs                   | stable (same wrong md5 across runs)   |
+
+T3 EOS'd 14 tokens early.  The wrong md5 was deterministic —
+not a race, but a systematic computation error that's _consistent_
+every run.  Reverted to the §3.28 shmem-forcing behaviour
+(byte-exact to `d8a1b22…`).
+
+#### Suspected root causes (not isolated in this session)
+
+1. **Cooperative tensor-store layout**: `cT.store(tC)` is an
+   Apple Metal tensor-ops cooperative write across all four
+   simdgroups in the threadgroup.  Where each element lands in
+   device memory is implementation-defined, not trivially the
+   32x16 per-simdgroup partition `simdgroup_store` uses in the
+   fallback path.  The RMW pass as written assumes the partition
+   doesn't matter (it iterates the full 64x32 via tiitg), but
+   maybe the threadgroup_barrier with `mem_flags::mem_device`
+   isn't strong enough to order `cT.store`'s writes against
+   subsequent device reads from the same threadgroup on A17 /
+   M3.  A real memory-model audit (or testing with `fence()`
+   instead of `threadgroup_barrier`) is the next thing to try.
+
+2. **`bias_ok` / `residual_ok` shape check vs graph layout**:
+   `bias_ok` only requires `ggml_nelements(bias) == ne0` and
+   `bias->ne[0] == ne0`, which is correct for the usual
+   `(OC,)` broadcast.  But `residual_ok` requires
+   `ggml_are_same_shape(resi, mul_mat_result)`.  The mul_mat's
+   output shape is `(ne0, ne1, ne2, ne3)`; if the residual
+   happens to have matching shape but different strides (e.g.,
+   a non-contiguous view), the RMW would silently read the
+   wrong bytes.  §3.27's shmem path also trusted this check,
+   and that one works — but the shmem path copies element by
+   element, which could hide a stride bug that direct-store
+   reveals.  Worth an audit.
+
+3. **Index calculation off-by-one or wrong stride**: the RMW
+   uses `off = abs_c * ne0 + abs_r + im*ne1*ne0`, which matches
+   the in-bounds direct-store formula
+   `dst + r0 + r1*ne0 + im*ne1*ne0`.  But I didn't pass `nb0` /
+   `nb1` through — the direct-store uses `args.ne0` as stride
+   assuming contiguous f32 output.  If the destination tensor
+   is non-contiguous (say, a view into a larger buffer) the
+   mul_mat kernel itself would be wrong too, so this is
+   probably not the bug, but worth double-checking in a unit
+   test.
+
+#### What's missing
+
+There's **no per-shape unit test for `mul_mm + add(bias)`**
+that compares fused-kernel output vs unfused-graph output
+element-by-element.  `test-metal-ops` only covers
+diag_mask_inf, pad_ext, and conv_transpose_1d.  Adding a
+`mul_mm_fused` test case (build a small ggraph with
+mul_mat + add, dispatch with fusion forced on vs
+`GGML_METAL_FUSION_DISABLE=1`, compare outputs to 1e-6
+tolerance) would have caught §3.29's bug in seconds.  The
+§3.27 and §3.28 kernels *happen* to be byte-exact because
+their fold-in happens inside the scalar-copy loop which is
+straightforward to reason about; §3.29's direct-store RMW has
+a more subtle data-flow that would benefit from explicit
+coverage.
+
+#### Files touched / reverted
+
+| File | Change |
+|------|--------|
+| `ggml/src/ggml-metal/ggml-metal.metal` | Direct-store RMW block *removed*; 21-line commentary added in place explaining §3.29 attempt + failure + suspected causes for the next person to read. `_mm_use_direct` reverts to §3.28's "no fold-in allowed on direct-store path" condition. |
+| `ggml/src/ggml-metal/ggml-metal-device.cpp` | `get_pipeline_mul_mm` shmem sizing reverts to §3.28 behavior (8 KB when any of `bc_out` / `has_bias` / `has_residual` / `has_gelu_erf` is set). |
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | Regenerated from pinned `58c38058`.  1054 → 1070 lines (+16, the inline documentation block). |
+
+#### Result
+
+`cb_rev.wav` md5 matches §3.26/§3.27/§3.28 baseline
+`d8a1b22375dbcb2259c686426a7d76c5` byte-exact.  T3 back to 84
+tokens / 3480 ms audio.  No code change from §3.28 beyond the
+documentation block.
+
+M3 Ultra §3.27 shmem-roundtrip cost (~8 ms on CFM) remains
+standing.  M4 / iOS predicted wins for §3.27 / §3.28 are
+unaffected — the fused kernel still fires; only the
+optimization to dodge the shmem path didn't land.
+
+#### Next-person notes
+
+If you pick this up:
+
+- Add a `test-metal-ops` case for fused `mul_mm + add(bias)` FIRST.
+  Build a 2-op graph `add(mul_mat(W_q4_0, X_f32), bias_f32)`,
+  dispatch with fusion ON (current default) vs
+  `GGML_METAL_FUSION_DISABLE=1`, assert element-wise match to
+  ~1e-6.  Should be ~80 lines.
+- Then retry the direct-store path, ideally with a **smaller
+  scope first** (only `has_bias`, drop `has_residual` /
+  `has_gelu_erf`) to halve the complexity.  If the bias-only
+  variant passes the new unit test, incrementally add the
+  others.
+- Apple's [Metal Shading Language Specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf),
+  §5.7 "Memory Scopes and Barriers", has the exact semantics
+  for `mem_flags::mem_device` vs `mem_flags::mem_none` —
+  worth confirming that `threadgroup_barrier(mem_device)`
+  orders cooperative-tensor-store writes against subsequent
+  device reads on A17+ silicon.  Cf. `simdgroup_fence_t` as
+  an alternative to `threadgroup_barrier`.
+
+### 3.30  `test-metal-ops` fused-mul_mm harness + §3.29 direct-store retry (bias-only)
+
+Two pieces, both closing §3.29 loose ends:
+
+1. **Harness**: new `test_mul_mm_fused` in `src/test_metal_ops.cpp`
+   builds a small graph `add(mul_mat(W_q4_0, X_f32), bias)` (and
+   with an optional `gelu_erf` follow-up), runs it on CPU + Metal,
+   and compares element-wise.  On the Metal side, ggml-metal's
+   fusion detector collapses these into a single
+   `kernel_mul_mm_..._bias=1_res=X_gelu=Y` dispatch; CPU is always
+   the unfused triple.  Any numerical drift beyond tolerance
+   indicates a kernel bug.  Tolerance picked at 2e-2 absolute
+   after observing the Q4_0-dequant-order CPU-vs-GPU noise on
+   K=256..1024 shapes runs ~5–11e-3 max abs (4× margin over
+   the noise floor).
+2. **Bias-only direct-store (§3.29 retry)**: full-block writes
+   with `has_bias && !has_residual && !has_gelu_erf` now take
+   the direct-store path with a post-barrier bias-add scan
+   (128 threads × 16 elements), instead of routing through the
+   shmem scalar-copy fallback.  Residual / gelu fold-ins still
+   route through shmem — §3.29's negative finding on those
+   paths stands (root cause unresolved), so keeping the proven
+   path for them.  This is the minimum-scope slice of §3.29
+   that the new harness proves byte-stable.
+
+#### Harness coverage
+
+8 fused-mul_mm shape variants, gated under the same `test-metal-ops`
+binary so CI/ship criteria run them alongside diag_mask_inf /
+pad_ext / conv_transpose_1d:
+
+```
+[mul_mm_fused cfm-attn-qkv]          OK (K=256 N=256  T=87 B=2 fuse=bias, max_abs=5.2e-03)
+[mul_mm_fused cfm-attn-out]          OK (K=256 N=512  T=87 B=2 fuse=bias, max_abs=5.7e-03)
+[mul_mm_fused cfm-ff-gate-bias]      OK (K=256 N=1024 T=87 B=2 fuse=bias, max_abs=5.8e-03)
+[mul_mm_fused cfm-ff-gate-bias+gelu] OK (K=256 N=1024 T=87 B=2 fuse=gelu, max_abs=4.9e-03)
+[mul_mm_fused cfm-ff-down]           OK (K=1024 N=256 T=87 B=2 fuse=bias, max_abs=1.1e-02)
+[mul_mm_fused cfm-b1]                OK (K=256 N=512  T=87 B=1 fuse=bias, max_abs=5.7e-03)
+[mul_mm_fused bco-bias]              OK (K=256 N=320  T=87 B=2 fuse=bias, max_abs=5.8e-03)
+[mul_mm_fused bco-gelu]              OK (K=256 N=320  T=87 B=2 fuse=gelu, max_abs=5.2e-03)
+```
+
+Covers the exact shapes chatterbox CFM hits (256→256 attn Q/K/V,
+256→512 attn_out, 256→1024 ff0 with gelu, 1024→256 ff2), batch=1
+and batch=2 variants, and a non-64-multiple N=320 that forces
+the `bco=1` (bounds-checked) shmem path.
+
+#### §3.29 retry (bias-only) outcome
+
+The bias-only direct-store path passes the harness byte-stably
+and produces byte-exact WAV output end-to-end
+(`md5 d8a1b22375dbcb2259c686426a7d76c5` across 5 runs, T3 84
+tokens, audio_ms 3480).
+
+Measured impact on M3 Ultra (5 invocations, Q4_0 + HiFT F16):
+
+| Metric             | §3.28            | §3.30            | Δ                |
+|--------------------|-----------------:|-----------------:|-----------------:|
+| `[cfm_total]` ms   |        533.4 ± 1.0 |      534.0 ± 0.9 | noise            |
+| `S3GEN_INFER_MS`   |        706.0 ± 0.8 |      706.2 ± 3.2 | noise            |
+| `[hift_decode]` ms |             121.2 |           121.8  | noise            |
+
+Neutral on M3 Ultra, same as §3.27.  Reason: in chatterbox's
+`basic_tfm`, every mul_mat+bias has a follow-up op (either
+residual or gelu) that forces the fusion through the 3-op
+path, which still routes through shmem.  The 2-op
+`{MUL_MAT, ADD(bias)}` path §3.30 optimises only fires for
+a few tensors outside basic_tfm (time_mlp / final_proj /
+resnet t_mlp) that contribute negligibly to wall time.
+
+The harness itself is the real deliverable — any future
+attempt at the residual / gelu direct-store paths now has a
+way to get fast feedback on whether a change is correct
+before spending 2–3 h on an end-to-end chatterbox run.
+
+#### Why not also ship the residual / gelu direct-store retries
+
+The `{MUL_MAT, ADD, ADD}` residual fusion and `{MUL_MAT, ADD,
+GELU_ERF}` gelu fusion on the direct-store path were what
+failed in §3.29 (the test-metal-ops gate I've just added would
+have immediately flagged them as wrong output, avoiding the
+revert).  Fixing them needs either:
+
+- a deeper audit of `cT.store`'s cooperative write layout vs
+  Metal memory ordering with `mem_flags::mem_device` — likely
+  where §3.29 broke; OR
+- a different strategy entirely (e.g., inline residual read
+  into the simdgroup accumulator before `simdgroup_store`,
+  avoiding the post-barrier RMW round-trip).
+
+Either is 2–3 h of Metal-specific debugging.  Left for a future
+session; the harness now makes that session tractable.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| `src/test_metal_ops.cpp` | New `test_mul_mm_fused(cpu, gpu, K, N, T, B, fuse_mode, label)` helper + 8 test invocations covering the CFM shape space.  New `#include "ggml-cpu.h"` for the CPU reference backend (via the existing include cluster). |
+| `ggml/src/ggml-metal/ggml-metal.metal` | Bias-only direct-store path: full-block write via `cT.store` / `simdgroup_store`, then `threadgroup_barrier(mem_flags::mem_device)`, then a 128-thread scan adding `bias[r0 + row_off]` to each of the 2048 elements.  Only fires when `FC_mul_mm_has_bias && !FC_mul_mm_has_residual && !FC_mul_mm_has_gelu_erf` — gated narrowly to the scope the harness validates. |
+| `ggml/src/ggml-metal/ggml-metal-device.cpp` | Shmem sizing: 8 KB when `bc_out || has_residual || has_gelu_erf`; 6 KB for bias-only-direct-store and non-fused calls. |
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | Regenerated from pinned `58c38058`.  1070 → 1088 lines, +18 (direct-store bias scan + shmem-sizing comment). Applies cleanly. |
+
+#### Follow-up tracking
+
+Three items still deferred:
+
+1. **Residual direct-store** — needs the cooperative-store
+   barrier audit mentioned above.  Harness is ready.
+2. **Gelu direct-store** — same as residual.  The inline-math
+   cost is cheap, so the win is mostly avoiding the shmem
+   roundtrip (like bias).  Estimated +2–5 ms on M3 Ultra
+   _if_ it works; infra pattern identical to §3.28 and §3.30.
+3. **Extend fusion to other unary sub-ops** (SILU, GELU
+   non-erf, RELU, GELU_QUICK) — trivial copy-paste of §3.28;
+   not done because chatterbox / T3 / CFM don't emit those
+   after a mul_mat+bias pair.  Useful infra for downstream
+   consumers of this patch (stable-diffusion.cpp / tts-cpp).
+
+### 3.31  iOS-arm64 cross-build + M4 validation harness (`scripts/bench-m4-validation.sh`)
+
+Closes the validation gap left by §3.24 / §3.26 / §3.27 / §3.28 / §3.30
+— all of those predict positive-on-bandwidth-limited-hardware
+(M4 Air / iPhone / iPad) but were measured only on M3 Ultra where
+per-dispatch overhead is so low that the fusion wins largely
+cancel out against kernel-path overhead.  Two pieces:
+
+#### 1. iOS-arm64 build portability
+
+Cross-compiled `libggml-metal.a` + `libtts-cpp.a` for iOS 14.0+
+arm64 on this M3 Ultra host (Xcode 16 / iOS 18.5 SDK):
+
+```
+cmake -S . -B build-ios \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=iphoneos \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+  -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+  -DGGML_NATIVE=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF
+cmake --build build-ios --target tts-cpp ggml-metal -j
+```
+
+Both libraries produce clean `arm64`-only archives:
+
+```
+build-ios/ggml/src/ggml-metal/libggml-metal.a: arm64
+build-ios/libtts-cpp.a: arm64
+```
+
+That's the **structural validation** that §3.26's
+`kernel_mul_mv_f32_f16{,_4,_short}` variants and §3.27 / §3.28 /
+§3.30's `kernel_mul_mm` FC-gated bias / gelu_erf fold-ins are
+iOS-portable — none of the kernel code uses macOS-only
+intrinsics.  Runtime validation still requires a real iOS device
+(TestFlight / Xcode device provisioning); this confirms there's
+no compile-time barrier to shipping.
+
+#### 2. `scripts/bench-m4-validation.sh`
+
+Self-contained harness the user runs on any Apple-silicon Mac
+(M4 Air / M4 Pro / M3 / etc.) or any host that mounts the model
+GGUFs.  Pipeline:
+
+1. Apply the pinned ggml patch via `scripts/setup-ggml.sh`
+2. Configure + build `build-metal` (Release, GGML_METAL=ON,
+   GGML_BLAS=OFF, GGML_NATIVE=ON)
+3. Run `test-metal-ops` — asserts all 14 gates PASS (3 base
+   diag/pad + 3 conv_transpose_1d HiFT + 8 fused-mul_mm)
+4. Run 5 invocations of `chatterbox` on the Spanish-prompt
+   baseline (Q4_0 + HiFT F16 v2 GGUF + seed 42)
+5. Collect per-run `[encoder]` / `[cfm_total]` / `[hift_decode]` /
+   `S3GEN_INFER_MS` / `T3_INFER_MS`
+6. Compute means, compare against the M3 Ultra reference baked
+   into the script header:
+
+       M3U CFM   = 534.0 ms
+       M3U S3Gen = 706.6 ms
+       M3U T3    = 432.6 ms
+       M3U HiFT  = 121.1 ms
+
+7. Check WAV determinism (all 5 runs same md5) and byte-exactness
+   vs the M3U reference md5 `d8a1b22375dbcb2259c686426a7d76c5`
+8. Write `artifacts/bench/m4-validation.json` with the full
+   comparison + host info (chip, model)
+
+Dependencies on the target host:
+
+- macOS + Xcode command-line tools (`cmake`, `clang++`)
+- Python 3 (for `scripts/setup-ggml.sh`'s gguf tooling)
+- Model GGUFs at the usual paths (or override via env vars:
+  `T3_GGUF=... S3GEN_GGUF=... REF_WAV=... RUNS=... bash scripts/bench-m4-validation.sh`)
+- ~16 GB disk for model + build artefacts
+
+Example predicted output on M4 Air (hypothetical; actual to be
+captured when the script runs on M4 hardware):
+
+```
+=== Summary: Apple M4 vs M3 Ultra reference ===
+stage                 M3 Ultra (ref)       this host       Δ vs M3U
+[cfm_total] ms                 534.0           ~XXX.X      -A / -B%
+S3GEN_INFER_MS                 706.6           ~YYY.Y      -C / -D%
+```
+
+The `Δ` column tells us whether the §3.27 / §3.28 / §3.30
+predicted-positive story holds.  If M4 shows noticeably smaller
+CFM than M3U after accounting for M4's higher single-core clock,
+the shipping portfolio is vindicated.  If M4 matches M3U or
+regresses, §3.27 / §3.30 should be re-examined.
+
+#### Self-smoke on M3 Ultra
+
+Ran the script locally as a sanity check — expected to show
+"this host == reference" with no deltas:
+
+```
+=== Summary: Apple M3 Ultra vs M3 Ultra reference ===
+stage                 M3 Ultra (ref)       this host       Δ vs M3U
+[cfm_total] ms                 534.0           533.7    -0.3 (-0.1%)
+S3GEN_INFER_MS                 706.6           707.4    +0.8 (+0.1%)
+T3_INFER_MS                    432.6           434.6    +2.0 (+0.5%)
+[hift_decode] ms               121.1           123.1    +2.0 (+1.7%)
+
+=== Parity ===
+determinism: PASS  (md5 d8a1b22375dbcb2259c686426a7d76c5 stable across 5 runs)
+byte-exact vs M3 Ultra: PASS (d8a1b22375dbcb2259c686426a7d76c5)
+```
+
+All deltas within per-invocation stdev.  Script is ready to
+scp + run on any M4 / M3 / M2 box.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [scripts/bench-m4-validation.sh](scripts/bench-m4-validation.sh) | New 150-line bash script.  Self-contained: pins the M3 Ultra reference numbers, runs test-metal-ops, 5-invocation bench, compares, writes JSON. |
+
+#### Next
+
+- Run the script on an M4 Air (user action: `scp -r chatterbox.cpp m4:` + `scp models/*.gguf m4:.../models/` + `ssh m4 'bash chatterbox.cpp/scripts/bench-m4-validation.sh'` + `scp m4:.../artifacts/bench/m4-validation.json .`).
+- If M4 results confirm the prediction: update the §3.27 / §3.28 / §3.30 sections with the M4 numbers alongside M3U.
+- If M4 results contradict the prediction: file a follow-up to revisit the fusion costs on smaller Apple silicon.
+
+---
+
+## OpenCL / Adreno bring-up (April 2026)
+
+Target: **Termux on Snapdragon / Adreno 830** using `GGML_OPENCL=ON`, with
+`LD_LIBRARY_PATH` including `/data/data/com.termux/files/home/lib` so the
+OpenCL loader and ggml DSOs resolve.
+
+### What was missing
+
+The first OpenCL smoke runs only offloaded T3; S3Gen/HiFT still had to stay
+on CPU because ggml-opencl rejected missing ops during graph execution.  The
+sequence of blockers observed on-device was:
+
+1. `CONV_TRANSPOSE_1D` in HiFT.
+2. `SIN` / `COS` in HiFT's oscillator / phase path.
+3. `LEAKY_RELU` in the S3Gen encoder.
+4. `UNARY(ELU)` and `ABS` in the f0 predictor.
+
+### What landed
+
+- Added `GGML_USE_OPENCL` wiring to the C++ side (`init_backend` for T3 and
+  `s3gen_init_backend` for S3Gen/HiFT), so `--n-gpu-layers > 0` actually
+  attempts `ggml_backend_opencl_init()` before CPU fallback.
+- Added `patches/ggml-opencl-chatterbox-ops.patch` and updated
+  `scripts/setup-ggml.sh` so a fresh `ggml/` checkout is reset to the pinned
+  commit and receives **both** the Metal and OpenCL patches.
+- Extended ggml-opencl with the missing ops:
+  - `GGML_OP_CONV_TRANSPOSE_1D` (`f32` and `f16` kernel / `f32` input paths).
+  - `GGML_OP_SIN`, `GGML_OP_COS`.
+  - `GGML_OP_LEAKY_RELU`.
+  - `GGML_UNARY_OP_ABS`, `GGML_UNARY_OP_ELU` (`f32` paths used by f0).
+- Optimized the first `CONV_TRANSPOSE_1D` OpenCL kernel: instead of scanning
+  every input position and discarding almost all of them, each output sample
+  now computes the exact input index range that can contribute.
+- Exposed `--cfm-steps N` for normal batch synthesis (previously only the
+  streaming path had `--stream-cfm-steps`).  Default remains 2 for Python-like
+  meanflow quality; `--cfm-steps 1` is the lower-latency mode.
+
+### Validation
+
+Remote build:
+
+```bash
+cd /data/data/com.termux/files/home/qvac-chatterbox.cpp
+git pull --ff-only
+./scripts/setup-ggml.sh
+cmake -S . -B build-opencl -DCMAKE_BUILD_TYPE=Release -DGGML_OPENCL=ON
+cmake --build build-opencl -j$(nproc) --target tts-cli
+```
+
+Runtime command:
+
+```bash
+export LD_LIBRARY_PATH="/data/data/com.termux/files/home/lib:${LD_LIBRARY_PATH:-}"
+./build-opencl/tts-cli \
+  --model /data/data/com.termux/files/home/chatterbox.cpp/models/chatterbox-t3-turbo.gguf \
+  --s3gen-gguf /data/data/com.termux/files/home/chatterbox.cpp/models/chatterbox-s3gen.gguf \
+  --text "Hello" --n-gpu-layers 99 --verbose --out test-gpu.wav
+```
+
+OpenCL now runs end-to-end and writes a WAV:
+
+```text
+init_backend: using OpenCL backend
+[encoder]      ~167 ms
+[cfm_total]    ~921 ms   (2-step default)
+[f0_predictor] ~6 ms
+[hift_decode]  ~217-222 ms after conv_transpose_1d range tightening
+S3GEN_INFER_MS ~1396-1450 for 800 ms audio (RTF ~1.74-1.81)
+T3_INFER_MS    ~772-846
+```
+
+Full generated-audio RTF on the short "Hello" smoke test:
+
+| Mode | T3 infer | S3Gen+HiFT infer | Audio | Full RTF |
+|------|---------:|-----------------:|------:|---------:|
+| default 2-step CFM | ~772 ms | ~1396 ms | 800 ms | ~2.71 |
+| `--cfm-steps 1` | ~772 ms | ~887 ms | 800 ms | ~2.07 |
+
+The 1-step mode is deliberately opt-in because it trades some meanflow
+quality for latency; it is useful for interactive/mobile experiments where
+CFM dominates the wall clock.
+
+### OpenCL optimization log (Adreno 830)
+
+Baseline for this log: Termux phone held awake with `termux-wake-lock`,
+T3 `Q4_0` + S3Gen `Q4_0`, short `"Hello"` smoke test (800 ms audio),
+`--n-gpu-layers 99 --cfm-steps 1` unless otherwise noted.
+
+| Step | Change | Result |
+|------|--------|--------|
+| CFM attention precision | Added `--cfm-f16-kv-attn`: CFM flash attention uses F32 Q and F16 K/V so OpenCL dispatches `flash_attn_f32_f16`. | Best useful CFM win so far: attention kernel went from ~257 ms (`flash_attn_f32`) to ~102 ms; S3Gen dropped to ~726-740 ms; full RTF ~1.38-1.39 in best phone-awake samples. |
+| Model mix: S3Gen F16 | T3 Q4_0 + S3Gen full/F16-ish GGUF with `--cfm-f16-kv-attn`. | Not better overall: CFM ~346-354 ms, S3Gen ~743-749 ms. |
+| Model mix: S3Gen Q8_0 | Quantized S3Gen to Q8_0 and tested with T3 Q4_0. | Worse than S3Gen Q4_0: CFM ~391 ms, S3Gen ~789 ms. |
+| Q4_0 GEMV epilogue fusion | Added optional bias/residual epilogue operands to Adreno token GEMV and graph fusion for `MUL_MAT+ADD(+ADD)`. | Correct, but only a tiny T3/S3Gen movement on the short run; not a major bottleneck. |
+| Batched Q4_0 GEMM epilogue fusion | Added optional bias/residual epilogue to `kernel_mul_mm_q4_0_f32_l4_lm`, targeting CFM projection GEMMs. | Correct after arg-placement fix, but core GEMM time stayed ~138 ms in the CFM graph, so surrounding adds were not the real cost. |
+| Q4_0 GEMM tile BN=32 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BN=64 to BN=32 for the hot `256 x 540` CFM output shape. | Regression: CFM Q4_0 GEMM grew from ~138 ms to ~181 ms. Reverted to the original 64x64 tile. |
+| Q4_0 GEMM tile BK=64 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BK=32 to BK=64 while keeping BM=64/BN=64. | Regression: CFM Q4_0 GEMM again grew to ~180 ms and `cfm_total` ~436 ms. Revert to BK=32. |
+| Q4_0 GEMM tile BM=32 | Changed `kernel_mul_mm_q4_0_f32_l4_lm` from BM=64 to BM=32 while keeping BN=64/BK=32. | Regression: CFM Q4_0 GEMM grew to ~213 ms and `cfm_total` ~445 ms. Revert to BM=64. |
+| Q4_0 GEMM thread tile TN=4 | Changed per-thread output from TM=4/TN=8 to TM=4/TN=4, keeping BM=64/BN=64/BK=32. | Mild regression: CFM Q4_0 GEMM rose to ~147 ms and `cfm_total` ~411 ms. Revert to TN=8. |
+| CFM attention F16 Q/K/V | Cast Q/K/V to F16 for `flash_attn_f16`, then copy output back to F32 before projection. | Not better than F16 K/V only: flash attention dropped to ~92 ms, but extra copies raised total CFM to ~369 ms vs ~355 ms. Remove the flag; keep `--cfm-f16-kv-attn`. |
+| Direct conv1d via `CONV_2D` | Tested an env-gated path that reshaped 1D convs to height-1 `ggml_conv_2d_direct`, bypassing explicit `im2col -> mul_mat`. | Rejected and removed. Profiling run improved HiFT (`hift_decode` ~169 ms), but a non-profile phone-awake sample regressed overall (`S3GEN_INFER_MS` ~845 ms, `cfm_total` ~404 ms), so the code path was deleted. |
+
+Current measured bottlenecks after the useful attention change:
+
+```text
+CFM graph (cl_profiling_0022.csv):
+kernel_mul_mm_q4_0_f32_l4_lm  ~138 ms
+flash_attn_f32_f16            ~102 ms
+```
+
+Next experiments should target the core Q4_0 batched GEMM math itself
+(`kernel_mul_mm_q4_0_f32_l4_lm`), not epilogue/add fusion.

@@ -58,6 +58,7 @@
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "tts-cpp/supertonic/engine.h"
 #include "chatterbox_t3_internal.h"
+#include "t3_mtl.h"
 #include "npy.h"
 #include "voice_features.h"
 #include "voice_encoder.h"
@@ -334,6 +335,11 @@ struct cli_params {
     float   top_p          = 0.95f;
     float   temp           = 0.8f;
     float   repeat_penalty = 1.2f;
+    // Experimental: route CFM flash-attn through the F32 Q + F16 K/V path
+    // so backends with `flash_attn_f32_f16` (Adreno OpenCL) dispatch the
+    // mixed-precision kernel.  Opt-in mobile latency knob.  See PROGRESS.md
+    // "OpenCL / Adreno bring-up".
+    bool    cfm_f16_kv_attn = false;
 
     // Multilingual-only knobs. Python ChatterboxMultilingualTTS.generate()
     // defaults: cfg_weight=0.5, temperature=0.8, repetition_penalty=2.0,
@@ -368,6 +374,12 @@ struct cli_params {
     // to 2 (matches Python's meanflow); setting 1 halves CFM cost at the
     // price of a bit of extra high-frequency noise.
     int32_t stream_cfm_steps          = 0;
+    // Override CFM Euler step count for non-streaming synthesis.  Defaults
+    // to 0 (= use the GGUF's `n_timesteps`: 10 for Multilingual standard
+    // CFM, 2 for Turbo's meanflow).  Lowering N (e.g. 7-8 on Multilingual)
+    // reduces S3Gen wall-clock proportionally; the §3.21 sweep documents
+    // the audio-cosine knee.  Streaming uses --stream-cfm-steps instead.
+    int32_t cfm_steps                 = 0;
 
     // Auto-split the input text into sentences before running the pipeline.
     // Chatterbox Turbo's T3 degrades badly on autoregressive outputs longer
@@ -486,6 +498,14 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          as --stream-chunk-tokens)\n");
     fprintf(stderr, "  --stream-cfm-steps N    CFM Euler step count per chunk.  Python uses 2 for\n");
     fprintf(stderr, "                          meanflow; 1 halves CFM cost.  (default: 0 = 2)\n");
+    fprintf(stderr, "  --cfm-steps N           Non-streaming CFM Euler step count.  Multilingual's\n");
+    fprintf(stderr, "                          standard CFM ships at 10 steps; lower (e.g. 7-8)\n");
+    fprintf(stderr, "                          trades small audio quality for proportional S3Gen\n");
+    fprintf(stderr, "                          speedup.  Turbo's meanflow defaults to 2 steps.\n");
+    fprintf(stderr, "                          See PROGRESS.md §3.21 for the quality knee sweep.\n");
+    fprintf(stderr, "                          (default: 0 = GGUF's n_timesteps)\n");
+    fprintf(stderr, "  --cfm-f16-kv-attn       Experimental: CFM flash-attn uses F32 Q + F16 K/V so\n");
+    fprintf(stderr, "                          OpenCL/Adreno can dispatch flash_attn_f32_f16.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --input-file PATH       Stream text from PATH as another process writes to it.\n");
     fprintf(stderr, "                          tail -f semantics: each complete sentence (ending in\n");
@@ -604,12 +624,14 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--steps")          { if (!parse_int  ("--steps",          params.supertonic_steps)) return false; params.has_supertonic_options = true; }
         else if (arg == "--speed")          { if (!parse_float("--speed",          params.supertonic_speed)) return false; params.has_supertonic_options = true; }
         else if (arg == "--noise-npy")      { auto v = next("--noise-npy");      if (!v) return false; params.supertonic_noise_npy = v; params.has_supertonic_options = true; }
+        else if (arg == "--cfm-f16-kv-attn") { params.cfm_f16_kv_attn = true; }
         else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
         else if (arg == "--crossfade-ms")   { if (!parse_int("--crossfade-ms",   params.crossfade_ms))   return false; }
         else if (arg == "--stream-chunk-tokens")       { if (!parse_int("--stream-chunk-tokens",       params.stream_chunk_tokens))       return false; }
         else if (arg == "--stream-first-chunk-tokens") { if (!parse_int("--stream-first-chunk-tokens", params.stream_first_chunk_tokens)) return false; }
         else if (arg == "--stream-cfm-steps")          { if (!parse_int("--stream-cfm-steps",          params.stream_cfm_steps))          return false; }
+        else if (arg == "--cfm-steps")                 { if (!parse_int("--cfm-steps",                 params.cfm_steps))                 return false; }
         else if (arg == "--input-file")       { auto v = next("--input-file");       if (!v) return false; params.input_file = v; }
         else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
         else if (arg == "--input-by-line")    { params.input_by_line = true; }
@@ -943,6 +965,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1139,19 +1163,27 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             // tears the device down.  (S3Gen's cache registers its own
             // atexit hook; T3 has no such hook, main() is its owner.)
             auto free_t3 = [&]() {
+                if (model.buffer_stack || model.ctx_stack) {
+                    tts_cpp::chatterbox::detail::t3_stack_unregister(
+                        model.buffer_stack, model.ctx_stack);
+                }
                 ggml_backend_buffer_free(model.buffer_w);
                 ggml_backend_buffer_free(model.buffer_kv);
+                if (model.buffer_stack)    ggml_backend_buffer_free(model.buffer_stack);
                 if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
                 ggml_backend_free(model.backend);
                 ggml_free(model.ctx_w);
                 ggml_free(model.ctx_kv);
+                if (model.ctx_stack)    ggml_free(model.ctx_stack);
                 if (model.ctx_override) ggml_free(model.ctx_override);
                 model.buffer_w = nullptr;
                 model.buffer_kv = nullptr;
+                model.buffer_stack = nullptr;
                 model.buffer_override = nullptr;
                 model.backend = nullptr;
                 model.ctx_w = nullptr;
                 model.ctx_kv = nullptr;
+                model.ctx_stack = nullptr;
                 model.ctx_override = nullptr;
             };
 
@@ -1203,6 +1235,11 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            // Live-input streaming: --stream-cfm-steps takes precedence per
+            // chunk; --cfm-steps falls in as the per-chunk default below
+            // (`stream_cfm_steps > 0 ? stream_cfm_steps : cfm_steps`).
+            opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -1508,7 +1545,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     std::vector<float> tail_out;
                     copts.hift_source_tail_out     = &tail_out;
                     copts.source_tail_samples      = 480;
-                    copts.cfm_steps                = params.stream_cfm_steps;
+                    copts.cfm_steps                = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
+                    copts.cfm_f16_kv_attn          = params.cfm_f16_kv_attn;
 
                     int rc = s3gen_synthesize_to_wav(toks, copts);
                     if (rc != 0) return rc;
@@ -1901,7 +1939,14 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 // retry still comes out short.
                 if (generated.size() > best_generated.size()) best_generated = generated;
 
-                const bool plausible = (int)generated.size() >= min_tokens;
+                // The 5x speech-tokens-per-BPE-token floor was calibrated for
+                // English Turbo (GPT-2 BPE, ~5 speech tokens per text token).
+                // MTL uses the Llama tokenizer with a ~1.7x ratio, so a clean
+                // stop-token termination on a short MTL segment looks
+                // "implausible" by this heuristic and would trigger up to 3
+                // spurious retries (4x T3 wall time).  The 3x-repeated-token
+                // early-stop (above) handles MTL's catastrophic case.
+                const bool plausible = is_mtl || (int)generated.size() >= min_tokens;
                 if (!stopped_by_stop_token || plausible) {
                     if (attempt > 0) {
                         fprintf(stderr, "  [t3 segment %zu/%zu] recovered after %d retries (%zu tokens)\n",
@@ -1987,6 +2032,11 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
+            // Non-streaming CFM Euler step count (0 = GGUF default).
+            // Streaming chunks honour --stream-cfm-steps with --cfm-steps as
+            // fallback when copts is set up further below.
+            opts.cfm_steps       = params.cfm_steps;
+            opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
                 if (!compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                 opts.prompt_feat_override,
@@ -2184,7 +2234,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         std::vector<float> tail_out;
                         copts.hift_source_tail_out      = &tail_out;
                         copts.source_tail_samples       = 480;
-                        copts.cfm_steps                 = params.stream_cfm_steps;
+                        copts.cfm_steps                 = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
+                        copts.cfm_f16_kv_attn           = params.cfm_f16_kv_attn;
 
                         ++global_chunk_idx;
                         if (params.verbose) {

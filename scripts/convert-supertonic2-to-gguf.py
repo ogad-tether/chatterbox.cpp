@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--default-voice", default=None,
                    help="Default voice metadata. Defaults to F1 when present, otherwise first voice.")
     p.add_argument("--default-steps", type=int, default=None,
-                   help="Default denoising steps metadata. Defaults to 5 for supertonic and 10 for supertonic2.")
+                   help="Default denoising steps metadata. Defaults to 5 to match reference dumps and examples.")
     p.add_argument("--default-speed", type=float, default=1.05,
                    help="Default speed metadata.")
     p.add_argument("--ftype", choices=("f32", "f16", "q8_0"), default="f32",
@@ -305,7 +305,7 @@ def main() -> int:
         int(cfg["ttl"]["latent_dim"]) * int(cfg["ttl"]["chunk_compress_factor"]),
     )
     wrap_mode = "none" if args.no_language_wrap else (args.language_wrap_mode or ("none" if args.arch == "supertonic" else "open_close"))
-    default_steps = args.default_steps if args.default_steps is not None else (5 if args.arch == "supertonic" else 10)
+    default_steps = args.default_steps if args.default_steps is not None else 5
 
     writer.add_uint32("supertonic.default_steps", default_steps)
     writer.add_float32("supertonic.default_speed", args.default_speed)

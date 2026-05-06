@@ -119,11 +119,6 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
         throw std::runtime_error("failed to load Supertonic GGUF: " + opts.model_gguf_path);
     }
     supertonic_set_n_threads(model, opts.n_threads);
-    if (model.hparams.ftype != "f32") {
-        free_supertonic_model(model);
-        throw std::runtime_error("Supertonic scalar runtime currently requires f32 GGUF; "
-                                 "use f16/q8_0 only with the GGML graph backend once enabled");
-    }
 
     try {
         const std::string voice = opts.voice.empty() ? model.hparams.default_voice : opts.voice;
