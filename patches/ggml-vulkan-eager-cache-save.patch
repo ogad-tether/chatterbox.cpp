@@ -1,8 +1,33 @@
+From 857c84a0a8962b78a79a243d3590f5741d2706e0 Mon Sep 17 00:00:00 2001
+From: Zbigniew Herman <zbigniew.herman@tether.io>
+Date: Wed, 6 May 2026 13:04:29 -0300
+Subject: [PATCH] vulkan: crash-safe eager pipeline-cache flush
+
+Stacks on the previous patch.  Writes back the on-disk pipeline-cache
+blob after every ggml_vk_load_shaders compile batch instead of only at
+ggml_vk_cleanup() time, so a process killed mid-graph (SIGKILL,
+abort, OS shutdown) doesn't lose the freshly compiled pipelines.
+
+Adds pipeline_cache_last_size book-keeping so warm runs short-circuit
+the disk write: the eager path only flushes when the cache actually
+grew (blob.size() > last_size), and the cleanup path skips when size
+matches last_size.  This avoided a +90 ms WALL regression measured
+during dev when the flush was unconditional.
+
+Backport from chatterbox.cpp PR GustavoA1604/chatterbox.cpp#8
+(QVAC-17872, round-2).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ src/ggml-vulkan/ggml-vulkan.cpp | 66 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 64 insertions(+), 2 deletions(-)
+
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index d8beedf6..ef662983 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -881,6 +881,12 @@
-     // VK_NULL_HANDLE, which is legal).
+@@ -881,6 +881,12 @@ struct vk_device_struct {
+     // (createComputePipeline takes VK_NULL_HANDLE, which is legal).
      vk::PipelineCache pipeline_cache = VK_NULL_HANDLE;
      std::string       pipeline_cache_path;
 +    // QVAC-17872 round-2: bytes already on disk for this cache.  Used by
@@ -14,7 +39,7 @@ diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
  
      std::unique_ptr<vk_memory_logger> memory_logger;
  
-@@ -934,6 +940,15 @@
+@@ -934,6 +940,15 @@ static void ggml_vk_save_pipeline_cache(vk_device & device) {
          if (blob.empty()) {
              return;
          }
@@ -30,7 +55,7 @@ diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
          const std::string tmp_path = device->pipeline_cache_path + ".tmp";
          std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
          if (!out) {
-@@ -942,8 +957,9 @@
+@@ -942,8 +957,9 @@ static void ggml_vk_save_pipeline_cache(vk_device & device) {
          out.write(reinterpret_cast<const char *>(blob.data()),
                    static_cast<std::streamsize>(blob.size()));
          out.close();
@@ -42,7 +67,7 @@ diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
          } else {
              (void) std::remove(tmp_path.c_str());
          }
-@@ -4846,6 +4862,44 @@
+@@ -4846,6 +4862,44 @@ static void ggml_vk_load_shaders(vk_device& device) {
      for (auto &c : compiles) {
          c.wait();
      }
@@ -87,7 +112,7 @@ diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
  }
  
  static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch);
-@@ -5638,6 +5692,14 @@
+@@ -5636,6 +5690,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
                      seed.empty() ? nullptr : seed.data());
                  try {
                      device->pipeline_cache = device->device.createPipelineCache(pci);
@@ -102,3 +127,6 @@ diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
                  } catch (const vk::SystemError &) {
                      device->pipeline_cache = VK_NULL_HANDLE;
                      device->pipeline_cache_path.clear();
+-- 
+2.52.0.windows.1
+

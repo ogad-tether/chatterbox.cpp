@@ -1,5 +1,40 @@
+From 591f749b2a23a1e7125cead754e9b7ba45b60ac3 Mon Sep 17 00:00:00 2001
+From: Zbigniew Herman <zbigniew.herman@tether.io>
+Date: Wed, 6 May 2026 13:02:26 -0300
+Subject: [PATCH] vulkan: persistent VkPipelineCache, explicit opt-in via
+ GGML_VK_PIPELINE_CACHE_DIR
+
+Adds an opt-in persistent shader cache to ggml-vulkan.  Enabled only
+when the caller sets GGML_VK_PIPELINE_CACHE_DIR to a non-empty path;
+when unset or empty behaviour is byte-identical to upstream ggml-vulkan.
+
+No auto-discovery of $XDG_CACHE_HOME or $HOME.  ggml is a library
+distributed through package managers (vcpkg) and consumed by
+applications that should decide whether and where to persist Vulkan
+artefacts.  Writing to the user's home directory without being asked
+is a side effect library consumers cannot see from the API surface.
+
+When enabled, createPipelineCache is seeded from the path at init and
+getPipelineCacheData is written back from ggml_vk_cleanup() (not
+~vk_device_struct which is unreliable at process exit due to
+shared_ptr ref cycles).  File keyed on vendorID/deviceID/driverVersion;
+Vulkan validates the blob header and silently ignores stale data if the
+shader bundle or driver changed.  Atomic save via tmp+rename.
+
+Recovers ~91% of the cold->warm shader-compile gap on the first warm
+run on drivers without an aggressive per-app system cache (Mesa/RADV,
+Android Adreno/Mali, fresh NVIDIA installs, containers).
+
+Backport from chatterbox.cpp PR GustavoA1604/chatterbox.cpp#8
+(QVAC-17872, round-1).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ src/ggml-vulkan/ggml-vulkan.cpp | 145 +++++++++++++++++++++++++++++++-
+ 1 file changed, 144 insertions(+), 1 deletion(-)
+
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index 19e7fbda..7c4d7ffe 100644
+index 19e7fbda..d8beedf6 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -23,8 +23,14 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
@@ -21,15 +56,15 @@ index 19e7fbda..7c4d7ffe 100644
      bool allow_sysmem_fallback;
      bool disable_graph_optimize;
  
-+    // Optional persistent VkPipelineCache.  When enabled via
-+    // GGML_VK_PIPELINE_CACHE_DIR / $XDG_CACHE_HOME / $HOME, createPipelineCache
-+    // is seeded from disk at init and getPipelineCacheData is written back
-+    // from the destructor, so repeated ggml_backend_vk_init() invocations
-+    // (and separate processes) skip the shader-compile wave that Vulkan
-+    // normally pays on every cold command-buffer graph-build.  When
-+    // pipeline_cache is VK_NULL_HANDLE (default / opt-out / mkdir failure)
-+    // behaviour is identical to upstream (createComputePipeline takes
-+    // VK_NULL_HANDLE, which is legal).
++    // Optional persistent VkPipelineCache.  Enabled only when the caller
++    // sets GGML_VK_PIPELINE_CACHE_DIR to a non-empty path.  When enabled,
++    // createPipelineCache is seeded from disk at init and getPipelineCacheData
++    // is written back from ggml_vk_cleanup(), so repeated
++    // ggml_backend_vk_init() invocations (and separate processes) skip the
++    // shader-compile wave that Vulkan normally pays on every cold
++    // command-buffer graph-build.  When pipeline_cache is VK_NULL_HANDLE
++    // (default / opt-out / mkdir failure) behaviour is identical to upstream
++    // (createComputePipeline takes VK_NULL_HANDLE, which is legal).
 +    vk::PipelineCache pipeline_cache = VK_NULL_HANDLE;
 +    std::string       pipeline_cache_path;
 +
@@ -101,43 +136,41 @@ index 19e7fbda..7c4d7ffe 100644
      } catch (const vk::SystemError& e) {
          std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
          std::cerr << "ggml_vulkan: " << e.what() << std::endl;
-@@ -5507,6 +5570,81 @@ static vk_device ggml_vk_get_device(size_t idx) {
+@@ -5507,6 +5570,79 @@ static vk_device ggml_vk_get_device(size_t idx) {
          descriptor_set_layout_create_info.setPNext(&dslbfci);
          device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
  
 +        // -------------------------------------------------------------------
-+        // Persistent VkPipelineCache (opt-in / default-on-when-HOME-exists).
++        // Persistent VkPipelineCache (explicit opt-in only).
 +        //
-+        // Disabled by setting GGML_VK_PIPELINE_CACHE_DIR to the empty string.
-+        // Path priority:
-+        //   1. $GGML_VK_PIPELINE_CACHE_DIR (if non-empty)
-+        //   2. $XDG_CACHE_HOME/ggml/vulkan
-+        //   3. $HOME/.cache/ggml/vulkan
++        // Enabled by setting GGML_VK_PIPELINE_CACHE_DIR to a non-empty
++        // directory path.  When unset or empty the feature is off and
++        // behaviour is byte-identical to upstream ggml-vulkan.
++        //
++        // No auto-discovery of $XDG_CACHE_HOME or $HOME: ggml is a library
++        // distributed through package managers and consumed by applications
++        // that should decide whether and where to persist Vulkan artefacts.
++        // Writing to the user's home directory without being asked is a
++        // side effect library consumers cannot see from the API surface.
++        //
 +        // Filename keyed on vendorID/deviceID/driverVersion; Vulkan itself
 +        // validates the blob header and silently ignores stale data if the
 +        // shader bundle or driver changed.
 +        //
 +        // The cache is consulted by createComputePipeline in
 +        // ggml_vk_create_pipeline_func and flushed back to disk from
-+        // ~vk_device_struct().  A cold first-process graph dispatch that
-+        // used to pay seconds of shader compile drops to tens of ms on
-+        // drivers without an aggressive per-app system cache (Mesa/RADV,
++        // ggml_vk_cleanup().  A cold first-process graph dispatch that used
++        // to pay seconds of shader compile drops to tens of ms on drivers
++        // without an aggressive per-app system cache (Mesa/RADV,
 +        // Android Adreno/Mali, fresh NVIDIA installs, containers).
-+        // See: QVAC-17872 for measured cold→warm deltas.
++        // See: QVAC-17872 for measured cold->warm deltas.
 +        // -------------------------------------------------------------------
 +        {
-+            const char * env_dir  = getenv("GGML_VK_PIPELINE_CACHE_DIR");
-+            const char * xdg_dir  = getenv("XDG_CACHE_HOME");
-+            const char * home_dir = getenv("HOME");
++            const char * env_dir = getenv("GGML_VK_PIPELINE_CACHE_DIR");
 +
 +            std::string dir;
-+            if (env_dir != nullptr) {
-+                // Explicit env var wins: non-empty -> use it; empty -> disabled.
-+                if (*env_dir) dir = env_dir;
-+            } else if (xdg_dir && *xdg_dir) {
-+                dir = std::string(xdg_dir) + "/ggml/vulkan";
-+            } else if (home_dir && *home_dir) {
-+                dir = std::string(home_dir) + "/.cache/ggml/vulkan";
++            if (env_dir != nullptr && *env_dir != '\0') {
++                dir = env_dir;
 +            }
 +
 +            if (!dir.empty()) {
@@ -183,7 +216,7 @@ index 19e7fbda..7c4d7ffe 100644
          ggml_vk_load_shaders(device);
  
          // Only use transfer queue on AMD non-GCN, when the graphics queue is not enabled
-@@ -13357,6 +13495,13 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
+@@ -13357,6 +13493,13 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
  // Clean up on backend free
  static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
      VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
@@ -197,3 +230,6 @@ index 19e7fbda..7c4d7ffe 100644
      // discard any unsubmitted command buffers
      ctx->compute_ctx.reset();
      // wait for any pending command buffers to finish
+-- 
+2.52.0.windows.1
+
