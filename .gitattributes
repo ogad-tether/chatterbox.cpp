@@ -3,7 +3,7 @@
 # Default: normalize all text files to LF in the index, auto-convert
 # on checkout per-platform.  Windows devs get CRLF in their working
 # tree (so MSVC + Notepad behave), but commits always go in as LF.
-# Aligns with the qvac / qvac2 convention so the chatterbox.cpp port
+# Aligns with the qvac convention so the chatterbox.cpp port
 # carries the same line-ending policy as the rest of the QVAC speech
 # stack when integrated under qvac-ext-lib-whisper.cpp.
 

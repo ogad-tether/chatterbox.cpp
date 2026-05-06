@@ -1196,11 +1196,9 @@ Metal fast, leaves CPU on the clean two-call path.
 
 #### Reference comparison vs onnxruntime (Multilingual, M4 CPU, F16)
 
-Head-to-head through
-[`examples/chatterbox-multilingual-bench.js`](https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js)
-in the `qvac-lib-infer-onnx-tts` package.  Same prompt (`"Hola mundo,
-esta es una prueba multilingue."`), same `jfk.wav` reference, same 4
-CPU threads:
+Head-to-head against ONNX Runtime, same prompt (`"Hola mundo, esta es
+una prueba multilingue."`), same `jfk.wav` reference, same 4 CPU
+threads on both:
 
 ```
                      onnxruntime-fp16   ggml-cpu-f16
@@ -1224,22 +1222,10 @@ A few things worth calling out:
   entirely an onnxruntime cost — initialising 4 session objects over
   1 GB of `external_data` .onnx_data blobs.  ggml mmaps the two GGUFs
   and rebinds through the backend allocator in half a second.
-- **Quality parity**: `bench-onnx.wav` and `bench-ggml.wav` are both
+- **Quality parity**: the ONNX-side and ggml-side wavs are both
   plausibly the same Spanish sentence in the JFK-cloned voice; the
   per-sample waveform differs (different samplers, different RNG) but
   the speaker identity and content match by ear.
-
-Comparison is reproducible with:
-
-```bash
-cd qvac2/packages/qvac-lib-infer-onnx-tts
-bare examples/chatterbox-multilingual-bench.js \
-    --language es \
-    --text "Hola mundo, esta es una prueba multilingue." \
-    --warmup 0 --runs 1
-```
-
-(Add `--skip-onnx` or `--skip-ggml` to isolate one side.)
 
 #### What's next for MTL
 
@@ -1367,7 +1353,7 @@ the bandwidth.)
 
 **End-to-end multilingual table (M4, same Spanish prompt as §3.19,
 seed 42, 4 CPU threads, built-in voice on ggml, `jfk.wav` voice on
-ONNX via the `chatterbox-multilingual-bench.js` harness):**
+the ONNX side):**
 
 | Runtime                                | T3 infer         | S3Gen infer | Audio | Total wall | RTF   |
 |----------------------------------------|-----------------:|------------:|------:|-----------:|------:|
@@ -1395,8 +1381,8 @@ ONNX side so it's doing half the compute):
 
 With CFG enabled on ONNX (the apples-to-apples comparison), those
 ratios would roughly double.  ONNX q4 notably improved from our
-§3.19-era measurement (RTF 18.17 → 14.55) after a recent
-`qvac-lib-infer-onnx-tts` prebuilds update; ONNX fp16 stayed within
+§3.19-era measurement (RTF 18.17 → 14.55) after a more recent
+onnxruntime build was used on the ONNX side; ONNX fp16 stayed within
 noise (20.91 → 23.50).
 
 **Quality check.** The output wavs for each config are available at
@@ -4205,9 +4191,9 @@ locked baseline — gallocator non-zero-offset view sensitivity).
 
 #### 7. G2 dump-script gap closure — `regress-tensor-compare.sh` end-to-end
 
-`regress-tensor-compare.sh` (kept in an internal benchmark log
-directory, out-of-tree) was previously aborting at stage G2 with
-`cannot open cfm_concat.npy`.
+`regress-tensor-compare.sh` (in the qvac monorepo's
+`inputFilesForAI/qvac-17872-findings/bench-logs-vk-c1/`) was
+previously aborting at stage G2 with `cannot open cfm_concat.npy`.
 Four files added to `scripts/dump-s3gen-reference.py`:
 
 - `cfm_concat.npy` (stage G2): replicates the
@@ -4249,8 +4235,8 @@ xc = ggml_concat(x_in, mu_in, spks_bc, cond_in);
 Skip-upload only works for inputs referenced **throughout** the
 graph (encoder `pos_emb` works, CFM `mu / spks / cond` doesn't).
 General rule for ggml's gallocator, kept as a comment in
-`synthesize()` and documented in the internal HIFT-round findings
-doc (out-of-tree) §2-bis.4.
+`synthesize()` and documented in
+`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_HIFT.md` §2-bis.4.
 
 #### Performance — RTX 5090, regress-tight aggregate, n=75 chunks, Turbo
 
@@ -4389,7 +4375,7 @@ shader-side optimisation (e.g. tensor-core engagement via
 ##### Reproduction (test-first harness)
 
 ```bash
-cd chatterbox.cpp
+cd inputFilesForAI/qvac-17872-findings/chatterbox.cpp
 
 # 1. Build the round-2 binary
 bash scripts/setup-ggml.sh
@@ -4482,8 +4468,8 @@ to ~30 ms (cache hit) — the headline mobile / Mesa win.
 ##### Reproduction
 
 ```bash
-# Build with the round-2 patch set applied
-cd chatterbox.cpp
+# PR build (this branch)
+cd inputFilesForAI/qvac-17872-findings/chatterbox.cpp
 bash scripts/setup-ggml.sh
 cmake -S . -B build-vk-mtl-merged -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
 cmake --build build-vk-mtl-merged -j --target tts-cli
@@ -4531,9 +4517,9 @@ deletions are user-facing; the −98 lines reduce the per-synth
 `gallocr_new` / `ggml_init` / `ggml_gallocr_free` / `ggml_free`
 boilerplate that the cache infrastructure now subsumes.
 
-The detailed FINDINGS_*.md companion docs stay out-of-tree
-(internal context only) — same arrangement as the multilingual-CPU
-cache work.
+All `inputFilesForAI/qvac-17872-findings/FINDINGS_*.md` and
+`PR_DESCRIPTION_*.md` companion docs stay in the qvac monorepo
+(out-of-tree) — same arrangement as the multilingual-CPU cache work.
 
 #### Next
 

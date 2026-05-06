@@ -54,8 +54,7 @@ instead of 2 — no classifier-free guidance, no CFG-combined CFM). If
 the ONNX CFG path were wired up, its RTF would roughly double and the
 gap vs ggml would widen to ~10–14× (CPU) / ~20–28× (Metal). ggml runs
 the full CFG pipeline in every row above. Reproduction + per-stage
-breakdown in [`PROGRESS.md §3.19–3.20`](PROGRESS.md) and
-[`qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js`][bench].
+breakdown in [`PROGRESS.md §3.19–3.20`](PROGRESS.md).
 
 ² **CPU multilingual rows re-measured after restoring CFG on the
 non-Metal CFM path.**  The previous numbers in this row (`6.0 s / 2.69`
@@ -67,8 +66,6 @@ two rows above are now end-to-end re-measurements on the same M4 host
 with CFG correctly applied (12 CFM steps × 2 forward calls).
 S3Gen wall-time roughly doubled, RTF went up ~2×.  Metal rows are
 unaffected (the `use_b2` branched path always carried the CFG combine).
-
-[bench]: https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js
 
 See the [full benchmark](#performance) section below for the per-stage
 breakdown, or [`PROGRESS.md`](PROGRESS.md) for the full chronological
@@ -997,13 +994,11 @@ relative to compute.
 
 ### Reference comparison vs onnxruntime (Multilingual, M4 CPU, F16)
 
-Same prompt, seed, and reference audio fed through
-[`qvac-lib-infer-onnx-tts`][onnx-tts] (the in-house ONNX Runtime TTS
-addon) and our ggml build back-to-back via
-[`examples/chatterbox-multilingual-bench.js`][bench].  4 CPU threads on
-both.  ONNX Runtime's multilingual export currently ships without the
-`text_emb_weight.bin` tensor and emits `CFG disabled` at load — so its
-numbers are already against a half-compute pipeline:
+Same prompt, seed, and reference audio fed through ONNX Runtime and
+our ggml build back-to-back, 4 CPU threads on both.  ONNX Runtime's
+multilingual export currently ships without the `text_emb_weight.bin`
+tensor and emits `CFG disabled` at load — so its numbers are already
+against a half-compute pipeline:
 
 ```
                      onnxruntime-fp16   ggml-cpu-f16⁴
@@ -1028,14 +1023,11 @@ unconditional pass on CPU; "CFG enabled: yes" overstated what was running
 in this specific column.  After commit `6d9b42b` restored CFG on the CPU
 path, the per-utterance ggml number on M4 CPU F16 should roughly double
 (see footnotes ² and ³ above for the 2× ratio observed on standalone CPU
-runs).  Re-running `chatterbox-multilingual-bench.js` with current
-`multilingual_merged` will produce a corrected column; the ONNX side is
-unchanged so the ratio should land near `~2.5–3× faster` rather than the
-historical `5.06×`.  Cold-load (`~85×`) is a load-time figure and
-unaffected by the runtime fix.
-
-[onnx-tts]: https://github.com/tetherto/qvac2/tree/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts
-[bench]: https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js
+runs).  Re-running the bench against current `multilingual_merged`
+will produce a corrected column; the ONNX side is unchanged so the
+ratio should land near `~2.5–3× faster` rather than the historical
+`5.06×`.  Cold-load (`~85×`) is a load-time figure and unaffected by
+the runtime fix.
 
 ### Reproducing these numbers
 
