@@ -13,12 +13,35 @@ else()
     set(TTS_CPP_STANDALONE_DEFAULT OFF)
 endif()
 
-option(TTS_CPP_BUILD_LIBRARY     "tts-cpp: build the static tts-cpp library"                 ON)
+option(TTS_CPP_BUILD_LIBRARY     "tts-cpp: build the tts-cpp library"                        ON)
+option(TTS_CPP_BUILD_SHARED      "tts-cpp: build tts-cpp as a SHARED library (otherwise STATIC). Defaults to OFF; the supertonic test harnesses link against tts-cpp directly and use detail-namespaced symbols that aren't part of the TTS_CPP_API public surface, so SHARED hides them and breaks the test build.  Decoupled from BUILD_SHARED_LIBS because ggml's own CMake declares its own option(BUILD_SHARED_LIBS) defaulting to ON on Windows non-MinGW; using a project-namespaced option keeps the two independent." OFF)
 option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build the tts-cli executable + mel2wav demo"     ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
 option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use system-installed GGML library"                OFF)
 option(TTS_CPP_GGML_LIB_PREFIX   "tts-cpp: rename bundled ggml libraries to libtts-ggml-* (filename only; CMake target names and C symbols are unchanged). Prevents shared-library filename collisions when multiple consumers that vendor different ggml versions are loaded into the same host process. Has no effect when TTS_CPP_USE_SYSTEM_GGML=ON." ON)
+option(TTS_CPP_CCACHE            "tts-cpp: use ccache as compiler launcher if available"     ON)
+
+# ccache shaves ~30 % off iterative rebuild time on developer machines.
+# Opt-out via -DTTS_CPP_CCACHE=OFF for clean reproducibility runs.
+# Scoped to tts-cpp's own targets via the helper below; ggml has its own
+# GGML_CCACHE option which we leave alone so the two launchers don't
+# double-up on the ggml subdirectory.
+if (TTS_CPP_CCACHE)
+    find_program(TTS_CPP_CCACHE_PROGRAM ccache)
+    if (TTS_CPP_CCACHE_PROGRAM)
+        message(STATUS "tts-cpp: using ccache at ${TTS_CPP_CCACHE_PROGRAM} (tts-cpp targets only; ggml uses GGML_CCACHE)")
+    endif()
+endif()
+
+function(tts_cpp_apply_ccache target)
+    if (TTS_CPP_CCACHE_PROGRAM)
+        set_target_properties(${target} PROPERTIES
+            C_COMPILER_LAUNCHER   "${TTS_CPP_CCACHE_PROGRAM}"
+            CXX_COMPILER_LAUNCHER "${TTS_CPP_CCACHE_PROGRAM}"
+        )
+    endif()
+endfunction()
 
 if (CMAKE_CROSSCOMPILING)
     if (NOT DEFINED GGML_NATIVE OR GGML_NATIVE)
@@ -70,17 +93,6 @@ if (WIN32 AND NOT MINGW)
         # an existing normal variable under CMP0077 (CMake 3.13+).
         set(GGML_OPENMP OFF)
     endif()
-endif()
-
-# Snapshot the user's BUILD_SHARED_LIBS intent BEFORE add_subdirectory(ggml).
-# ggml's own CMake declares its own option(BUILD_SHARED_LIBS ...) with
-# Windows-non-MinGW default = ON, so any later `if (DEFINED BUILD_SHARED_LIBS)`
-# check sees the variable as defined regardless of what the user passed.
-# We capture the user's explicit pre-ggml setting here and use that to drive
-# the tts-cpp library linkage default.
-set(_tts_cpp_user_set_shared FALSE)
-if (DEFINED BUILD_SHARED_LIBS OR DEFINED CACHE{BUILD_SHARED_LIBS})
-    set(_tts_cpp_user_set_shared TRUE)
 endif()
 
 if (NOT TARGET ggml)
@@ -175,24 +187,28 @@ add_library(mtl_tokenizer STATIC src/mtl_tokenizer.cpp)
 # install(EXPORT) and trip CMake's source-prefix check.
 target_include_directories(mtl_tokenizer PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 set_target_properties(mtl_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+tts_cpp_apply_ccache(mtl_tokenizer)
 
 if (TTS_CPP_BUILD_LIBRARY)
-    # Honour BUILD_SHARED_LIBS only when the *user* set it; otherwise
-    # default to STATIC even though ggml's own CMake declares an
-    # option(BUILD_SHARED_LIBS ...) that flips the variable to ON on
-    # Windows non-MinGW.  Static is the right default here because the
-    # supertonic test harnesses link against tts-cpp directly and use
-    # detail-namespaced symbols (declared in src/supertonic_internal.h)
-    # that aren't part of the TTS_CPP_API public surface; a SHARED
-    # library would hide them and the tests would fail to link.
-    # Consumers that want a SHARED tts-cpp pass -DBUILD_SHARED_LIBS=ON
-    # explicitly and accept the export-surface restriction.
-    if (_tts_cpp_user_set_shared)
-        add_library(tts-cpp ${TTS_CPP_LIB_SOURCES})
+    # Decoupled from BUILD_SHARED_LIBS on purpose: ggml's own CMake
+    # declares option(BUILD_SHARED_LIBS ...) defaulting to ON on
+    # Windows non-MinGW, so any DEFINED-style check on
+    # BUILD_SHARED_LIBS is unreliable once the build dir's CMakeCache
+    # gets populated.  STATIC is the right default for tts-cpp because
+    # the supertonic test harnesses + supertonic-bench link against it
+    # directly and use detail-namespaced symbols (declared in
+    # src/supertonic_internal.h) that aren't part of the TTS_CPP_API
+    # public surface; SHARED would hide them and the test build would
+    # fail to link.  Consumers that want a SHARED tts-cpp pass
+    # -DTTS_CPP_BUILD_SHARED=ON explicitly and accept that the
+    # supertonic test/bench targets won't link.
+    if (TTS_CPP_BUILD_SHARED)
+        add_library(tts-cpp SHARED ${TTS_CPP_LIB_SOURCES})
     else()
         add_library(tts-cpp STATIC ${TTS_CPP_LIB_SOURCES})
     endif()
     add_library(tts-cpp::tts-cpp ALIAS tts-cpp)
+    tts_cpp_apply_ccache(tts-cpp)
 
     target_include_directories(tts-cpp
         PUBLIC
@@ -249,22 +265,119 @@ if (TTS_CPP_BUILD_EXECUTABLES)
 
     add_executable(tts-cli src/cli_main.cpp)
     target_link_libraries(tts-cli PRIVATE tts-cpp)
+    tts_cpp_apply_ccache(tts-cli)
 
     add_executable(chatterbox src/cli_main.cpp)
     target_link_libraries(chatterbox PRIVATE tts-cpp)
+    tts_cpp_apply_ccache(chatterbox)
 
     add_executable(mel2wav src/mel2wav.cpp)
     target_link_libraries(mel2wav PRIVATE ggml)
     target_include_directories(mel2wav PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(mel2wav)
 
     add_executable(supertonic-cli src/supertonic_cli.cpp)
     target_link_libraries(supertonic-cli PRIVATE tts-cpp)
+    tts_cpp_apply_ccache(supertonic-cli)
 endif()
 
 if (TTS_CPP_BUILD_TESTS)
+    enable_testing()
+    include(CTest)
+
+    # Roots that the test registrations below resolve fixture paths against.
+    # All three are CACHE PATHs so CI / package builds can point them at
+    # pre-staged mirrors (e.g. a tarball of `.gguf`s + reference `.npy`s)
+    # without editing this listfile.
+    #
+    #   MODEL_DIR  - GGUF checkpoints (produced by scripts/convert-*-to-gguf.py
+    #                or `bash scripts/setup-supertonic2.sh`)
+    #   AUDIO_DIR  - reference WAV fixtures (test/reference-audio/jfk.wav, ...)
+    #   REF_DIR    - PyTorch / ONNX reference dumps (`.npy`) produced by
+    #                scripts/dump-{s3gen,supertonic,t3-mtl}-reference.py;
+    #                expected layout is REF_DIR/{s3gen-ref,supertonic-ref-quick,t3-mtl-ref}/.
+    #                Tests that need a ref dump auto-disable when the dump
+    #                isn't present, so a fresh checkout still gives a green
+    #                ctest run on the harnesses whose fixtures it does have.
+    set(TTS_CPP_TEST_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models"               CACHE PATH "tts-cpp: directory containing .gguf fixtures used by the test suite")
+    set(TTS_CPP_TEST_AUDIO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/test/reference-audio" CACHE PATH "tts-cpp: directory containing .wav fixtures used by the test suite")
+    set(TTS_CPP_TEST_REF_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/artifacts"            CACHE PATH "tts-cpp: directory containing PyTorch / ONNX .npy reference dumps")
+
+    # Helper: register a built test target with CTest.  Mirrors the
+    # standard llama-style `<project>_test()` macro: every harness ends
+    # up surfaced via `ctest` against the build dir, with labels that
+    # allow filtering (e.g. `ctest -L cpu` to skip GPU-only tests on CI
+    # fleets without the matching backend).  The optional REQUIRES list
+    # names paths that must exist at configure time; if any is missing
+    # the test is still registered (so it shows up in `ctest -N`) but
+    # marked DISABLED so a missing reference dump shows as "Not Run"
+    # rather than a hard failure.
+    function(tts_cpp_register_test target)
+        cmake_parse_arguments(TCRT "" "LABEL;EXE" "ARGS;REQUIRES" ${ARGN})
+        if (NOT DEFINED TCRT_LABEL)
+            set(TCRT_LABEL "cpu")
+        endif()
+        # EXE defaults to the test name when the test has its own
+        # executable target.  Pass an explicit EXE when several tests
+        # share one binary and differ only in CLI args / fixtures
+        # (e.g. test-cpu-caches-{turbo,mtl} all invoke test-cpu-caches.exe).
+        if (NOT DEFINED TCRT_EXE)
+            set(TCRT_EXE ${target})
+        endif()
+        add_test(NAME ${target}
+                 COMMAND $<TARGET_FILE:${TCRT_EXE}> ${TCRT_ARGS})
+        set_property(TEST ${target} PROPERTY LABELS ${TCRT_LABEL})
+        if (WIN32)
+            # When ggml builds as shared (the MSVC default), test exes
+            # link against import libs and need to find tts-ggml-*.dll
+            # at runtime.  Windows has no rpath, so we prepend the
+            # build-tree DLL output dirs to PATH.  Both `bin/` (Ninja /
+            # single-config) and `bin/<Config>/` (Visual Studio /
+            # multi-config) are listed because the generator type isn't
+            # known at configure time on a fresh checkout; the
+            # generator-expression $<CONFIG> resolves to the active
+            # config at test time.  Without this, ctest sees
+            # STATUS_DLL_NOT_FOUND (0xc0000135) before main() runs.
+            set_property(TEST ${target} PROPERTY ENVIRONMENT
+                "PATH=${CMAKE_BINARY_DIR}/bin/$<CONFIG>\;${CMAKE_BINARY_DIR}/bin\;$ENV{PATH}")
+        endif()
+        set(_tcrt_missing "")
+        foreach (_tcrt_req IN LISTS TCRT_REQUIRES)
+            if (NOT EXISTS "${_tcrt_req}")
+                list(APPEND _tcrt_missing "${_tcrt_req}")
+            endif()
+        endforeach()
+        if (_tcrt_missing)
+            set_property(TEST ${target} PROPERTY DISABLED TRUE)
+            list(JOIN _tcrt_missing "\n        " _tcrt_missing_pretty)
+            message(STATUS "tts-cpp: test ${target} disabled (missing fixture(s):\n        ${_tcrt_missing_pretty})")
+        endif()
+    endfunction()
+
+    # Stable shorthands for the fixtures referenced by the registrations
+    # below.  Resolved at configure time; missing files turn into
+    # DISABLED tests via tts_cpp_register_test(REQUIRES ...).
+    set(_tcb_t3_turbo_gguf      "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-t3-turbo.gguf")
+    set(_tcb_t3_mtl_gguf        "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-t3-mtl.gguf")
+    set(_tcb_s3gen_gguf         "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen.gguf")
+    set(_tcb_s3gen_mtl_gguf     "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen-mtl.gguf")
+    set(_tcb_super_gguf         "${TTS_CPP_TEST_MODEL_DIR}/supertonic.gguf")
+    set(_tcb_super_ref          "${TTS_CPP_TEST_REF_DIR}/supertonic-ref-quick")
+    set(_tcb_super_ref_noise    "${_tcb_super_ref}/noise.npy")
+    set(_tcb_s3gen_ref          "${TTS_CPP_TEST_REF_DIR}/s3gen-ref")
+    set(_tcb_s3gen_ref_logits   "${_tcb_s3gen_ref}/logits.npy")
+    set(_tcb_t3_mtl_ref         "${TTS_CPP_TEST_REF_DIR}/t3-mtl-ref")
+    set(_tcb_streaming_ref      "${TTS_CPP_TEST_REF_DIR}/streaming-ref")
+    set(_tcb_jfk_wav            "${TTS_CPP_TEST_AUDIO_DIR}/jfk.wav")
+
     add_executable(test-s3gen test/test_s3gen.cpp)
     target_link_libraries(test-s3gen PRIVATE ggml)
     target_include_directories(test-s3gen PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-s3gen)
+    tts_cpp_register_test(test-s3gen
+        LABEL    "fixture"
+        ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}" "ALL"
+        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref_logits}")
 
     add_executable(test-voice-features
         test/test_voice_features.cpp
@@ -272,6 +385,11 @@ if (TTS_CPP_BUILD_TESTS)
         src/mel_extract_stft.cpp)
     target_link_libraries(test-voice-features PRIVATE ggml)
     target_include_directories(test-voice-features PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-voice-features)
+    tts_cpp_register_test(test-voice-features
+        LABEL    "fixture"
+        ARGS     "${_tcb_s3gen_gguf}" "${_tcb_jfk_wav}" "${_tcb_s3gen_ref}/prompt_feat.npy"
+        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_jfk_wav}" "${_tcb_s3gen_ref}/prompt_feat.npy")
 
     add_executable(test-resample
         test/test_resample.cpp
@@ -279,6 +397,8 @@ if (TTS_CPP_BUILD_TESTS)
         src/mel_extract_stft.cpp)
     target_link_libraries(test-resample PRIVATE ggml)
     target_include_directories(test-resample PRIVATE src)
+    tts_cpp_apply_ccache(test-resample)
+    tts_cpp_register_test(test-resample LABEL "unit")
 
     add_executable(test-voice-encoder
         test/test_voice_encoder.cpp
@@ -287,6 +407,11 @@ if (TTS_CPP_BUILD_TESTS)
         src/mel_extract_stft.cpp)
     target_link_libraries(test-voice-encoder PRIVATE ggml)
     target_include_directories(test-voice-encoder PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-voice-encoder)
+    tts_cpp_register_test(test-voice-encoder
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_turbo_gguf}" "${_tcb_jfk_wav}" "${_tcb_s3gen_ref}/speaker_emb.npy"
+        REQUIRES "${_tcb_t3_turbo_gguf}" "${_tcb_jfk_wav}" "${_tcb_s3gen_ref}/speaker_emb.npy")
 
     add_executable(test-campplus
         test/test_campplus.cpp
@@ -296,6 +421,11 @@ if (TTS_CPP_BUILD_TESTS)
     if (OpenMP_CXX_FOUND)
         target_link_libraries(test-campplus PRIVATE OpenMP::OpenMP_CXX)
     endif()
+    tts_cpp_apply_ccache(test-campplus)
+    tts_cpp_register_test(test-campplus
+        LABEL    "fixture"
+        ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/fbank.npy" "${_tcb_s3gen_ref}/embedding.npy"
+        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/fbank.npy" "${_tcb_s3gen_ref}/embedding.npy")
 
     add_executable(test-fbank
         test/test_fbank.cpp
@@ -303,6 +433,11 @@ if (TTS_CPP_BUILD_TESTS)
         src/mel_extract_stft.cpp)
     target_link_libraries(test-fbank PRIVATE ggml)
     target_include_directories(test-fbank PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-fbank)
+    tts_cpp_register_test(test-fbank
+        LABEL    "fixture"
+        ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/fbank.npy"
+        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/fbank.npy")
 
     add_executable(test-voice-embedding
         test/test_voice_embedding.cpp
@@ -314,16 +449,31 @@ if (TTS_CPP_BUILD_TESTS)
     if (OpenMP_CXX_FOUND)
         target_link_libraries(test-voice-embedding PRIVATE OpenMP::OpenMP_CXX)
     endif()
+    tts_cpp_apply_ccache(test-voice-embedding)
+    tts_cpp_register_test(test-voice-embedding
+        LABEL    "fixture"
+        ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/embedding.npy"
+        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/embedding.npy")
 
     add_executable(test-s3tokenizer
         test/test_s3tokenizer.cpp
         src/s3tokenizer.cpp)
     target_link_libraries(test-s3tokenizer PRIVATE ggml)
     target_include_directories(test-s3tokenizer PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-s3tokenizer)
+    tts_cpp_register_test(test-s3tokenizer
+        LABEL    "fixture"
+        ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/log_mel.npy" "${_tcb_s3gen_ref}/speech_tokens.npy"
+        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/log_mel.npy" "${_tcb_s3gen_ref}/speech_tokens.npy")
 
     add_executable(test-mtl-tokenizer test/test_mtl_tokenizer.cpp)
     target_link_libraries(test-mtl-tokenizer PRIVATE mtl_tokenizer)
     target_include_directories(test-mtl-tokenizer PRIVATE src)
+    tts_cpp_apply_ccache(test-mtl-tokenizer)
+    tts_cpp_register_test(test-mtl-tokenizer
+        LABEL    "fixture"
+        ARGS     "${TTS_CPP_TEST_REF_DIR}/mtl-tokenizer/tokenizer.json" "${TTS_CPP_TEST_REF_DIR}/mtl-tokenizer/golden.json"
+        REQUIRES "${TTS_CPP_TEST_REF_DIR}/mtl-tokenizer/tokenizer.json" "${TTS_CPP_TEST_REF_DIR}/mtl-tokenizer/golden.json")
 
     add_executable(test-t3-mtl test/test_t3_mtl.cpp)
     target_link_libraries(test-t3-mtl PRIVATE tts-cpp ggml)
@@ -331,6 +481,11 @@ if (TTS_CPP_BUILD_TESTS)
     if (GGML_METAL)
         target_compile_definitions(test-t3-mtl PRIVATE GGML_USE_METAL)
     endif()
+    tts_cpp_apply_ccache(test-t3-mtl)
+    tts_cpp_register_test(test-t3-mtl
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_t3_mtl_ref}"
+        REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_t3_mtl_ref}")
 
     add_executable(test-t3-mtl-stages test/test_t3_mtl_stages.cpp)
     target_link_libraries(test-t3-mtl-stages PRIVATE tts-cpp ggml)
@@ -338,28 +493,73 @@ if (TTS_CPP_BUILD_TESTS)
     if (GGML_METAL)
         target_compile_definitions(test-t3-mtl-stages PRIVATE GGML_USE_METAL)
     endif()
+    tts_cpp_apply_ccache(test-t3-mtl-stages)
+    tts_cpp_register_test(test-t3-mtl-stages
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_t3_mtl_ref}" "ALL"
+        REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_t3_mtl_ref}")
 
     add_executable(test-streaming
         test/test_streaming.cpp
         src/chatterbox_tts.cpp)
     target_link_libraries(test-streaming PRIVATE ggml)
     target_include_directories(test-streaming PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-streaming)
+    tts_cpp_register_test(test-streaming
+        LABEL    "fixture"
+        ARGS     "${_tcb_s3gen_gguf}" "${_tcb_streaming_ref}"
+        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_streaming_ref}")
 
+    # CPU-side persistent-cache validation (QVAC-18422).
+    # Exercises the time_mlp / time_emb / cfm_estimator / weight_mirror
+    # caches that amortise per-synth overhead on the multilingual CPU
+    # path.  Links chatterbox_tts.cpp directly so it can reach the
+    # internal test-hook entrypoints.
     add_executable(test-cpu-caches
         test/test_cpu_caches.cpp
         src/chatterbox_tts.cpp)
     target_link_libraries(test-cpu-caches PRIVATE ggml)
     target_include_directories(test-cpu-caches PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-cpu-caches)
+    # No-model invocation: bit-cast cache-key + initial-state checks.
+    tts_cpp_register_test(test-cpu-caches LABEL "unit")
+    # Per-variant warm-cache + bit-exact pipeline checks.  Each shares
+    # the same exe but takes a different GGUF; auto-disabled when its
+    # GGUF isn't present.
+    tts_cpp_register_test(test-cpu-caches-turbo
+        LABEL    "fixture"
+        EXE      test-cpu-caches
+        ARGS     "${_tcb_s3gen_gguf}"
+        REQUIRES "${_tcb_s3gen_gguf}")
+    tts_cpp_register_test(test-cpu-caches-mtl
+        LABEL    "fixture"
+        EXE      test-cpu-caches
+        ARGS     "${_tcb_s3gen_mtl_gguf}"
+        REQUIRES "${_tcb_s3gen_mtl_gguf}")
 
+    # T3 step-graph cache validation (QVAC-18422 round 4).
     add_executable(test-t3-caches test/test_t3_caches.cpp)
     target_link_libraries(test-t3-caches PRIVATE tts-cpp ggml)
     target_include_directories(test-t3-caches PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-t3-caches)
+    tts_cpp_register_test(test-t3-caches LABEL "unit")
+    tts_cpp_register_test(test-t3-caches-mtl
+        LABEL    "fixture"
+        EXE      test-t3-caches
+        ARGS     "${_tcb_t3_mtl_gguf}"
+        REQUIRES "${_tcb_t3_mtl_gguf}")
 
     add_executable(test-metal-ops test/test_metal_ops.cpp)
     target_link_libraries(test-metal-ops PRIVATE ggml)
     target_include_directories(test-metal-ops PRIVATE ggml/include src)
     if (GGML_METAL)
         target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
+    endif()
+    tts_cpp_apply_ccache(test-metal-ops)
+    # Metal-only kernel parity check.  Useful only when built with
+    # -DGGML_METAL=ON; skipped on CI fleets without Metal via `ctest -LE gpu`.
+    if (GGML_METAL)
+        tts_cpp_register_test(test-metal-ops LABEL "gpu")
     endif()
 
     if (NOT TTS_CPP_BUILD_LIBRARY)
@@ -370,6 +570,16 @@ if (TTS_CPP_BUILD_TESTS)
         add_executable(${target} ${source})
         target_link_libraries(${target} PRIVATE tts-cpp)
         target_include_directories(${target} PRIVATE ggml/include src include)
+        tts_cpp_apply_ccache(${target})
+        # Every Supertonic harness takes (MODEL.gguf REF_DIR) and is
+        # auto-disabled when either is absent.  REQUIRES checks the dir
+        # plus a sentinel file inside it (noise.npy is produced by every
+        # `dump-supertonic-reference.py` run) so the test isn't merely
+        # gated on an empty dir existing.
+        tts_cpp_register_test(${target}
+            LABEL    "fixture"
+            ARGS     "${_tcb_super_gguf}" "${_tcb_super_ref}"
+            REQUIRES "${_tcb_super_gguf}" "${_tcb_super_ref_noise}")
     endfunction()
 
     add_supertonic_harness(test-supertonic-preprocess test/test_supertonic_preprocess.cpp)
@@ -383,7 +593,16 @@ if (TTS_CPP_BUILD_TESTS)
     add_supertonic_harness(test-supertonic-vector test/test_supertonic_vector.cpp)
     add_supertonic_harness(test-supertonic-vector-trace test/test_supertonic_vector_trace.cpp)
     add_supertonic_harness(test-supertonic-pipeline test/test_supertonic_pipeline.cpp)
-    add_supertonic_harness(supertonic-bench src/supertonic_bench.cpp)
+
+    # supertonic-bench is a benchmark CLI (takes --text / --out / --runs),
+    # not a parity test, so it doesn't go through add_supertonic_harness
+    # which auto-registers everything as a positional-args (MODEL, REF_DIR)
+    # ctest target.  Built unconditionally with the rest of the test set
+    # so `cmake --build --target supertonic-bench` works the same way.
+    add_executable(supertonic-bench src/supertonic_bench.cpp)
+    target_link_libraries(supertonic-bench PRIVATE tts-cpp)
+    target_include_directories(supertonic-bench PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(supertonic-bench)
 endif()
 
 set(TTS_CPP_POINTWISE_ACCEL_TARGETS
