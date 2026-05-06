@@ -4282,10 +4282,22 @@ contributed to the larger headline number on the main base.
 
 #### Bit-exactness
 
+Turbo F32 invariants on the original `main` base, carried forward
+to this `multilingual_merged` port:
+
 | Backend                | F32 single-shot | F32 multi-synth identical | F32 multi-synth varied |
 |------------------------|:---------------:|:-------------------------:|:----------------------:|
 | RTX 5090 + 590.48      |       ✓         |             ✓             |           ✓            |
 | AMD iGPU (RADV, Mesa)  |       ✓         |             ✓             |           ✓            |
+
+Multilingual F32 invariants (NEW, locked May 6, 2026 against
+upstream/multilingual_merged HEAD `b074399` on RTX 5090 +
+NVIDIA 590.48 + Vulkan 1.3.275 — see "Multilingual verification"
+section below for details):
+
+| Backend                | F32 single-shot                      | F32 multi-synth (6 seg)              |
+|------------------------|:------------------------------------:|:------------------------------------:|
+| RTX 5090 + 590.48      | `c65d98f15a59b8fe9cad98e46eb3fb30` ✓ | `0b374c7474895a3387b9f1df10b3c1b8` ✓ |
 
 F16 invariants are not in this commit (C1 deferred).
 
@@ -4306,6 +4318,108 @@ infrastructure that is shared between Turbo and multilingual:
 4. **HiFT cont removals** — HiFT decoder code path is identical
    for both variants.
 
+#### Multilingual verification (May 6, 2026)
+
+The May 4 squashed port was measured on Turbo because the
+multilingual GGUF was not available locally then.  After the
+QVAC-18422 §3.34 companion work shipped a converter from the
+public `ResembleAI/chatterbox` HuggingFace repo
+(`chatterbox-s3gen-mtl-q4_0.gguf` 788 MB +
+`chatterbox-t3-mtl-q4_0.gguf` 345 MB), this section captures the
+actual multilingual measurement.
+
+**Test methodology.** Six-segment auto-split via
+`--max-sentence-chars 32` (the multilingual T3 GGUF doesn't embed
+the tokenizer needed for the `--input-file` streaming pattern;
+`--max-sentence-chars` triggers multiple within-process synths
+which is what the persistent host caches actually need to fire).
+Three iterations × five warm-state segments each = **n=15 samples
+per build**.  Comparison build: a fresh `upstream/multilingual_merged`
+HEAD (`b074399`) worktree with only the Metal + OpenCL patches
+applied (NOT the two new Vulkan patches in this PR).  Both builds
+use the same vendored ggml commit `58c38058` and the same Vulkan
+1.3.275 / RTX 5090 + NVIDIA 590.48 host.
+
+##### Bit-exactness on multilingual
+
+Both single-shot and 6-segment multi-synth produce **byte-identical
+multilingual WAV** vs the upstream/multilingual_merged baseline:
+
+| Test                                  | This PR MD5                          | Baseline MD5                         | Match |
+|---------------------------------------|--------------------------------------|--------------------------------------|:-----:|
+| Single-shot (seed 42, --temp 0)       | `c65d98f15a59b8fe9cad98e46eb3fb30`   | `c65d98f15a59b8fe9cad98e46eb3fb30`   |  ✓   |
+| Multi-synth 6 segments (seed 42)      | `0b374c7474895a3387b9f1df10b3c1b8`   | `0b374c7474895a3387b9f1df10b3c1b8`   |  ✓   |
+
+These are the **first locked multilingual F32 invariants** for the
+Vulkan path on the multilingual_merged base (the previously locked
+RTX 5090 invariants in `regress-c1.sh` were captured against the
+older `main`-base branch and don't apply to this base).
+
+##### Multilingual performance — RTX 5090, n=15 warm-state samples per build
+
+| Metric          | upstream/multilingual_merged | this PR     | Δ                          |
+|-----------------|-----------------------------:|------------:|---------------------------:|
+| **S3GEN_INFER** |                     169.9 ms | **153.7 ms**| **−16.2 ms (−9.5 %)**      |
+| **cfm_total**   |                     132.5 ms | **114.7 ms**| **−17.8 ms (−13.4 %)**     |
+| **cfm_step0**   |                      24.1 ms |  **12.6 ms**| **−11.5 ms (−47.7 %)**     |
+
+`cfm_step0` is the strongest multilingual signal: the persistent
+CFM estimator graph cache eliminates ~half of the per-segment
+graph-rebuild cost on warm-state synth.  The −9.5 % S3GEN_INFER
+win is below the Turbo wins shown above because:
+
+1. **Multilingual CFM is ~6× larger** in absolute terms (more
+   layers, larger hidden dims, default 10-step cosine schedule
+   vs Turbo's 2-step meanflow), so the cached host overhead is a
+   smaller fraction of the wall.
+2. The multilingual baseline already absorbs more of the
+   per-synth fixed cost than Turbo does — multilingual hits
+   `compute_time_mlp` 10 times per inference but each time only
+   touches a tiny graph, whereas the cached CFM estimator graph
+   matters more in the absolute.
+
+##### Cold-start (first segment of a fresh process)
+
+Within a single process, the **first** segment pays a one-time
+cache-warm-up overhead: PR 210–236 ms vs baseline 195–241 ms
+(no statistically significant first-segment penalty given
+run-to-run variance).  Subsequent segments are where the
+caches actually pay off and the win is consistently visible.
+
+Across processes, the persistent VkPipelineCache patch
+(round-1) collapses the cold-process startup: `cfm_step0` on a
+fresh process drops from ~133 ms (no cache, full shader compile)
+to ~30 ms (cache hit) — the headline mobile / Mesa win.
+
+##### Reproduction
+
+```bash
+# PR build (this branch)
+cd inputFilesForAI/qvac-17872-findings/chatterbox.cpp
+bash scripts/setup-ggml.sh
+cmake -S . -B build-vk-mtl-merged -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+cmake --build build-vk-mtl-merged -j --target tts-cli
+
+./build-vk-mtl-merged/tts-cli \
+    --model models/chatterbox-t3-mtl-q4_0.gguf \
+    --s3gen-gguf models/chatterbox-s3gen-mtl-q4_0.gguf \
+    --language en \
+    --text "Hello from ggml first synthesis. Second synthesis run here now. Third sentence here. Fourth sentence runs too. Fifth sentence wraps." \
+    --max-sentence-chars 32 --out /tmp/mtl-pr.wav \
+    --n-gpu-layers 99 --threads 4 --seed 42 --temp 0 --top-k 1 --verbose
+
+# Baseline (upstream/multilingual_merged HEAD, separate worktree)
+git worktree add /tmp/cb-base upstream/multilingual_merged
+ln -s "$(pwd)/models" /tmp/cb-base/models
+cd /tmp/cb-base
+bash scripts/setup-ggml.sh
+cmake -S . -B build-vk-base -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+cmake --build build-vk-base -j --target tts-cli
+
+# Same command with --out /tmp/mtl-base.wav, then:
+md5sum /tmp/mtl-pr.wav /tmp/mtl-base.wav  # MUST match
+```
+
 #### Files touched
 
 | File                                       |          Change |
@@ -4325,12 +4439,11 @@ All `inputFilesForAI/qvac-17872-findings/FINDINGS_*.md` and
 
 #### Next
 
-- **Multilingual GGUF cross-validation**: re-run the regress harness
-  against `chatterbox-s3gen-mtl-q4_0.gguf` (converted from the
-  HuggingFace public `ResembleAI/chatterbox` repo per the §3.34
-  converter) once that GGUF is available on the Vulkan host.  By
-  construction every cache should hit ≥ as often as on Turbo;
-  measurable wins should be ≥ those reported here.
+- **Multilingual GGUF cross-validation** — ✅ **DONE (May 6, 2026)**.
+  See "Multilingual verification" subsection above: bit-exact on F32
+  (single-shot `c65d98…`, multi-synth `0b374c…`); steady-state wins
+  −9.5 % S3GEN_INFER, −13.4 % cfm_total, −47.7 % cfm_step0 vs
+  upstream/multilingual_merged HEAD on multilingual GGUF.
 - **C1 port to `multilingual_merged`** (F16 CFM matmul weights,
   opt-in `CHATTERBOX_F16_CFM`): needs ~100 lines adapting our F32→F16
   conversion path to `multilingual_merged`'s
