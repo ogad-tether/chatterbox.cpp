@@ -206,12 +206,12 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-streaming PRIVATE ggml/include src include)
 
     add_executable(test-cpu-caches
-        src/test_cpu_caches.cpp
+        test/test_cpu_caches.cpp
         src/chatterbox_tts.cpp)
     target_link_libraries(test-cpu-caches PRIVATE ggml)
     target_include_directories(test-cpu-caches PRIVATE ggml/include src include)
 
-    add_executable(test-t3-caches src/test_t3_caches.cpp)
+    add_executable(test-t3-caches test/test_t3_caches.cpp)
     target_link_libraries(test-t3-caches PRIVATE tts-cpp ggml)
     target_include_directories(test-t3-caches PRIVATE ggml/include src include)
 
