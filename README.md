@@ -324,7 +324,7 @@ cd -
 
 ```bash
 # (from wherever you want the repo to live)
-git clone git@github.com:gianni-cor/chatterbox.cpp.git
+git clone <this-repo> chatterbox.cpp
 cd chatterbox.cpp
 
 # Clone ggml at the pinned commit and apply the Metal + OpenCL patches
@@ -922,11 +922,12 @@ this table (`2 711 ms / 71 tok`, `8 029 ms`, `RTF 3.63`) was captured
 while CPU was silently running only the conditional CFM pass — i.e.
 half the CFM compute and no classifier-free guidance steering.  S3Gen
 wall-time roughly doubled (one extra forward call per CFM step) and
-RTF went from 3.63 → 8.20.  The remeasurement here uses the local
-`gianni.wav` reference (jfk.wav was not on the host) — that accounts
-for the slightly larger token count (85 vs the original 71); the per-
-audio-second cost ratio is what shifted, ~2×, in line with restoring
-the missing pass.  Turbo and the Metal multilingual row are
+RTF went from 3.63 → 8.20.  The remeasurement here uses a different
+local reference wav (the original `jfk.wav` was not present on the
+host) — that accounts for the slightly larger token count (85 vs the
+original 71); the per-audio-second cost ratio is what shifted, ~2×,
+in line with restoring the missing pass.  Turbo and the Metal
+multilingual row are
 unaffected — they always carried the CFG combine.
 
 ### Multilingual (Mac Studio M3 Ultra, after §3.21 optimisation pass)
