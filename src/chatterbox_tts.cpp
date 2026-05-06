@@ -582,6 +582,24 @@ static std::unordered_map<const ggml_tensor *, std::vector<float>>       g_inv_a
 static std::unordered_map<int, std::vector<float>>                       g_hann_window_cache;
 static std::unordered_map<int, std::vector<float>>                       g_istft_kernel_cache;
 static std::unordered_map<int64_t, std::vector<float>>                   g_window_sum_cache;
+
+// Round 5 (PROGRESS.md §3.36): STFT graph + analysis-kernel caches.
+// `run_stft` runs once per synth as part of the HiFT path (between
+// SineGen and the HiFT decoder).  Both the graph and the analysis
+// kernel were rebuilt every synth in the un-optimised path; caching
+// them eliminates a 4 MB context buffer + ggml_init + graph build +
+// gallocator alloc cycle per synth, plus the small hann × trig
+// build inside `build_stft_kernel`.
+//
+// Keying:
+//   * g_stft_graph_cache.key = T_src (= T_mel × 480 in chatterbox).
+//     Streaming chunks of varying length still produce correct output
+//     — the cache rebuilds when its key diverges.
+//   * g_stft_kernel_cache key = n_fft (int).  Constant 16 in the
+//     chatterbox HiFT path; tiny per-build cost (~144 floats) but
+//     pure waste across synths.
+static graph_cache                                                       g_stft_graph_cache;
+static std::unordered_map<int, std::vector<float>>                       g_stft_kernel_cache;
 }  // namespace
 
 // Cached F32 mirror of a model tensor.  Returns a pointer into the
@@ -623,6 +641,7 @@ static void s3gen_release_synth_caches() {
     g_encoder_graph_cache.destroy();
     g_hift_graph_cache.destroy();
     g_f0_graph_cache.destroy();
+    g_stft_graph_cache.destroy();
     g_hift_inv_alpha_entries.clear();
     g_time_mlp_results.clear();
     g_time_emb_results.clear();
@@ -632,6 +651,7 @@ static void s3gen_release_synth_caches() {
     g_hann_window_cache.clear();
     g_istft_kernel_cache.clear();
     g_window_sum_cache.clear();
+    g_stft_kernel_cache.clear();
 }
 
 // ============================================================================
@@ -1660,6 +1680,23 @@ static const std::vector<float> & cached_istft_kernel(int n_fft) {
     return it->second;
 }
 
+// QVAC-18422 round 5: cached STFT analysis kernel.  Pure function of
+// n_fft (constant 16 in chatterbox HiFT) and the cached hann window.
+// Per-build cost is small (~144 floats; trig + window scaling) but
+// rebuilding it every synth is pointless waste.  Keyed identically
+// to `cached_istft_kernel`; both share `g_synth_caches_mu`.
+static const std::vector<float> & cached_stft_kernel(int n_fft) {
+    {
+        std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+        auto it = g_stft_kernel_cache.find(n_fft);
+        if (it != g_stft_kernel_cache.end()) return it->second;
+    }
+    auto k = build_stft_kernel(n_fft, cached_hann_window(n_fft));
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    auto [it, inserted] = g_stft_kernel_cache.try_emplace(n_fft, std::move(k));
+    return it->second;
+}
+
 static const std::vector<float> & cached_window_sum(int T_stft, int n_fft, int hop) {
     // Pack (n_fft, hop, T_stft) into a single int64 key — n_fft and
     // hop are constants on the chatterbox path but encoding them
@@ -1821,36 +1858,60 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
 }
 
 // STFT (time-domain source -> spec)
+//
+// QVAC-18422 round 5: graph + analysis kernel cached process-wide via
+// g_stft_graph_cache (keyed on T_src) and g_stft_kernel_cache (keyed on
+// n_fft).  Streaming chunks of varying length still produce correct
+// output — the graph cache rebuilds when its T_src diverges; the n_fft-
+// keyed kernel cache stays at one entry across all chunks because n_fft
+// is constant in the chatterbox HiFT path.  Lifecycle is identical to
+// the round-2 graph caches: invalidated together by
+// s3gen_release_synth_caches() before ggml_backend_free, so the cached
+// gallocator releases against a still-valid backend on backend swap or
+// s3gen_unload().
 static std::vector<float> run_stft(const model_ctx & m, const std::vector<float> & src) {
     const int n_fft = 16, hop = 4;
     const int F = n_fft / 2 + 1;
     int T_src = (int)src.size();
-    auto window = build_hann_window(n_fft, true);
-    auto kernel = build_stft_kernel(n_fft, window);
 
-    static size_t buf_size = 4 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
-    ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_src, 1);
-    ggml_set_name(s, "s"); ggml_set_input(s);
-    ggml_tensor * s_pad = reflect_pad_1d(ctx, s, n_fft/2, n_fft/2);
-    ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_fft, 1, 2*F);
-    ggml_set_name(k, "k"); ggml_set_input(k);
-    ggml_tensor * spec = conv1d_f32(ctx, k, s_pad, hop, 0, 1);
-    ggml_set_name(spec, "out"); ggml_set_output(spec);
-    ggml_build_forward_expand(gf, spec);
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "s"), src.data(), 0, src.size()*sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "k"), kernel.data(), 0, kernel.size()*sizeof(float));
-    compute(m.backend, gf);
+    const std::vector<float> & kernel = cached_stft_kernel(n_fft);
+
+    graph_cache & cache = g_stft_graph_cache;
+    const bool build_graph = (cache.key != (int64_t) T_src) || (cache.ctx == nullptr);
+    if (build_graph) {
+        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+        if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
+        // Reuse `buf` across rebuilds — keeping it allocated avoids a
+        // 4 MB malloc when streaming chunks rotate through varying T_src
+        // values.  graph_cache::destroy() preserves the buf reservation.
+        cache.buf.resize(4 * 1024 * 1024);
+        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+        cache.ctx = ggml_init(gp);
+        cache.gf  = ggml_new_graph_custom(cache.ctx, 8192, false);
+        cache.key = (int64_t) T_src;
+
+        ggml_tensor * s = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, T_src, 1);
+        ggml_set_name(s, "s"); ggml_set_input(s);
+        ggml_tensor * s_pad = reflect_pad_1d(cache.ctx, s, n_fft/2, n_fft/2);
+        ggml_tensor * k = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, n_fft, 1, 2*F);
+        ggml_set_name(k, "k"); ggml_set_input(k);
+        ggml_tensor * spec = conv1d_f32(cache.ctx, k, s_pad, hop, 0, 1);
+        ggml_set_name(spec, "out"); ggml_set_output(spec);
+        ggml_build_forward_expand(cache.gf, spec);
+
+        cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        ggml_gallocr_reserve(cache.allocr, cache.gf);
+    }
+
+    ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(cache.gf, "s"),
+                            src.data(), 0, src.size() * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(cache.gf, "k"),
+                            kernel.data(), 0, kernel.size() * sizeof(float));
+    compute(m.backend, cache.gf);
+    ggml_tensor * spec = ggml_graph_get_tensor(cache.gf, "out");
     std::vector<float> out(ggml_nelements(spec));
     ggml_backend_tensor_get(spec, out.data(), 0, ggml_nbytes(spec));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
     return out;
 }
 
@@ -2922,6 +2983,18 @@ size_t istft_kernel_cache_size() {
 size_t hann_window_cache_size() {
     std::lock_guard<std::mutex> lk(g_synth_caches_mu);
     return g_hann_window_cache.size();
+}
+bool stft_graph_cache_built() {
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    return g_stft_graph_cache.ctx != nullptr;
+}
+int stft_graph_cache_T_src() {
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    return (int) g_stft_graph_cache.key;
+}
+size_t stft_kernel_cache_size() {
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    return g_stft_kernel_cache.size();
 }
 size_t window_sum_cache_size() {
     std::lock_guard<std::mutex> lk(g_synth_caches_mu);

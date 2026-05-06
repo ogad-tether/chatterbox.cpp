@@ -94,6 +94,26 @@ size_t istft_kernel_cache_size();
 size_t hann_window_cache_size();
 size_t window_sum_cache_size();
 
+// ---------- Round 5 (PROGRESS.md §3.36): STFT graph + kernel caches ---
+//
+// `run_stft` (called once per synth from the HiFT path, between
+// SineGen output and the HiFT decoder) used to allocate a fresh
+// 4 MB context buffer + ggml_gallocator + backend buffer + build a
+// fresh conv1d graph every synth.  The graph topology depends on
+// T_src (= T_mel × 480), so it must rebuild when streaming chunks
+// change length.  The forward STFT analysis kernel `build_stft_kernel`
+// is a pure function of n_fft (constant 16 in the chatterbox path)
+// and depends on `cached_hann_window(n_fft)` — caching it eliminates
+// the per-synth ~144-element trig + window build.
+//
+// Wired into the same s3gen_release_synth_caches() teardown as the
+// other graph caches, so backend swap / s3gen_unload() leaves no
+// dangling gallocator pointing at a freed backend.
+
+bool   stft_graph_cache_built();
+int    stft_graph_cache_T_src();
+size_t stft_kernel_cache_size();
+
 // ---------- Round 4 (PROGRESS.md §3.35): T3 step-graph cache ---------
 //
 // MTL-only.  Caches the per-(n_past, is_uncond) graph that
