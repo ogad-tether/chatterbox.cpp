@@ -18,6 +18,59 @@ option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build the tts-cli executable + mel2wa
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
 option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use system-installed GGML library"                OFF)
+option(TTS_CPP_GGML_LIB_PREFIX   "tts-cpp: rename bundled ggml libraries to libtts-ggml-* (filename only; CMake target names and C symbols are unchanged). Prevents shared-library filename collisions when multiple consumers that vendor different ggml versions are loaded into the same host process. Has no effect when TTS_CPP_USE_SYSTEM_GGML=ON." ON)
+
+if (CMAKE_CROSSCOMPILING)
+    if (NOT DEFINED GGML_NATIVE OR GGML_NATIVE)
+        message(STATUS "tts-cpp: cross-compiling to ${CMAKE_SYSTEM_NAME} -- "
+                       "forcing GGML_NATIVE=OFF (ggml's ARM feature probes use try_run() "
+                       "which CMake refuses in cross-compile mode).")
+        set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
+    if (NOT DEFINED GGML_BLAS OR GGML_BLAS)
+        set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+    endif()
+    if (NOT DEFINED GGML_ACCELERATE OR GGML_ACCELERATE)
+        set(GGML_ACCELERATE OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
+
+# Two related workarounds for clang-cl / MSVC builds on Windows.  Both
+# come from msys2 sneaking GCC-flavoured libraries onto CMake's search
+# paths and being mismatched against MSVC-compiled translation units.
+# Both are no-ops on MinGW (excluded) and on non-Windows.
+#
+# (1) libm. ggml/src/CMakeLists.txt unconditionally links libm on Windows
+#     unless ONEAPI_ROOT is set, which fails when find_library picks up a
+#     stray libm.dll.a from msys2 (lld-link errors with `could not open
+#     'm.lib'`). Set ONEAPI_ROOT in the configure-time environment so
+#     ggml's existing escape hatch fires.  set(ENV{...}) only affects
+#     the running CMake configure process — the same scope ggml's check
+#     runs in.
+#
+# (2) OpenMP. CMake's FindOpenMP picks `-fopenmp=libomp` (LLVM-style) for
+#     MSVC, but resolves OpenMP_*_LIBRARIES to msys2's libgomp.dll.a if
+#     msys2 is on PATH.  The resulting object files reference LLVM
+#     `__kmpc_*` symbols that GOMP doesn't provide and lld-link errors
+#     out with `undefined symbol: __kmpc_global_thread_num`.  Disable
+#     OpenMP for this toolchain; the perf hit on the CPU encoder is
+#     bounded and only affects this specific build environment.
+if (WIN32 AND NOT MINGW)
+    if (NOT DEFINED ENV{ONEAPI_ROOT})
+        set(ENV{ONEAPI_ROOT} "1")
+    endif()
+    if (NOT DEFINED GGML_OPENMP AND NOT DEFINED CACHE{GGML_OPENMP})
+        # Normal (non-cache) variable on purpose: scoped to this
+        # listfile + its add_subdirectory(ggml) below, doesn't poison
+        # parent-project CMakeCache when tts-cpp is consumed via
+        # add_subdirectory.  ggml's `option(GGML_OPENMP ... ON)` respects
+        # an existing normal variable under CMP0077 (CMake 3.13+).
+        set(GGML_OPENMP OFF)
+    endif()
+endif()
 
 if (NOT TARGET ggml)
     if (TTS_CPP_USE_SYSTEM_GGML)
@@ -29,6 +82,53 @@ if (NOT TARGET ggml)
     else()
         add_subdirectory(ggml)
     endif()
+endif()
+
+# Rename the bundled ggml shared/static library filenames so the speech
+# stack (whisper, parakeet, chatterbox, supertonic) can vendor a single
+# ggml file set without colliding with other addons that ship their own
+# (fabric/qvac-ggml-*, diffusion-ggml-*).  CMake target names and C
+# symbols are unchanged; only the on-disk filename gains the prefix.
+function(tts_cpp_apply_ggml_prefix target)
+    if (NOT TARGET ${target})
+        return()
+    endif()
+    get_target_property(_tcgp_type ${target} TYPE)
+    if (_tcgp_type STREQUAL "INTERFACE_LIBRARY" OR _tcgp_type STREQUAL "OBJECT_LIBRARY")
+        return()
+    endif()
+    get_target_property(_tcgp_old ${target} OUTPUT_NAME)
+    if (NOT _tcgp_old OR _tcgp_old STREQUAL "_tcgp_old-NOTFOUND")
+        set(_tcgp_old ${target})
+    endif()
+    set_target_properties(${target} PROPERTIES
+        OUTPUT_NAME "tts-${_tcgp_old}"
+    )
+endfunction()
+
+if (TTS_CPP_GGML_LIB_PREFIX AND NOT TTS_CPP_USE_SYSTEM_GGML)
+    foreach (_tcgp_target ggml ggml-base)
+        tts_cpp_apply_ggml_prefix(${_tcgp_target})
+    endforeach()
+    if (DEFINED GGML_AVAILABLE_BACKENDS)
+        foreach (_tcgp_target ${GGML_AVAILABLE_BACKENDS})
+            tts_cpp_apply_ggml_prefix(${_tcgp_target})
+        endforeach()
+    endif()
+    # Renaming the .so/.dll files alone is not enough: ggml's runtime
+    # backend loader (`ggml_backend_load_best`) hard-codes the
+    # `libggml-` / `ggml-` filename prefix when scanning under
+    # GGML_BACKEND_DL=ON.  qvac-ext-ggml/speech absorbs the patch that
+    # adds GGML_BACKEND_DL_PROJECT_PREFIX; defining it here teaches the
+    # loader to look for our prefixed filenames at runtime.  Without
+    # it the renamed .so/.dll files exist on disk but Vulkan / OpenCL
+    # / CUDA backends silently fail to load on Android.
+    if (TARGET ggml)
+        target_compile_definitions(ggml PRIVATE
+            GGML_BACKEND_DL_PROJECT_PREFIX="tts-"
+        )
+    endif()
+    message(STATUS "tts-cpp: bundled ggml libraries will be emitted as libtts-ggml-* (set TTS_CPP_GGML_LIB_PREFIX=OFF to keep upstream filenames)")
 endif()
 
 find_package(OpenMP)
