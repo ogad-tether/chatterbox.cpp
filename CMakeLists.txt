@@ -161,6 +161,32 @@ if (MSVC)
     add_compile_definitions(_USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# INTERFACE library that holds the GGML_USE_<BACKEND> compile defines
+# every TU that includes ggml.h needs to dispatch correctly on the
+# enabled backend.  The tts-cpp library AND any test executable that
+# recompiles src/chatterbox_tts.cpp / src/main.cpp from source (i.e.
+# bypasses the tts-cpp link) must link against this; otherwise the
+# #ifdef GGML_USE_<BACKEND> branches inside those TUs evaluate as
+# undefined and the GPU code paths get silently compiled out of the
+# test executable, even when the parent build did enable the backend.
+# Mirrors parakeet-cpp's parakeet-backend-defs INTERFACE lib.
+add_library(tts-cpp-backend-defs INTERFACE)
+if (GGML_CUDA)
+    target_compile_definitions(tts-cpp-backend-defs INTERFACE GGML_USE_CUDA)
+endif()
+if (GGML_METAL)
+    target_compile_definitions(tts-cpp-backend-defs INTERFACE GGML_USE_METAL)
+endif()
+if (GGML_VULKAN)
+    target_compile_definitions(tts-cpp-backend-defs INTERFACE GGML_USE_VULKAN)
+endif()
+if (GGML_BLAS)
+    target_compile_definitions(tts-cpp-backend-defs INTERFACE GGML_USE_BLAS)
+endif()
+if (GGML_OPENCL)
+    target_compile_definitions(tts-cpp-backend-defs INTERFACE GGML_USE_OPENCL)
+endif()
+
 set(TTS_CPP_LIB_SOURCES
     src/main.cpp
     src/chatterbox_cli.cpp
@@ -273,18 +299,7 @@ if (TTS_CPP_BUILD_LIBRARY)
         target_link_libraries(tts-cpp PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
-    if (GGML_CUDA)
-        target_compile_definitions(tts-cpp PRIVATE GGML_USE_CUDA)
-    endif()
-    if (GGML_METAL)
-        target_compile_definitions(tts-cpp PRIVATE GGML_USE_METAL)
-    endif()
-    if (GGML_VULKAN)
-        target_compile_definitions(tts-cpp PRIVATE GGML_USE_VULKAN)
-    endif()
-    if (GGML_OPENCL)
-        target_compile_definitions(tts-cpp PRIVATE GGML_USE_OPENCL)
-    endif()
+    target_link_libraries(tts-cpp PRIVATE tts-cpp-backend-defs)
 
     set_target_properties(tts-cpp PROPERTIES
         POSITION_INDEPENDENT_CODE ON
@@ -506,11 +521,8 @@ if (TTS_CPP_BUILD_TESTS)
         REQUIRES "${TTS_CPP_TEST_REF_DIR}/mtl-tokenizer/tokenizer.json" "${TTS_CPP_TEST_REF_DIR}/mtl-tokenizer/golden.json")
 
     add_executable(test-t3-mtl test/test_t3_mtl.cpp)
-    target_link_libraries(test-t3-mtl PRIVATE tts-cpp ggml)
+    target_link_libraries(test-t3-mtl PRIVATE tts-cpp ggml tts-cpp-backend-defs)
     target_include_directories(test-t3-mtl PRIVATE ggml/include src include)
-    if (GGML_METAL)
-        target_compile_definitions(test-t3-mtl PRIVATE GGML_USE_METAL)
-    endif()
     tts_cpp_apply_ccache(test-t3-mtl)
     tts_cpp_register_test(test-t3-mtl
         LABEL    "fixture"
@@ -518,11 +530,8 @@ if (TTS_CPP_BUILD_TESTS)
         REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_t3_mtl_ref}")
 
     add_executable(test-t3-mtl-stages test/test_t3_mtl_stages.cpp)
-    target_link_libraries(test-t3-mtl-stages PRIVATE tts-cpp ggml)
+    target_link_libraries(test-t3-mtl-stages PRIVATE tts-cpp ggml tts-cpp-backend-defs)
     target_include_directories(test-t3-mtl-stages PRIVATE ggml/include src include)
-    if (GGML_METAL)
-        target_compile_definitions(test-t3-mtl-stages PRIVATE GGML_USE_METAL)
-    endif()
     tts_cpp_apply_ccache(test-t3-mtl-stages)
     tts_cpp_register_test(test-t3-mtl-stages
         LABEL    "fixture"
@@ -532,7 +541,7 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-streaming
         test/test_streaming.cpp
         src/chatterbox_tts.cpp)
-    target_link_libraries(test-streaming PRIVATE ggml)
+    target_link_libraries(test-streaming PRIVATE ggml tts-cpp-backend-defs)
     target_include_directories(test-streaming PRIVATE ggml/include src include)
     tts_cpp_apply_ccache(test-streaming)
     tts_cpp_register_test(test-streaming
@@ -548,7 +557,7 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-cpu-caches
         test/test_cpu_caches.cpp
         src/chatterbox_tts.cpp)
-    target_link_libraries(test-cpu-caches PRIVATE ggml)
+    target_link_libraries(test-cpu-caches PRIVATE ggml tts-cpp-backend-defs)
     target_include_directories(test-cpu-caches PRIVATE ggml/include src include)
     tts_cpp_apply_ccache(test-cpu-caches)
     # No-model invocation: bit-cast cache-key + initial-state checks.
@@ -580,11 +589,8 @@ if (TTS_CPP_BUILD_TESTS)
         REQUIRES "${_tcb_t3_mtl_gguf}")
 
     add_executable(test-metal-ops test/test_metal_ops.cpp)
-    target_link_libraries(test-metal-ops PRIVATE ggml)
+    target_link_libraries(test-metal-ops PRIVATE ggml tts-cpp-backend-defs)
     target_include_directories(test-metal-ops PRIVATE ggml/include src)
-    if (GGML_METAL)
-        target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
-    endif()
     tts_cpp_apply_ccache(test-metal-ops)
     # Metal-only kernel parity check.  Useful only when built with
     # -DGGML_METAL=ON; skipped on CI fleets without Metal via `ctest -LE gpu`.
@@ -717,7 +723,13 @@ if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
     # generated tts-cppTargets.cmake carries the correct shape for
     # whatever linkage the build produced (STATIC vs SHARED, with
     # IMPORTED_IMPLIB on Windows shared builds, etc.).
-    install(TARGETS tts-cpp
+    # tts-cpp-backend-defs is an INTERFACE library that ships compile
+    # defines only (no archives / no runtime artefacts).  It is part of
+    # tts-cpp's PRIVATE link line for static archives, so the exporter
+    # requires it to be in the same export set even though there's
+    # nothing to install for it on disk.  Adding it here keeps the
+    # generated tts-cppTargets.cmake self-contained.
+    install(TARGETS tts-cpp tts-cpp-backend-defs
         EXPORT tts-cppTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
