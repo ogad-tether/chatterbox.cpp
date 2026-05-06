@@ -1,4 +1,4 @@
-// QVAC-18422 round 4 — T3 step-graph cache validation.
+// T3 step-graph cache validation.
 //
 // Verifies the per-(n_past, is_uncond) graph cache that
 // `build_step_graph_mtl` consults instead of rebuilding the ~5500-
@@ -420,7 +420,7 @@ void test_multi_synth_timing(const std::string & model_path) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    fprintf(stderr, "test-t3-caches: QVAC-18422 round 4 (T3 step-graph cache)\n");
+    fprintf(stderr, "test-t3-caches: T3 step-graph cache validation\n");
 
     // Enable the opt-in cache for the duration of the test.  In
     // production the cache is gated behind CHATTERBOX_T3_STEP_CACHE

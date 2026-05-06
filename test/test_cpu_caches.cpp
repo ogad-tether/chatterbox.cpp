@@ -1,5 +1,5 @@
-// CPU-side persistent-cache validation harness for QVAC-18422
-// "[TTS GGML] Optimize cpp backend multilingual for CPU".
+// CPU-side persistent-cache validation harness for the multilingual
+// CPU TTS path.
 //
 // Verifies the four cache layers added to chatterbox_tts.cpp:
 //
@@ -656,7 +656,7 @@ void test_streaming_shape_invalidation(const std::string & gguf,
 }  // namespace
 
 int main(int argc, char ** argv) {
-    fprintf(stderr, "test-cpu-caches: QVAC-18422 cache validation\n");
+    fprintf(stderr, "test-cpu-caches: CPU-side persistent-cache validation\n");
 
     test_cache_keys();
     test_initial_state();
