@@ -11,6 +11,7 @@
 
 #include "chatterbox_t3_internal.h"
 #include "gpt2_bpe.h"
+#include "mtl_tokenizer.h"
 #include "npy.h"
 #include "t3_mtl.h"
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
@@ -52,11 +53,14 @@ struct Engine::Impl {
     std::vector<float>   s3gen_embedding;
     std::vector<int32_t> s3gen_prompt_token;
 
-    // Cached BPE built once from model.tok_tokens / model.tok_merges in
-    // the ctor below.  Constructing the gpt2_bpe (Turbo's 64K vocab +
-    // ~50K merges) costs a few ms per call; rebuilding per synthesize()
-    // is wasteful, especially in streaming / short-utterance scenarios.
+    // Tokenizer cache.  Exactly one of bpe / mtl_tok is populated based
+    // on the loaded GGUF's variant metadata; the other stays default-
+    // constructed.  Constructed once in the ctor and reused per
+    // synthesize() call (gpt2_bpe rebuilds amortise poorly on Turbo's
+    // 64K vocab + ~50K merges; mtl_tokenizer JSON parse is heavier
+    // still).
     gpt2_bpe             bpe;
+    mtl_tokenizer        mtl_tok;
 
     std::atomic<bool>    cancel_flag{false};
 
@@ -101,31 +105,39 @@ struct Engine::Impl {
             throw std::runtime_error("Engine: failed to load T3 GGUF: " + opts.t3_gguf_path);
         }
 
-        // Build the BPE once from the now-loaded tokenizer.  Reused by
-        // every synthesize() call; the model owns the underlying token /
-        // merges arrays so the bpe stays valid for the Engine's lifetime.
-        bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
-
-        // Engine currently only wires the Turbo (GPT-2 Medium) variant.  An
-        // MTL (Llama-520M multilingual) GGUF loads cleanly via load_model_gguf
-        // -> load_model_gguf_mtl (populating model.layers_mtl, leaving
-        // model.layers empty), but synthesize() unconditionally calls
-        // eval_prompt() -> build_prompt_graph() -> build_transformer_core(),
-        // which iterates model.layers[il] and would index into an empty
-        // vector (UB / crash).  Reject up front with a clear error until
-        // the public Engine API is extended with language / cfg_weight /
-        // min_p / exaggeration and synthesize() learns to dispatch on
-        // model.hparams.variant.  The CLI (tts-cli / chatterbox) uses the
-        // lower-level eval_prompt_mtl / eval_step_mtl / sample_next_token_mtl
-        // helpers directly and is unaffected.
-        if (model.hparams.variant != CHBX_VARIANT_TURBO) {
+        // Variant dispatch.  Turbo uses the GPT-2 BPE (built from the
+        // model's tok_tokens / tok_merges arrays); multilingual uses
+        // the HuggingFace MTL tokenizer JSON embedded in the GGUF.
+        // synthesize() / run_t3() switch graph + sampling paths on the
+        // same flag.
+        if (model.hparams.variant == CHBX_VARIANT_TURBO) {
+            bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
+        } else if (model.hparams.variant == CHBX_VARIANT_MTL) {
+            if (model.mtl_tokenizer_json.empty()) {
+                free_model();
+                throw std::runtime_error(
+                    "Engine: T3 GGUF reports chatterbox.variant == t3_mtl "
+                    "but does not embed an mtl_tokenizer.json blob; "
+                    "regenerate with scripts/convert-t3-mtl-to-gguf.py.  "
+                    "Path: " + opts.t3_gguf_path);
+            }
+            if (!mtl_tok.load_from_json(model.mtl_tokenizer_json)) {
+                free_model();
+                throw std::runtime_error(
+                    "Engine: failed to parse embedded mtl_tokenizer.json "
+                    "for: " + opts.t3_gguf_path);
+            }
+            if (!opts.language.empty() && !mtl_tok.is_language_supported(opts.language)) {
+                free_model();
+                throw std::runtime_error(
+                    "Engine: language '" + opts.language +
+                    "' not in the multilingual tokenizer's tier-1 set");
+            }
+        } else {
             free_model();
             throw std::runtime_error(
-                "Engine: T3 GGUF reports chatterbox.variant != t3_turbo "
-                "(multilingual / t3_mtl is not yet supported through the "
-                "public Engine API).  Use the tts-cli binary or the "
-                "internal eval_*_mtl helpers in chatterbox_t3_internal.h "
-                "for now.  Path: " + opts.t3_gguf_path);
+                "Engine: T3 GGUF reports unknown chatterbox.variant; "
+                "supported: t3_turbo, t3_mtl.  Path: " + opts.t3_gguf_path);
         }
 
         s3gen_preload_thread = std::thread([path = opts.s3gen_gguf_path,
@@ -358,14 +370,23 @@ struct Engine::Impl {
     }
 
     std::vector<int32_t> run_t3(const std::string & text) {
-        if (model.tok_tokens.empty()) {
-            throw std::runtime_error(
-                "Engine: T3 GGUF has no embedded tokenizer; "
-                "re-run scripts/convert-t3-turbo-to-gguf.py");
-        }
+        const bool is_mtl = (model.hparams.variant == CHBX_VARIANT_MTL);
 
-        const std::string normalised = gpt2_bpe::punc_norm(text);
-        const std::vector<int32_t> text_tokens = bpe.tokenize(normalised);
+        // Tokenise via the variant-appropriate tokenizer.  Both paths
+        // produce a flat vector<int32_t> the rest of the loop is
+        // agnostic to.
+        std::vector<int32_t> text_tokens;
+        if (is_mtl) {
+            text_tokens = mtl_tok.encode(text, opts.language);
+        } else {
+            if (model.tok_tokens.empty()) {
+                throw std::runtime_error(
+                    "Engine: T3 GGUF has no embedded tokenizer; "
+                    "re-run scripts/convert-t3-turbo-to-gguf.py");
+            }
+            const std::string normalised = gpt2_bpe::punc_norm(text);
+            text_tokens = bpe.tokenize(normalised);
+        }
         if (text_tokens.empty()) {
             throw std::runtime_error("Engine: text tokenised to empty sequence");
         }
@@ -375,21 +396,39 @@ struct Engine::Impl {
         sp.top_p          = opts.top_p;
         sp.temp           = opts.temperature;
         sp.repeat_penalty = opts.repeat_penalty;
+        sp.min_p          = opts.min_p;
+        sp.cfg_weight     = opts.cfg_weight;
 
         const int n_threads = resolve_thread_count(opts.n_threads);
         std::mt19937 rng(opts.seed);
 
+        // Prompt eval.  Turbo: single-pass; MTL: cond + uncond batched
+        // into one B=2 forward, with the eval_*_mtl helpers returning
+        // both logit slices.
         std::vector<float> logits;
+        std::vector<float> logits_c, logits_u;
         int prompt_len = 0;
-        if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, prompt_len)) {
-            throw std::runtime_error("Engine: T3 prompt eval failed");
+        if (is_mtl) {
+            if (!eval_prompt_mtl(model, allocr, n_threads,
+                                 text_tokens, opts.exaggeration,
+                                 logits_c, logits_u, prompt_len)) {
+                throw std::runtime_error("Engine: T3 prompt eval failed (mtl)");
+            }
+        } else {
+            if (!eval_prompt(model, allocr, n_threads,
+                             text_tokens, logits, prompt_len)) {
+                throw std::runtime_error("Engine: T3 prompt eval failed");
+            }
         }
 
         int n_past = prompt_len;
         std::vector<int32_t> generated;
         generated.reserve((size_t) opts.n_predict + 1);
 
-        int32_t current = sample_next_token_ex(logits, generated, sp, rng);
+        int32_t current = is_mtl
+            ? sample_next_token_mtl(logits_c, logits_u, generated, sp, rng,
+                                    model.hparams.stop_speech_token)
+            : sample_next_token_ex(logits, generated, sp, rng);
         generated.push_back(current);
 
         for (int i = 0; i < opts.n_predict; ++i) {
@@ -398,11 +437,18 @@ struct Engine::Impl {
             }
             if (current == model.hparams.stop_speech_token) break;
             if (n_past + 1 > model.hparams.n_ctx) break;
-            if (!eval_step(model, allocr, n_threads, n_past, current, logits)) {
+            const bool step_ok = is_mtl
+                ? eval_step_mtl(model, allocr, n_threads, n_past, current,
+                                logits_c, logits_u)
+                : eval_step(model, allocr, n_threads, n_past, current, logits);
+            if (!step_ok) {
                 throw std::runtime_error("Engine: T3 step eval failed");
             }
             ++n_past;
-            current = sample_next_token_ex(logits, generated, sp, rng);
+            current = is_mtl
+                ? sample_next_token_mtl(logits_c, logits_u, generated, sp, rng,
+                                        model.hparams.stop_speech_token)
+                : sample_next_token_ex(logits, generated, sp, rng);
             generated.push_back(current);
         }
 

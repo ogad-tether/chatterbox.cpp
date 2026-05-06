@@ -101,6 +101,36 @@ struct EngineOptions {
     float temperature    = 0.8f;
     float repeat_penalty = 1.2f;
 
+    // ---------------- Multilingual variant only ---------------------
+    //
+    // Honoured when the loaded T3 GGUF reports
+    // `chatterbox.variant = "t3_mtl"`; ignored on Turbo.  The engine
+    // dispatches automatically based on the variant metadata - callers
+    // don't need to look at the GGUF to know which set of fields apply.
+    //
+    //   language     ISO 639-1 code (e.g. "en", "es", "fr"); the
+    //                multilingual tokenizer wraps the input text in a
+    //                <lang>...</lang> prefix per the language.  Must
+    //                be one of mtl_tokenizer::supported_languages();
+    //                the engine throws on unsupported inputs.
+    //
+    //   exaggeration Per-utterance prosody knob; >0 = more expressive,
+    //                <0 = flatter.  Default 0.5 matches Python's
+    //                ChatterboxMultilingualTTS.generate().
+    //
+    //   cfg_weight   Classifier-free guidance scale.  0 disables CFG
+    //                (single forward pass per token).  >0 enables CFG
+    //                (cond+uncond batched into one B=2 forward).
+    //                Default 0.5 (matches the Python reference).
+    //
+    //   min_p        Min-p sampling threshold; 0 disables, ~0.05 is a
+    //                reasonable starting point for tighter sampling
+    //                without sacrificing diversity.
+    std::string language     = "en";
+    float       exaggeration = 0.5f;
+    float       cfg_weight   = 0.5f;
+    float       min_p        = 0.0f;
+
     // S3Gen side.  0 = library default (2-step meanflow).
     int cfm_steps = 0;
 
