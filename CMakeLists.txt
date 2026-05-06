@@ -181,15 +181,8 @@ set(TTS_CPP_LIB_SOURCES
     src/supertonic_text_encoder.cpp
     src/supertonic_vector_estimator.cpp
     src/supertonic_engine.cpp
+    src/mtl_tokenizer.cpp
 )
-
-add_library(mtl_tokenizer STATIC src/mtl_tokenizer.cpp)
-# $<BUILD_INTERFACE:...> so the source-tree path stays out of any
-# INTERFACE_INCLUDE_DIRECTORIES that would otherwise leak into the
-# install(EXPORT) and trip CMake's source-prefix check.
-target_include_directories(mtl_tokenizer PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
-set_target_properties(mtl_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
-tts_cpp_apply_ccache(mtl_tokenizer)
 
 if (TTS_CPP_BUILD_LIBRARY)
     # Decoupled from BUILD_SHARED_LIBS on purpose: ggml's own CMake
@@ -234,7 +227,6 @@ if (TTS_CPP_BUILD_LIBRARY)
     )
     target_compile_features(tts-cpp PUBLIC cxx_std_17)
     target_link_libraries(tts-cpp PUBLIC ggml)
-    target_link_libraries(tts-cpp PRIVATE mtl_tokenizer)
 
     # Symbol-export contract for shared builds.  Standard llama-style
     # PAIR: PUBLIC define so consumers see the import side of TTS_CPP_API
@@ -501,7 +493,7 @@ if (TTS_CPP_BUILD_TESTS)
         REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/log_mel.npy" "${_tcb_s3gen_ref}/speech_tokens.npy")
 
     add_executable(test-mtl-tokenizer test/test_mtl_tokenizer.cpp)
-    target_link_libraries(test-mtl-tokenizer PRIVATE mtl_tokenizer)
+    target_link_libraries(test-mtl-tokenizer PRIVATE tts-cpp)
     target_include_directories(test-mtl-tokenizer PRIVATE src)
     tts_cpp_apply_ccache(test-mtl-tokenizer)
     tts_cpp_register_test(test-mtl-tokenizer
@@ -721,14 +713,7 @@ if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
     # generated tts-cppTargets.cmake carries the correct shape for
     # whatever linkage the build produced (STATIC vs SHARED, with
     # IMPORTED_IMPLIB on Windows shared builds, etc.).
-    #
-    # mtl_tokenizer is a private STATIC dep of tts-cpp; for static
-    # archives, the PRIVATE link bleeds into the export interface
-    # (static archives don't carry transitive PRIVATE deps the way
-    # shared libs do), so the exporter would otherwise refuse with
-    # "requires target mtl_tokenizer that is not in any export set".
-    # Add it to the same export so consumers get a self-contained set.
-    install(TARGETS tts-cpp mtl_tokenizer
+    install(TARGETS tts-cpp
         EXPORT tts-cppTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
