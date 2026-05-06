@@ -2232,6 +2232,16 @@ int s3gen_synthesize_to_wav(
     if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
     g_n_threads = n_threads;
     vlog("Using %d threads\n", g_n_threads);
+
+    // Cooperative cancellation: cheap acquire-load on every checkpoint.
+    // Returns true once *opts.cancel_flag becomes true (or stays false
+    // forever when the caller didn't pass one).  Implemented as a
+    // lambda so the no-cancel-flag path stays one branch deep.
+    auto is_cancelled = [&]() -> bool {
+        return opts.cancel_flag != nullptr &&
+               opts.cancel_flag->load(std::memory_order_acquire);
+    };
+
     if (gguf_path.empty()) {
         fprintf(stderr, "s3gen_synthesize_to_wav: s3gen_gguf_path is required\n");
         return 1;
@@ -2394,6 +2404,11 @@ int s3gen_synthesize_to_wav(
         fprintf(stderr, "  token[0]=%d lookup: %.6f %.6f %.6f %.6f %.6f\n",
                 flow_tokens[0],
                 input_embed[0], input_embed[1], input_embed[2], input_embed[3], input_embed[4]);
+    }
+
+    if (is_cancelled()) {
+        vlog("synthesis cancelled before encoder\n");
+        return 2;
     }
 
     // 3) Run encoder -> mu_T (numpy (T_mu, 80) layout, to match encoder_proj.npy)
@@ -2629,6 +2644,10 @@ int s3gen_synthesize_to_wav(
     cfm_estimator_cache & cfm_cache = g_cfm_estimator_cache;
     double cfm_t0 = now_ms();
     for (size_t s = 0; s < t_span.size() - 1; ++s) {
+        if (is_cancelled()) {
+            vlog("synthesis cancelled at CFM step %zu\n", s);
+            return 2;
+        }
         float t = t_span[s], r = t_span[s + 1];
         float dt = r - t;
         vlog("CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
@@ -2842,6 +2861,11 @@ int s3gen_synthesize_to_wav(
     auto s_stft = run_stft(m_hift, src);
     vlog("  [stft] %.1f ms\n", now_ms() - t0);
     int T_stft = (int)(s_stft.size() / 18);
+
+    if (is_cancelled()) {
+        vlog("synthesis cancelled before HiFT decode\n");
+        return 2;
+    }
 
     vlog("Running HiFT decode...\n");
     t0 = now_ms();

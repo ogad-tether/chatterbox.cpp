@@ -434,6 +434,11 @@ struct Engine::Impl {
         if (!s3gen_prompt_token.empty()) {
             sopts.prompt_token_override = s3gen_prompt_token;
         }
+        // Cooperative-cancel hook so a single Engine::cancel() reaches
+        // both the T3 decode loop (handled directly) and the S3Gen +
+        // HiFT path (cooperatively checked between CFM steps and
+        // before HiFT decode).
+        sopts.cancel_flag = &cancel_flag;
     }
 
     SynthesisResult synthesize_batch(const std::vector<int32_t> & speech_tokens,
@@ -448,6 +453,9 @@ struct Engine::Impl {
         const auto s3_t0 = std::chrono::steady_clock::now();
         const int rc = s3gen_synthesize_to_wav(speech_tokens, sopts);
         const auto s3_t1 = std::chrono::steady_clock::now();
+        if (rc == 2) {
+            throw std::runtime_error("Engine: synthesis cancelled during S3Gen+HiFT");
+        }
         if (rc != 0) {
             throw std::runtime_error("Engine: s3gen_synthesize_to_wav failed with code "
                                      + std::to_string(rc));
@@ -532,6 +540,11 @@ struct Engine::Impl {
             const auto s3_t0 = std::chrono::steady_clock::now();
             const int rc = s3gen_synthesize_to_wav(toks, copts);
             const auto s3_t1 = std::chrono::steady_clock::now();
+            if (rc == 2) {
+                throw std::runtime_error(
+                    "Engine: synthesis cancelled during S3Gen+HiFT chunk "
+                    + std::to_string(k));
+            }
             if (rc != 0) {
                 throw std::runtime_error(
                     "Engine: streaming chunk " + std::to_string(k) +

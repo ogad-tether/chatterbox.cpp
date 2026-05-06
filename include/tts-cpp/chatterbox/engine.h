@@ -192,7 +192,18 @@ public:
     // Best-effort cancel of an in-flight synthesize() call on another
     // thread.  Safe to call concurrently with synthesize() or from any
     // thread.  Setting the flag is all this does; actual termination
-    // happens at the next cancellation check inside the T3 decode loop.
+    // happens at the next cancellation checkpoint:
+    //
+    //   - between iterations of the T3 decode loop (every token);
+    //   - between CFM steps inside s3gen_synthesize_to_wav (every
+    //     CFM step, ~80 ms on Metal, longer on CPU);
+    //   - between encoder / HiFT-decode stages.
+    //
+    // ggml_backend_graph_compute calls cannot be preempted, so the
+    // worst-case cancel latency is one in-flight graph submission
+    // (a single CFM step, an encoder pass, or a HiFT decode pass —
+    // whichever was running when cancel() fired).  Streaming-mode
+    // cancels apply at the same checkpoints inside each chunk.
     void cancel();
 
     // Return the options the engine was constructed with (convenience for

@@ -8,6 +8,7 @@
 
 #include "tts-cpp/export.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -168,6 +169,21 @@ struct s3gen_synthesize_opts {
     // Experimental OpenCL/mobile latency option: run CFM flash attention with
     // F32 Q and F16 K/V.  This may trade a small amount of quality for speed.
     bool                 cfm_f16_kv_attn       = false;
+
+    // Optional cooperative-cancellation flag.  When non-null and set to
+    // true mid-call, s3gen_synthesize_to_wav() bails out with a non-zero
+    // exit code at the next safe checkpoint instead of running the full
+    // pipeline through.  Cooperatively checked between CFM steps and
+    // between HiFT upsample stages; in-flight ggml_backend_graph_compute
+    // calls cannot be preempted, so cancel latency is bounded by the
+    // longest single graph submission (one CFM step on multilingual,
+    // ~80 ms on M3 Ultra Metal; longer on CPU).
+    //
+    // Lifetime: the caller owns the atomic; s3gen_synthesize_to_wav only
+    // reads from it.  Engine::cancel() wires this to its internal
+    // cancel_flag so a single Engine::cancel() reaches both the T3
+    // decode loop and the S3Gen + HiFT path.
+    const std::atomic<bool> * cancel_flag       = nullptr;
 };
 
 // Runs encoder + CFM + HiFT on the given T3 speech tokens and writes a WAV.
