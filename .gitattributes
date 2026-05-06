@@ -1,0 +1,38 @@
+# tts-cpp / chatterbox.cpp line-ending policy.
+#
+# Default: normalize all text files to LF in the index, auto-convert
+# on checkout per-platform.  Windows devs get CRLF in their working
+# tree (so MSVC + Notepad behave), but commits always go in as LF.
+# Aligns with the qvac / qvac2 convention so the chatterbox.cpp port
+# carries the same line-ending policy as the rest of the QVAC speech
+# stack when integrated under qvac-ext-lib-whisper.cpp.
+
+* text=auto eol=lf
+
+# Force LF on shell scripts and patches regardless of platform.
+# `text=auto` already gives us LF in the index, but:
+#  * bash on macOS/Linux refuses to execute scripts that contain CR
+#    characters, so we pin *.sh to LF in the working tree too;
+#  * `git apply` of a CRLF patch against an LF target file fails
+#    silently with "patch does not apply", which is exactly the
+#    failure mode we want to avoid for `patches/ggml-*.patch` when a
+#    Windows dev stages them through git for the first time.
+
+*.sh    text eol=lf
+*.patch text eol=lf
+
+# Common binary file types that may show up as fixtures in the
+# future (none currently tracked — `models/`, `artifacts/`, and
+# `test/reference-audio/` are all .gitignored — but declared up-front
+# so a future `git add` of a sample wav or a tiny golden npy doesn't
+# get silently text-converted and corrupted).
+
+*.gguf  binary
+*.npy   binary
+*.npz   binary
+*.wav   binary
+*.flac  binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.pdf   binary
