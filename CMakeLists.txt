@@ -211,6 +211,17 @@ if (TTS_CPP_BUILD_LIBRARY)
     add_library(tts-cpp::tts-cpp ALIAS tts-cpp)
     tts_cpp_apply_ccache(tts-cpp)
 
+    # Hide every symbol in the .so/.dll by default; only those tagged with
+    # TTS_CPP_API (see include/tts-cpp/export.h) end up exported.  Mirrors
+    # parakeet.cpp's pattern and shrinks the runtime dynamic-symbol table to
+    # just the public API surface, which is also what lets a host that
+    # vendors libtts-cpp.a inside its own .so see only one tts_cpp::* surface
+    # instead of every detail-namespaced helper.
+    set_target_properties(tts-cpp PROPERTIES
+        CXX_VISIBILITY_PRESET     hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+
     target_include_directories(tts-cpp
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
