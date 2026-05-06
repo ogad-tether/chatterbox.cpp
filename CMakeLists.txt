@@ -510,7 +510,7 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_s3gen_gguf}" "${_tcb_streaming_ref}"
         REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_streaming_ref}")
 
-    # CPU-side persistent-cache validation (QVAC-18422).
+    # CPU-side persistent-cache validation.
     # Exercises the time_mlp / time_emb / cfm_estimator / weight_mirror
     # caches that amortise per-synth overhead on the multilingual CPU
     # path.  Links chatterbox_tts.cpp directly so it can reach the
@@ -537,7 +537,7 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_s3gen_mtl_gguf}"
         REQUIRES "${_tcb_s3gen_mtl_gguf}")
 
-    # T3 step-graph cache validation (QVAC-18422 round 4).
+    # T3 step-graph cache validation.
     add_executable(test-t3-caches test/test_t3_caches.cpp)
     target_link_libraries(test-t3-caches PRIVATE tts-cpp ggml)
     target_include_directories(test-t3-caches PRIVATE ggml/include src include)

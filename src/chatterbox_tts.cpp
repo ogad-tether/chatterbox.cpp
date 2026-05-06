@@ -163,12 +163,11 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
 // belong in a server front-end.
 static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose);
 
-// QVAC-17872 round-HIFT (initial) + round 2 (this PR): tears down every
-// per-synth host-side cache before ggml_backend_free runs.  Includes the
-// CFM estimator graph cache and (added in round 2) the encoder / HiFT /
-// F0 graph caches plus all the scaffolding caches (pos_emb, inv_alpha,
-// hann_window, istft_kernel, window_sum).  Defined later, alongside the
-// cache structs themselves.  Forward-declared here so
+// Tears down every per-synth host-side cache before ggml_backend_free
+// runs: the CFM estimator graph cache, the encoder / HiFT / F0 graph
+// caches, and the scaffolding caches (pos_emb, inv_alpha, hann_window,
+// istft_kernel, window_sum).  Defined later, alongside the cache
+// structs themselves.  Forward-declared here so
 // s3gen_model_cache_release / cache-miss / s3gen_unload can all call it
 // without moving the struct definitions earlier in the file.
 static void s3gen_release_synth_caches();
@@ -204,10 +203,10 @@ static void s3gen_model_cache_release() {
     s3gen_release_synth_caches();
 
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
-    // QVAC-17872 round-HIFT + round 2: tear down every persistent host-side
-    // cache BEFORE freeing the backend.  The graph caches own
-    // ggml_gallocr_t handles that hold Vulkan (or Metal/CUDA) buffers
-    // allocated against the soon-to-be-freed backend; gallocr_free against
+    // Tear down every persistent host-side cache BEFORE freeing the
+    // backend.  The graph caches own ggml_gallocr_t handles that hold
+    // Vulkan (or Metal/CUDA) buffers allocated against the soon-to-be-
+    // freed backend; gallocr_free against
     // a dangling vk_device asserts inside ggml-vulkan.  Same constraint as
     // the existing thread_local time_mlp_cache documents.
     s3gen_release_synth_caches();
@@ -236,10 +235,10 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
             return g_s3gen_cache_entry->m.get();
         }
     }
-    // QVAC-17872 round-HIFT + round 2: backend swap (different path or
-    // n_gpu_layers).  Tear down every persistent cache against the OLD
-    // backend before freeing it, then drop the s3gen_cache_entry.  Same
-    // reasoning as s3gen_model_cache_release.
+    // Backend swap (different path or n_gpu_layers).  Tear down every
+    // persistent cache against the OLD backend before freeing it, then
+    // drop the s3gen_cache_entry.  Same reasoning as
+    // s3gen_model_cache_release.
     if (g_s3gen_cache_entry) {
         s3gen_release_synth_caches();
     }
@@ -359,10 +358,9 @@ static ggml_tensor * conv1d_f32_b(ggml_context * ctx, ggml_tensor * kernel, ggml
     return ggml_cont(ctx, ggml_permute(ctx, prod, 1, 0, 2, 3));
 }
 
-// QVAC-17872 round-HIFT (2026-05-04): drop the trailing ggml_cont.  The
-// only caller is run_hift_decode's upsample loop, where the result is
-// immediately consumed by ggml_add(x, ggml_reshape_2d(bias)) — same
-// strided-tolerant pattern as round-AUDIT's pre_lookahead exit cont.
+// Drops the trailing ggml_cont.  The only caller is run_hift_decode's
+// upsample loop, where the result is immediately consumed by
+// ggml_add(x, ggml_reshape_2d(bias)) — a strided-tolerant pattern.
 // The view's nb[1]/nb[2] are the original out's strides (which span the
 // pre-trim length), so element-wise add iterates with the proper byte
 // offsets.  After add, x is a fresh contiguous tensor again, so the
@@ -444,23 +442,22 @@ static ggml_tensor * reflect_pad_1d(ggml_context * ctx, ggml_tensor * x, int p_l
 }
 
 // ============================================================================
-// QVAC-18422 — CPU-side persistent caches (multilingual TTS optimisation)
+// CPU-side persistent caches (multilingual TTS optimisation)
 // ============================================================================
 //
-// Round 1 (already shipped above) targeted three host-side bottlenecks:
+// Caches that amortise per-synth host-side overhead across calls:
+//
 //   (a) compute_time_mlp graph submissions (10× / synth on multilingual)
-//   (b) the local-scope cfm_estimator_cache rebuild on every synth
-//   (c) per-synth ggml_backend_tensor_get of the 13–28 MB
-//       flow/input_embedding + the speaker affine matrices
-//
-// Round 2 closes the gap between "host overhead" and "real compute" for
-// the remaining per-synth pipeline stages:
-//
-//   (d) S3Gen Conformer encoder graph + gallocator built from scratch
-//       every synth (~700 nodes; ~3-5 ms saved per synth)
-//   (e) HiFT decoder graph built from scratch every synth (~3000 nodes
-//       across 3 upsample stages × 9 ResBlocks; ~10-30 ms saved)
-//   (f) F0 predictor graph built every synth (~25 nodes; <1 ms saved)
+//   (b) cfm_estimator_cache so the CFM estimator graph isn't rebuilt
+//       every synth
+//   (c) CPU mirrors of the 13–28 MB flow/input_embedding + the speaker
+//       affine matrices, instead of paying ggml_backend_tensor_get
+//       per synth
+//   (d) S3Gen Conformer encoder graph + gallocator (~700 nodes;
+//       ~3-5 ms saved per synth)
+//   (e) HiFT decoder graph (~3000 nodes across 3 upsample stages ×
+//       9 ResBlocks; ~10-30 ms saved per synth)
+//   (f) F0 predictor graph (~25 nodes; <1 ms saved per synth)
 //   (g) compute_pos_emb result (T trig ops, fired twice per encoder run)
 //   (h) build_hann_window / build_istft_kernel scaffolding for HiFT
 //       (~1.85M F32 mults + cos/sin in build_istft_kernel alone)
@@ -504,9 +501,9 @@ static int64_t pack_hift_key(int T_mel, int T_stft) {
     return ((int64_t) T_mel << 32) | (uint32_t) T_stft;
 }
 
-// Round-1 CFM estimator graph cache (struct definition; the global
-// instance lives in the cache-state block below alongside the round-2
-// graph caches).  Cache key is (T, b2): a graph built for batch=1
+// CFM estimator graph cache (struct definition; the global instance
+// lives in the cache-state block below alongside the other graph
+// caches).  Cache key is (T, b2): a graph built for batch=1
 // (cfm_estimator_forward) cannot be reused for the batch=2 path
 // (cfm_estimator_forward_b2) since the input tensor layouts differ
 // (ne[2] = 1 vs 2).  Today `use_b2` is constant per
@@ -560,7 +557,7 @@ namespace {
 // compute itself.
 static std::mutex                                                        g_synth_caches_mu;
 
-// Round 1 result caches.
+// Result caches (per-shape memoised compute).
 static std::unordered_map<uint32_t, std::vector<float>>                  g_time_mlp_results;
 static std::unordered_map<uint64_t, std::vector<float>>                  g_time_emb_results;
 static std::unordered_map<const ggml_tensor *, std::vector<float>>       g_weight_cpu_mirror;
@@ -758,14 +755,14 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
     return ggml_add(ctx, residual, ff);
 }
 
-// QVAC-17872 round 2 / QVAC-18422 round 2: the `graph_cache` struct,
-// `pack_hift_key`, and the cache-state globals (g_encoder_graph_cache,
-// g_hift_graph_cache, g_f0_graph_cache, g_hift_inv_alpha_entries,
-// g_pos_emb_results, g_inv_alpha_results, g_hann_window_cache,
-// g_istft_kernel_cache, g_window_sum_cache) all live in the QVAC-18422
-// CPU-side cache block earlier in this file — declared above run_encoder
-// so its definition can use them, and torn down in
-// s3gen_release_synth_caches() against the still-live backend.
+// The `graph_cache` struct, `pack_hift_key`, and the cache-state
+// globals (g_encoder_graph_cache, g_hift_graph_cache,
+// g_f0_graph_cache, g_hift_inv_alpha_entries, g_pos_emb_results,
+// g_inv_alpha_results, g_hann_window_cache, g_istft_kernel_cache,
+// g_window_sum_cache) all live in the CPU-side cache block earlier
+// in this file — declared above run_encoder so its definition can
+// use them, and torn down in s3gen_release_synth_caches() against
+// the still-live backend.
 
 // Scaffolding-helper forward declarations (definitions live later, alongside
 // the cfm_estimator_cache + cached_cpu_weights_f32 helpers, where the
@@ -804,10 +801,10 @@ static void compute_pos_emb(std::vector<float> & pe, int T, int D) {
     }
 }
 
-// QVAC-18422 round 2: cached wrapper around compute_pos_emb.  Keyed by
-// pack(T, D); for chatterbox D is constant=512 and T is determined by
-// the encoder input length.  Streaming chunks at the same T after the
-// first synth pay zero compute_pos_emb work.
+// Cached wrapper around compute_pos_emb.  Keyed by pack(T, D); for
+// chatterbox D is constant=512 and T is determined by the encoder
+// input length.  Streaming chunks at the same T after the first
+// synth pay zero compute_pos_emb work.
 static const std::vector<float> & cached_pos_emb(int T, int D) {
     const int64_t key = ((int64_t) T << 32) | (uint32_t) D;
     {
@@ -823,10 +820,10 @@ static const std::vector<float> & cached_pos_emb(int T, int D) {
 }
 
 // Run the full S3Gen encoder: input (T, D=512) -> mu (2T, 80)
-// QVAC-17872 round 2: graph + gallocator cached process-wide via
-// g_encoder_graph_cache (keyed on T = encoder input length).  Same-shape
-// calls (e.g. batch synthesis of constant-length prompts, or streaming
-// chunks at a stable T) skip the rebuild + gallocr_reserve.  pos_emb
+// Graph + gallocator cached process-wide via g_encoder_graph_cache
+// (keyed on T = encoder input length).  Same-shape calls (e.g. batch
+// synthesis of constant-length prompts, or streaming chunks at a
+// stable T) skip the rebuild + gallocr_reserve.  pos_emb
 // vectors are cached separately by cached_pos_emb (keyed on (T, D));
 // re-used across every same-T synth.
 static std::vector<float> run_encoder(const model_ctx & m, const std::vector<float> & input_embed, int T, int D = 512) {
@@ -1292,12 +1289,12 @@ static std::vector<float> compute_time_mixed(const model_ctx & m,
     return out;
 }
 
-// QVAC-18422: memoised time-embedding pipeline.  Both Turbo (meanflow,
+// Memoised time-embedding pipeline.  Both Turbo (meanflow,
 // t_span = [0, 0.5, 1]) and multilingual (cosine-scheduled, 10 steps)
 // produce the same set of t-values across all subsequent synth calls —
 // the t-embedding outputs are deterministic functions of t (and the
 // model weights), so we cache them.  Globals + mutex live in the
-// QVAC-18422 anonymous namespace block earlier in this file.
+// anonymous namespace block earlier in this file.
 //
 // Bit-exactness: trivially preserved — same compute, just memoised.
 static std::vector<float> compute_time_mlp_cached(const model_ctx & m, float t_val) {
@@ -1337,9 +1334,9 @@ static std::vector<float> compute_time_emb_cached(const model_ctx & m, float t_v
 // `cfm_estimator_cache` struct, its global `g_cfm_estimator_cache`,
 // `g_weight_cpu_mirror` + `cached_cpu_weights_f32`, the bit-cast key
 // helpers `g_float_bits` / `g_float_pair_bits`, and the
-// `s3gen_release_synth_caches()` definition all live in the QVAC-18422
-// cache block earlier in this file (so they're in scope for run_encoder
-// and other users above).  See "QVAC-18422 — CPU-side persistent caches".
+// `s3gen_release_synth_caches()` definition all live in the cache
+// block earlier in this file (so they're in scope for run_encoder
+// and other users above).  See "CPU-side persistent caches".
 
 // Single estimator forward: (x, mu, t_emb, spks, cond) -> dxdt
 // All shapes are numpy (80, T) or (80,) as given, flattened row-major.
@@ -1649,10 +1646,10 @@ static std::vector<float> build_window_sum(int T_stft, int n_fft, int hop,
     return ws;
 }
 
-// QVAC-18422 round 2: cached HiFT scaffolding helpers.  hann_window +
-// istft_kernel are pure functions of n_fft (constant 1920 in the
-// chatterbox HiFT path); window_sum additionally depends on T_stft
-// (varies with output length, but stable across same-shape synth
+// Cached HiFT scaffolding helpers.  hann_window + istft_kernel are
+// pure functions of n_fft (constant 1920 in the chatterbox HiFT
+// path); window_sum additionally depends on T_stft (varies with
+// output length, but stable across same-shape synth
 // calls).  Caching them eliminates the per-synth host-CPU build cost
 // — build_istft_kernel(1920) alone is ~1.85M F32 mults + cos/sin.
 static const std::vector<float> & cached_hann_window(int n_fft) {
@@ -1680,10 +1677,10 @@ static const std::vector<float> & cached_istft_kernel(int n_fft) {
     return it->second;
 }
 
-// QVAC-18422 round 5: cached STFT analysis kernel.  Pure function of
-// n_fft (constant 16 in chatterbox HiFT) and the cached hann window.
-// Per-build cost is small (~144 floats; trig + window scaling) but
-// rebuilding it every synth is pointless waste.  Keyed identically
+// Cached STFT analysis kernel.  Pure function of n_fft (constant 16
+// in chatterbox HiFT) and the cached hann window.  Per-build cost is
+// small (~144 floats; trig + window scaling) but rebuilding it every
+// synth is pointless waste.  Keyed identically
 // to `cached_istft_kernel`; both share `g_synth_caches_mu`.
 static const std::vector<float> & cached_stft_kernel(int n_fft) {
     {
@@ -1753,16 +1750,17 @@ static const std::vector<float> & cached_inv_alpha(const model_ctx & m,
     return it->second;
 }
 
-// `cached_pos_emb` lives in the QVAC-18422 cache block above (right
-// after `compute_pos_emb`).  `cached_hann_window`, `cached_istft_kernel`,
-// and `cached_window_sum` are defined just above this block (alongside
-// `build_hann_window` / `build_istft_kernel` / `build_window_sum`).
+// `cached_pos_emb` lives in the cache block above (right after
+// `compute_pos_emb`).  `cached_hann_window`, `cached_istft_kernel`,
+// and `cached_window_sum` are defined just above this block
+// (alongside `build_hann_window` / `build_istft_kernel` /
+// `build_window_sum`).
 
 // F0 predictor (mel (80, T) -> f0 (T,))
 //
-// QVAC-17872 round 2: graph + gallocator cached process-wide via
-// g_f0_graph_cache (keyed on T_mel).  Same-shape calls (e.g. streaming
-// chunks at constant T_mel) skip the rebuild + gallocr_reserve.
+// Graph + gallocator cached process-wide via g_f0_graph_cache (keyed
+// on T_mel).  Same-shape calls (e.g. streaming chunks at constant
+// T_mel) skip the rebuild + gallocr_reserve.
 static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vector<float> & mel, int T_mel) {
     graph_cache & cache = g_f0_graph_cache;
     const bool build_graph = (cache.key != (int64_t) T_mel) || (cache.ctx == nullptr);
@@ -1793,12 +1791,12 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
         x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
     // ggml-cpu's mul_mat asserts nb10 == ggml_type_size(src1->type) — the
-    // CPU backend rejects a permuted src1 even for f32 matmul, so the cont
-    // here is required for CPU correctness.  Vulkan / Metal / CUDA shaders
-    // do iterate by stride and would accept the bare permute (which is what
-    // PR #8 / QVAC-17872 round-HIFT optimised for); restoring the cont
-    // unconditionally trades one dispatch on those backends for not aborting
-    // on CPU.  A backend-conditional fast path can revisit this later.
+    // CPU backend rejects a permuted src1 even for f32 matmul, so the
+    // cont here is required for CPU correctness.  Vulkan / Metal /
+    // CUDA shaders do iterate by stride and would accept the bare
+    // permute, so this trades one dispatch on those backends for not
+    // aborting on CPU.  A backend-conditional fast path can revisit
+    // this later.
     ggml_tensor * xp = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     ggml_tensor * cw = find_tensor(m, "hift/f0_predictor/classifier/weight");
     ggml_tensor * cb = find_tensor(m, "hift/f0_predictor/classifier/bias");
@@ -1860,10 +1858,10 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
 
 // STFT (time-domain source -> spec)
 //
-// QVAC-18422 round 5: graph + analysis kernel cached process-wide via
-// g_stft_graph_cache (keyed on T_src) and g_stft_kernel_cache (keyed on
-// n_fft).  Streaming chunks of varying length still produce correct
-// output — the graph cache rebuilds when its T_src diverges; the n_fft-
+// Graph + analysis kernel cached process-wide via g_stft_graph_cache
+// (keyed on T_src) and g_stft_kernel_cache (keyed on n_fft).
+// Streaming chunks of varying length still produce correct output —
+// the graph cache rebuilds when its T_src diverges; the n_fft-
 // keyed kernel cache stays at one entry across all chunks because n_fft
 // is constant in the chatterbox HiFT path.  Lifecycle is identical to
 // the round-2 graph caches: invalidated together by
@@ -1917,10 +1915,10 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
 }
 
 // Full HiFT decode: mel + s_stft -> wav (inlined from mel2wav.cpp)
-// QVAC-17872 round 2: graph + gallocator cached process-wide via
-// g_hift_graph_cache (keyed on pack(T_mel, T_stft)).  Scaffolding
-// (hann_window, istft_kernel, window_sum, ~72 inv_alpha tensors) is also
-// cached, so subsequent same-shape calls do zero CPU host work outside
+// Graph + gallocator cached process-wide via g_hift_graph_cache (keyed
+// on pack(T_mel, T_stft)).  Scaffolding (hann_window, istft_kernel,
+// window_sum, ~72 inv_alpha tensors) is also cached, so subsequent
+// same-shape calls do zero CPU host work outside
 // the graph compute itself.  HiFT is the biggest multilingual beneficiary
 // because audio length scales with prompt length.
 static std::vector<float> run_hift_decode(const model_ctx & m,
@@ -2082,10 +2080,10 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     y = ggml_div(ctx, y, ws_in);
     int pad_amt = n_fft / 2;
     int L_wav = (int)ws_for_size.size() - n_fft;
-    // QVAC-17872 round-HIFT (2026-05-04): drop the trailing ggml_cont.  The
-    // view's only consumer is ggml_clamp (element-wise, accepts strided
-    // src0); clamp's output is a fresh contiguous tensor allocated by the
-    // gallocator.  ggml_set_output is set on that contig output, so
+    // Drop the trailing ggml_cont.  The view's only consumer is
+    // ggml_clamp (element-wise, accepts strided src0); clamp's output
+    // is a fresh contiguous tensor allocated by the gallocator.
+    // ggml_set_output is set on that contig output, so
     // tensor_get reads from a contig buffer.  Saves 1 dispatch / HiFT decode.
     ggml_tensor * y_trim = ggml_view_2d(ctx, y, L_wav, y->ne[1], y->nb[1],
                                         (size_t)pad_amt * y->nb[0]);
@@ -2363,10 +2361,10 @@ int s3gen_synthesize_to_wav(
     // 2) input_embedding lookup + multiply by mask
     vlog("Running input_embedding...\n");
     ggml_tensor * emb_w = find_tensor(m, "flow/input_embedding");
-    // QVAC-17872 round-HIFT: input_embedding weight is multiple MB on Turbo
-    // and ~28 MB on multilingual (vocab=13632 × D=512 × 4 B).  Each synth
-    // call previously paid the full GPU→CPU download (~600-1000 µs wall
-    // on RTX 5090).  Cache the CPU mirror so subsequent calls only pay
+    // input_embedding weight is multiple MB on Turbo and ~28 MB on
+    // multilingual (vocab=13632 × D=512 × 4 B).  Without caching, each
+    // synth call pays the full GPU→CPU download (~600-1000 µs wall on
+    // RTX 5090).  Cache the CPU mirror so subsequent calls only pay
     // the cheap row-copy lookup cost.  Cache is bound to the s3gen model
     // lifecycle.
     const float * emb_w_data = cached_cpu_weights_f32(emb_w);
@@ -2467,8 +2465,8 @@ int s3gen_synthesize_to_wav(
 
     ggml_tensor * saw = find_tensor(m, "flow/spk_embed_affine/w");  // (80, 192) numpy -> ne=[192, 80]
     ggml_tensor * sab = find_tensor(m, "flow/spk_embed_affine/b");  // (80,)
-    // QVAC-17872 round-HIFT: cache CPU mirrors of the speaker-affine
-    // weights (~60 KB) instead of paying GPU→CPU download per synth.
+    // Cache CPU mirrors of the speaker-affine weights (~60 KB) instead
+    // of paying GPU→CPU download per synth.
     const float * saw_data = cached_cpu_weights_f32(saw);
     const float * sab_data = cached_cpu_weights_f32(sab);
     std::vector<float> spks(MEL, 0.0f);
@@ -2613,10 +2611,9 @@ int s3gen_synthesize_to_wav(
     const bool use_b2 = (!meanflow) && (cfg_rate != 0.0f) &&
                         !ggml_backend_is_cpu(m.backend);
 
-    // QVAC-17872 round-HIFT: persistent CFM estimator graph cache
-    // (was local-scope before).  Re-used across synth calls when T matches —
-    // multi-synth chunks 2..N skip the graph build + gallocr_reserve cost
-    // they previously paid every chunk.  Lifetime managed by
+    // Persistent CFM estimator graph cache.  Re-used across synth
+    // calls when T matches — multi-synth chunks 2..N skip the graph
+    // build + gallocr_reserve cost.  Lifetime managed by
     // s3gen_model_cache_release.  Works for both batch=1 (Turbo) and
     // batch=2 (multilingual CFG) paths via the cache.b2 flag.
     cfm_estimator_cache & cfm_cache = g_cfm_estimator_cache;
@@ -2625,10 +2622,10 @@ int s3gen_synthesize_to_wav(
         float t = t_span[s], r = t_span[s + 1];
         float dt = r - t;
         vlog("CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
-        // QVAC-17872 round-HIFT: memoised t-emb pipeline.  Same (t, r)
-        // pair always produces the same vector (deterministic functions of
-        // t, r and the model weights).  Both Turbo (meanflow) and
-        // multilingual (standard) paths benefit; multilingual amortises
+        // Memoised t-emb pipeline.  Same (t, r) pair always produces
+        // the same vector (deterministic function of t, r, and the
+        // model weights).  Both Turbo (meanflow) and multilingual
+        // (standard) paths benefit; multilingual amortises
         // the cache better since it has 10 steps × 2 sets of {t, r}
         // values that repeat across every subsequent synth call.
         std::vector<float> t_emb;
@@ -2717,8 +2714,8 @@ int s3gen_synthesize_to_wav(
                     MEL, T_mu, base.c_str());
         }
 
-        // Fused CFG-combine + Euler step (QVAC-18422 round 3).  Saves one
-        // pass over `dxdt` per step.  When the debug/dump code-paths above
+        // Fused CFG-combine + Euler step.  Saves one pass over
+        // `dxdt` per step.  When the debug/dump code-paths above
         // already wrote the combined result back into `dxdt_cond`, we
         // detect it via `need_full_dxdt && have_cfg_uncond` and fall back
         // to the plain `z + dt * dxdt_cond` form so the math stays
@@ -2894,7 +2891,7 @@ void s3gen_unload() {
 }
 
 // ============================================================================
-// QVAC-18422 — internal test hooks
+// Internal test hooks
 // ============================================================================
 //
 // Implementations of the read-only cache-state queries declared in

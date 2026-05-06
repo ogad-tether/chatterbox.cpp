@@ -5,8 +5,9 @@
 // include/tts-cpp/chatterbox/s3gen_pipeline.h because production callers must
 // not depend on cache layout.
 //
-// The hooks are populated by the persistent-cache work landed for QVAC-18422
-// (CPU-side multilingual perf): see PROGRESS.md §3.32.
+// The hooks are populated by the persistent-cache work for the
+// CPU-side multilingual TTS path (see PROGRESS.md for the design
+// notes).
 //
 // Rules:
 //  - Read-only.  Tests must NOT mutate cache state via these hooks; use
@@ -14,8 +15,8 @@
 //  - Locking is internal.  All hooks acquire the same mutex used by the
 //    cache writers, so concurrent calls during a synthesize() in another
 //    thread are safe but may briefly block.
-//  - Stable across the QVAC-18422 series.  Adding new caches must add new
-//    hooks rather than reshape existing ones.
+//  - Stable: adding new caches must add new hooks rather than reshape
+//    existing ones (the test harnesses depend on this surface).
 
 #pragma once
 

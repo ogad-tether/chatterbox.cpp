@@ -106,7 +106,7 @@ void t3_stack_unregister(ggml_backend_buffer_t buf, ggml_context * ctx) {
     }
 }
 
-// Forward declaration for the step-graph builder used by the round-4
+// Forward declaration for the step-graph builder used by the
 // cache below.  Body lives in the second anonymous namespace further
 // down (alongside the legacy build_step_graph_mtl wrapper).
 namespace {
@@ -117,7 +117,7 @@ ggml_cgraph * build_step_graph_mtl_in_ctx(const chatterbox_model & model,
 }
 
 // ============================================================================
-// QVAC-18422 round 4 — T3 step-graph cache (multilingual CFG token decode)
+// T3 step-graph cache (multilingual CFG token decode)
 // ============================================================================
 //
 // `build_step_graph_mtl(n_past, is_uncond)` constructs a 30-layer Llama-block
@@ -339,7 +339,7 @@ void t3_release_caches() {
 }
 
 // detail-scope bridges so the test_hooks namespace (defined further
-// down, outside detail::) can reach the round-4 cache state without
+// down, outside detail::) can reach the step-graph cache state without
 // each individual symbol leaking into the public surface.  These
 // helpers are NOT for production callers; the only consumers are
 // test_hooks::t3_* in the same TU.
@@ -1011,7 +1011,7 @@ ggml_cgraph * build_step_graph_mtl_b2(const chatterbox_model & model,
 }
 
 // Body of the step graph build, parameterised on a caller-provided
-// ggml_context.  Lets the (round-4) step-graph cache hold the ctx
+// ggml_context.  Lets the step-graph cache hold the ctx
 // alive across calls without sharing the legacy thread_local buf.
 ggml_cgraph * build_step_graph_mtl_in_ctx(const chatterbox_model & model,
                                           ggml_context * ctx,
@@ -1268,10 +1268,10 @@ bool run_step_pass(const chatterbox_model & model,
                    int32_t token,
                    bool is_uncond,
                    std::vector<float> & logits_out) {
-    // QVAC-18422 round 4: when CHATTERBOX_T3_STEP_CACHE is set, try
-    // the per-(n_past, is_uncond) graph cache first.  On hit, we skip
-    // the ~3 ms build cost.  On miss + room: build into a fresh
-    // cache entry; the caller's allocator is used for layout either
+    // When CHATTERBOX_T3_STEP_CACHE is set, try the per-(n_past,
+    // is_uncond) graph cache first.  On hit, we skip the ~3 ms build
+    // cost.  On miss + room: build into a fresh cache entry; the
+    // caller's allocator is used for layout either
     // way (no ~1 MB-per-entry backend buffer regression).  On miss +
     // cache full: fall back to the legacy thread_local-buf path.
     //
@@ -1976,10 +1976,10 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
 } // namespace tts_cpp::chatterbox::detail
 
 // ============================================================================
-// QVAC-18422 round 4 — T3 step-graph cache test hooks
+// T3 step-graph cache test hooks
 // ============================================================================
 //
-// Read-only observability for the cache state declared in the round-4
+// Read-only observability for the cache state declared in the
 // section of t3_mtl.cpp.  The cache state lives in an anonymous
 // namespace inside detail::; these forwarders go through the
 // `_t3_step_cache_*_for_tests` bridges defined alongside it.
