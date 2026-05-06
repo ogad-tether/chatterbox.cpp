@@ -199,6 +199,14 @@ public:
     // callers that want to introspect the resolved n_gpu_layers / n_ctx).
     const EngineOptions & options() const;
 
+    // Return the registered name of the backend the engine actually
+    // resolved to during construction (e.g. "Metal", "Vulkan", "CUDA0",
+    // "CPU").  Useful for telemetry / debug logs after the load-time
+    // backend cascade picks one of the candidates compiled in.  Returns
+    // "(unknown)" when the backend is unset (e.g. a partial construction
+    // path that hasn't run init_backend yet).
+    std::string backend_name() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> pimpl_;

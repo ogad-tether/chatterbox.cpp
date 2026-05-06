@@ -31,6 +31,12 @@ struct s3gen_synthesize_opts {
     // Optional: if non-null, the pipeline writes the 24 kHz float32 mono PCM
     // samples here in addition to (or instead of) `out_wav_path`.  Lets
     // callers consume the audio without a temp-file round-trip.
+    //
+    // Semantics: clear-then-fill.  s3gen_synthesize_to_wav assigns the
+    // produced PCM to *pcm_out by replacement, dropping any prior
+    // contents.  Callers that want to accumulate across multiple calls
+    // (e.g. one chunk per call from the streaming driver) should use a
+    // fresh local std::vector<float> per call and concatenate themselves.
     std::vector<float> * pcm_out = nullptr;
 
     // If empty, use the built-in voice embedded in the GGUF

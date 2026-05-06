@@ -52,6 +52,12 @@ struct Engine::Impl {
     std::vector<float>   s3gen_embedding;
     std::vector<int32_t> s3gen_prompt_token;
 
+    // Cached BPE built once from model.tok_tokens / model.tok_merges in
+    // the ctor below.  Constructing the gpt2_bpe (Turbo's 64K vocab +
+    // ~50K merges) costs a few ms per call; rebuilding per synthesize()
+    // is wasteful, especially in streaming / short-utterance scenarios.
+    gpt2_bpe             bpe;
+
     std::atomic<bool>    cancel_flag{false};
 
     explicit Impl(const EngineOptions & o)
@@ -94,6 +100,11 @@ struct Engine::Impl {
         if (!load_model_gguf(opts.t3_gguf_path, model, opts.n_ctx, opts.n_gpu_layers)) {
             throw std::runtime_error("Engine: failed to load T3 GGUF: " + opts.t3_gguf_path);
         }
+
+        // Build the BPE once from the now-loaded tokenizer.  Reused by
+        // every synthesize() call; the model owns the underlying token /
+        // merges arrays so the bpe stays valid for the Engine's lifetime.
+        bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
 
         // Engine currently only wires the Turbo (GPT-2 Medium) variant.  An
         // MTL (Llama-520M multilingual) GGUF loads cleanly via load_model_gguf
@@ -353,8 +364,6 @@ struct Engine::Impl {
                 "re-run scripts/convert-t3-turbo-to-gguf.py");
         }
 
-        gpt2_bpe bpe;
-        bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
         const std::string normalised = gpt2_bpe::punc_norm(text);
         const std::vector<int32_t> text_tokens = bpe.tokenize(normalised);
         if (text_tokens.empty()) {
@@ -594,6 +603,16 @@ void Engine::cancel() {
 
 const EngineOptions & Engine::options() const {
     return pimpl_->opts;
+}
+
+std::string Engine::backend_name() const {
+    if (!pimpl_->model.backend) {
+        return "(unknown)";
+    }
+    if (const char * name = ggml_backend_name(pimpl_->model.backend)) {
+        return std::string(name);
+    }
+    return "(unknown)";
 }
 
 } // namespace tts_cpp::chatterbox
