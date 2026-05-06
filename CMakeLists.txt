@@ -14,7 +14,7 @@ else()
 endif()
 
 option(TTS_CPP_BUILD_LIBRARY     "tts-cpp: build the tts-cpp library"                        ON)
-option(TTS_CPP_BUILD_SHARED      "tts-cpp: build tts-cpp as a SHARED library (otherwise STATIC). Defaults to OFF; the supertonic test harnesses link against tts-cpp directly and use detail-namespaced symbols that aren't part of the TTS_CPP_API public surface, so SHARED hides them and breaks the test build.  Decoupled from BUILD_SHARED_LIBS because ggml's own CMake declares its own option(BUILD_SHARED_LIBS) defaulting to ON on Windows non-MinGW; using a project-namespaced option keeps the two independent." OFF)
+option(TTS_CPP_BUILD_SHARED      "tts-cpp: build tts-cpp as a SHARED library (otherwise STATIC). Defaults to OFF; the test harnesses (test-mtl-tokenizer, test-supertonic-*) link against tts-cpp directly and use detail-namespaced symbols outside the TTS_CPP_API public surface, so SHARED hides them and disables those targets. Decoupled from BUILD_SHARED_LIBS because ggml's own CMake declares its own option(BUILD_SHARED_LIBS) which pollutes the cache with a platform-dependent default once any configure has run; using a project-namespaced option keeps the two independent and prevents a second configure from silently flipping linkage." OFF)
 option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build the tts-cli executable + mel2wav demo"     ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
@@ -185,18 +185,22 @@ set(TTS_CPP_LIB_SOURCES
 )
 
 if (TTS_CPP_BUILD_LIBRARY)
-    # Decoupled from BUILD_SHARED_LIBS on purpose: ggml's own CMake
-    # declares option(BUILD_SHARED_LIBS ...) defaulting to ON on
-    # Windows non-MinGW, so any DEFINED-style check on
-    # BUILD_SHARED_LIBS is unreliable once the build dir's CMakeCache
-    # gets populated.  STATIC is the right default for tts-cpp because
-    # the supertonic test harnesses + supertonic-bench link against it
-    # directly and use detail-namespaced symbols (declared in
-    # src/supertonic_internal.h) that aren't part of the TTS_CPP_API
-    # public surface; SHARED would hide them and the test build would
-    # fail to link.  Consumers that want a SHARED tts-cpp pass
-    # -DTTS_CPP_BUILD_SHARED=ON explicitly and accept that the
-    # supertonic test/bench targets won't link.
+    # Decoupled from BUILD_SHARED_LIBS by design.  parakeet.cpp's same-
+    # repo sibling re-couples (`if (DEFINED BUILD_SHARED_LIBS)`), but
+    # that pattern silently breaks on the second configure: ggml's own
+    # add_subdirectory(ggml) declares option(BUILD_SHARED_LIBS ...) which
+    # populates the cache with a platform-dependent default (Windows
+    # non-MinGW: ON), and any subsequent DEFINED check returns TRUE
+    # regardless of whether the user explicitly asked for shared linkage.
+    # Empirically: cmake -B build (1st run, no -D) -> STATIC; cmake -B
+    # build (2nd run, no -D) -> SHARED.  Project-namespaced option keeps
+    # the two strictly independent.  See PR review item #15.
+    #
+    # SHARED hides the detail-namespaced symbols that the test harnesses
+    # link against directly (test-mtl-tokenizer, test-supertonic-*); the
+    # CXX_VISIBILITY_PRESET=hidden setting added below makes those
+    # symbols invisible at SHARED-link time.  Disable the tests
+    # (TTS_CPP_BUILD_TESTS=OFF) when building shared.
     if (TTS_CPP_BUILD_SHARED)
         add_library(tts-cpp SHARED ${TTS_CPP_LIB_SOURCES})
     else()
