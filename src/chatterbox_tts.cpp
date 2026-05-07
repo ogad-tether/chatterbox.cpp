@@ -2882,6 +2882,11 @@ int s3gen_synthesize_to_wav(
         opts.hift_source_tail_out->assign(src.end() - tail_n, src.end());
     }
 
+    if (is_cancelled()) {
+        vlog("synthesis cancelled before STFT\n");
+        return 2;
+    }
+
     vlog("Running STFT...\n");
     t0 = now_ms();
     auto s_stft = run_stft(m_hift, src);
