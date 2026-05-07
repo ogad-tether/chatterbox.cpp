@@ -643,7 +643,7 @@ struct vector_text_attention_cache {
 };
 
 void free_text_attention_cache(vector_text_attention_cache & cache) {
-    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
     if (cache.ctx) ggml_free(cache.ctx);
     cache = {};
 }
@@ -780,7 +780,7 @@ struct vector_group_graph_cache {
 };
 
 void free_group_graph_cache(vector_group_graph_cache & cache) {
-    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
     if (cache.ctx) ggml_free(cache.ctx);
     cache = {};
 }
@@ -994,7 +994,7 @@ struct vector_res_style_qkv_cache {
 };
 
 void free_res_style_qkv_cache(vector_res_style_qkv_cache & cache) {
-    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
     if (cache.ctx) ggml_free(cache.ctx);
     cache = {};
 }
@@ -1217,7 +1217,7 @@ void tail_update_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
 #endif
 
 void free_tail_graph_cache(vector_tail_graph_cache & cache) {
-    if (cache.allocr) ggml_gallocr_free(cache.allocr);
+    supertonic_safe_gallocr_free(cache.allocr, cache.generation_id);
     if (cache.ctx) ggml_free(cache.ctx);
     cache = {};
 }
